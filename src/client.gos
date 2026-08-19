@@ -1,0 +1,701 @@
+// The surface a program uses: a client that owns one connection, typed row
+// accessors, transactions with savepoints, COPY, LISTEN/NOTIFY, and a
+// prepared-statement cache.
+//
+// Every call takes `&mut self` because a connection is a request/response
+// stream: two overlapping exchanges on one connection would interleave their
+// messages. Concurrency comes from more connections - see the pool.
+
+use std::errors
+
+use crate::{buf, config, conn, dberror, value}
+
+// A client and its connection.
+pub struct Client {
+    pub (package) pg: conn::PgConn
+    // Prepared statements already parsed on the server, keyed by SQL text.
+    pub (package) cache: Map<String, conn::Statement>
+    // Whether `query` and friends consult the cache.
+    pub (package) caching: bool
+    // Result format for queries that do not name one.
+    pub (package) result_format: i64
+}
+
+// Connects using a libpq keyword string or a `postgres://` URI.
+pub fn connect(url: &String) -> Result<Client, errors::Error> {
+    let cfg = config::parse(url)?
+    connect_with(&cfg)
+}
+
+// Connects using already-parsed parameters.
+pub fn connect_with(cfg: &config::Config) -> Result<Client, errors::Error> {
+    let pg = conn::connect(cfg)?
+    Ok(Client {
+        pg: pg
+        cache: Map::new()
+        caching: true
+        result_format: value::FORMAT_TEXT
+    })
+}
+
+impl Client {
+    // --- session ----------------------------------------------------
+
+    // The session parameter `name`, as the server reported it.
+    pub fn parameter(&self, name: String) -> Option<String> {
+        self.pg.parameter(&name)
+    }
+
+    // The server's version string.
+    pub fn server_version(&self) -> String {
+        self.pg.server_version()
+    }
+
+    // The backend PID serving this session.
+    pub fn backend_pid(&self) -> i64 {
+        self.pg.backend_pid()
+    }
+
+    // True when the session is inside a transaction block.
+    pub fn in_transaction(&self) -> bool {
+        self.pg.in_transaction()
+    }
+
+    // True when the connection is unusable.
+    pub fn is_closed(&self) -> bool {
+        self.pg.is_closed()
+    }
+
+    // True when the session is running over TLS.
+    pub fn is_tls(&self) -> bool {
+        self.pg.is_tls()
+    }
+
+    // Notices the server reported since the last call.
+    pub fn take_notices(&mut self) -> Vec<dberror::DbError> {
+        self.pg.take_notices()
+    }
+
+    // Round-trips a trivial query to confirm the connection still works.
+    pub fn ping(&mut self) -> Result<(), errors::Error> {
+        let _ = self.pg.simple_query(&"SELECT 1")?
+        Ok(())
+    }
+
+    // Turns the prepared-statement cache on or off. With it off, every
+    // parameterized call prepares and drops its statement, which is what a
+    // session behind a statement-rewriting proxy needs.
+    pub fn set_statement_cache(&mut self, enabled: bool) {
+        self.caching = enabled
+        if !enabled {
+            self.cache = Map::new()
+        }
+    }
+
+    // Sets the wire format results arrive in: `value::FORMAT_TEXT` (the
+    // default) or `value::FORMAT_BINARY`.
+    pub fn set_result_format(&mut self, format: i64) {
+        self.result_format = format
+    }
+
+    // Sends Terminate and closes the socket.
+    pub fn close(&mut self) {
+        self.cache = Map::new()
+        self.pg.close()
+    }
+
+    // --- statements -------------------------------------------------
+
+    // Prepares `sql`, letting the server infer the parameter types.
+    pub fn prepare(&mut self, sql: &String) -> Result<conn::Statement, errors::Error> {
+        self.pg.prepare(sql, &#[])
+    }
+
+    // Prepares `sql` with the parameter types pinned, for a query whose
+    // types the server cannot infer (`$1` compared only to `NULL`, or a
+    // value that would otherwise resolve to `text`).
+    pub fn prepare_typed(
+        &mut self
+        sql: &String
+        param_oids: &Vec<i64>
+    ) -> Result<conn::Statement, errors::Error> {
+        self.pg.prepare(sql, param_oids)
+    }
+
+    // Drops a prepared statement, and forgets it if it was cached.
+    pub fn close_statement(&mut self, statement: &conn::Statement) -> Result<(), errors::Error> {
+        let mut stale: Vec<String> = #[]
+        for (sql, cached) in self.cache.iter() {
+            if cached.name == statement.name {
+                stale.push(sql)
+            }
+        }
+        for sql in stale {
+            let _ = Map::pop(&mut self.cache, sql)
+        }
+        self.pg.close_statement(statement)
+    }
+
+    // The cached statement for `sql`, preparing it on first use.
+    fn statement_for(&mut self, sql: &String) -> Result<conn::Statement, errors::Error> {
+        if !self.caching {
+            return self.pg.prepare(sql, &#[])
+        }
+        match self.cache.get(sql) {
+            Some(cached) => Ok(cached)
+            None => {
+                let prepared = self.pg.prepare(sql, &#[])?
+                let _ = self.cache.insert(sql.clone(), prepared.clone())
+                Ok(prepared)
+            }
+        }
+    }
+
+    // --- executing --------------------------------------------------
+
+    // Runs `sql` with `params` for its effect, answering the rows affected.
+    pub fn execute(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<i64, errors::Error> {
+        let statement = self.statement_for(sql)?
+        let outcome = self.pg.execute(&statement, params)
+        self.forget_if_failed(sql, &outcome)
+        outcome
+    }
+
+    // Runs a prepared statement for its effect.
+    pub fn execute_prepared(
+        &mut self
+        statement: &conn::Statement
+        params: &Vec<value::Value>
+    ) -> Result<i64, errors::Error> {
+        self.pg.execute(statement, params)
+    }
+
+    // Runs one or more statements with no parameters, through the simple
+    // query protocol. This is the call for DDL and for a script.
+    pub fn batch_execute(&mut self, sql: &String) -> Result<(), errors::Error> {
+        self.pg.batch_execute(sql)
+    }
+
+    // Runs `sql` through the simple query protocol, answering every result
+    // set it produced.
+    pub fn simple_query(&mut self, sql: &String) -> Result<Vec<conn::SimpleResult>, errors::Error> {
+        self.pg.simple_query(sql)
+    }
+
+    // --- querying ---------------------------------------------------
+
+    // Runs `sql` and collects every row.
+    pub fn query(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<Vec<conn::Row>, errors::Error> {
+        let mut stream = self.query_raw(sql, params)?
+        let mut rows: Vec<conn::Row> = #[]
+        while let Some(row) = self.pg.next_row(&mut stream)? {
+            rows.push(row)
+        }
+        Ok(rows)
+    }
+
+    // Runs `sql` and answers a stream, for a result set that should not be
+    // held in memory at once. Rows are pulled with `next_row`.
+    pub fn query_raw(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<conn::RowStream, errors::Error> {
+        let statement = self.statement_for(sql)?
+        let format = self.result_format
+        let outcome = self.pg.query(&statement, params, format)
+        self.forget_if_failed(sql, &outcome)
+        outcome
+    }
+
+    // The next row of an open stream, or `None` at the end.
+    pub fn next_row(
+        &mut self
+        stream: &mut conn::RowStream
+    ) -> Result<Option<conn::Row>, errors::Error> {
+        self.pg.next_row(stream)
+    }
+
+    // Abandons a stream that will not be read to the end.
+    pub fn close_stream(&mut self, stream: &mut conn::RowStream) -> Result<(), errors::Error> {
+        self.pg.close_stream(stream)
+    }
+
+    // Runs `sql` expecting exactly one row, and reports any other count.
+    pub fn query_one(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<conn::Row, errors::Error> {
+        let rows = self.query(sql, params)?
+        if rows.len() != 1 {
+            return Err(errors::newf("query returned {} row(s), expected exactly 1", rows.len()))
+        }
+        Ok(rows[0])
+    }
+
+    // Runs `sql` expecting at most one row.
+    pub fn query_opt(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<Option<conn::Row>, errors::Error> {
+        let rows = self.query(sql, params)?
+        if rows.len() > 1 {
+            return Err(errors::newf("query returned {} row(s), expected at most 1", rows.len()))
+        }
+        Ok(rows.first())
+    }
+
+    // The single value of a one-row, one-column query. The shape a
+    // `SELECT count(*)` or a `RETURNING id` takes.
+    pub fn query_value(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<value::Value, errors::Error> {
+        let row = self.query_one(sql, params)?
+        if row.width() < 1 {
+            return Err(errors::new("query returned a row with no columns"))
+        }
+        Ok(row.at(0))
+    }
+
+    // Opens a server-side portal, fetched in batches with `fetch`. A portal
+    // lives until its transaction ends, so open one inside a transaction.
+    pub fn open_portal(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<conn::Portal, errors::Error> {
+        let statement = self.statement_for(sql)?
+        let format = self.result_format
+        self.pg.open_portal(&statement, params, format)
+    }
+
+    // Fetches up to `batch_size` rows from a portal.
+    pub fn fetch(
+        &mut self
+        portal: &mut conn::Portal
+        batch_size: i64
+    ) -> Result<Vec<conn::Row>, errors::Error> {
+        self.pg.fetch_portal(portal, batch_size)
+    }
+
+    // Closes a portal before it is exhausted.
+    pub fn close_portal(&mut self, portal: &mut conn::Portal) -> Result<(), errors::Error> {
+        self.pg.close_portal(portal)
+    }
+
+    // Runs several statements in one round trip, answering each one's
+    // affected-row count. Pair the statements with their parameter sets.
+    pub fn pipeline(
+        &mut self
+        sql: &Vec<String>
+        params: &Vec<Vec<value::Value>>
+    ) -> Result<Vec<i64>, errors::Error> {
+        let mut statements: Vec<conn::Statement> = #[]
+        for text in sql {
+            statements.push(self.statement_for(&text)?)
+        }
+        self.pg.pipeline(&statements, params)
+    }
+
+    // --- transactions -----------------------------------------------
+
+    // Opens a transaction with the server's default characteristics.
+    pub fn transaction(&mut self) -> Result<Transaction, errors::Error> {
+        self.begin_with(&TxOptions::defaults())
+    }
+
+    // Opens a transaction with explicit characteristics.
+    pub fn begin_with(&mut self, options: &TxOptions) -> Result<Transaction, errors::Error> {
+        self.pg.batch_execute(&options.render())?
+        Ok(Transaction { open: true, depth: 0 })
+    }
+
+    // Commits an open transaction.
+    pub fn commit(&mut self, tx: &mut Transaction) -> Result<(), errors::Error> {
+        if !tx.open {
+            return Err(errors::new("transaction is already finished"))
+        }
+        tx.open = false
+        self.pg.batch_execute(&"COMMIT")
+    }
+
+    // Rolls an open transaction back. Safe to call on a failed transaction,
+    // which is the only thing the server will accept there.
+    pub fn rollback(&mut self, tx: &mut Transaction) -> Result<(), errors::Error> {
+        if !tx.open {
+            return Ok(())
+        }
+        tx.open = false
+        self.pg.batch_execute(&"ROLLBACK")
+    }
+
+    // Establishes a savepoint inside a transaction, answering its name so
+    // it can be released or rolled back to.
+    pub fn savepoint(&mut self, tx: &mut Transaction) -> Result<String, errors::Error> {
+        if !tx.open {
+            return Err(errors::new("savepoint needs an open transaction"))
+        }
+        tx.depth += 1
+        let name = format!("gos_pgsql_sp{}", tx.depth)
+        self.pg.batch_execute(&format!("SAVEPOINT {}", quote_ident(&name)))?
+        Ok(name)
+    }
+
+    // Rolls back to a savepoint, keeping the transaction open. This is what
+    // recovers a transaction whose last statement failed.
+    pub fn rollback_to(&mut self, name: String) -> Result<(), errors::Error> {
+        self.pg.batch_execute(&format!("ROLLBACK TO SAVEPOINT {}", quote_ident(&name)))
+    }
+
+    // Releases a savepoint, keeping its effects.
+    pub fn release_savepoint(&mut self, name: String) -> Result<(), errors::Error> {
+        self.pg.batch_execute(&format!("RELEASE SAVEPOINT {}", quote_ident(&name)))
+    }
+
+    // --- COPY -------------------------------------------------------
+
+    // Streams `data` into the server with `COPY ... FROM STDIN`.
+    pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
+        self.pg.copy_in(sql, data)
+    }
+
+    // Streams text rows into the server, one line per row, in the default
+    // COPY text format. Fields are tab-separated and `\N` is NULL, which
+    // `copy_text_row` renders.
+    pub fn copy_in_rows(
+        &mut self
+        sql: &String
+        rows: &Vec<Vec<value::Value>>
+    ) -> Result<i64, errors::Error> {
+        let mut data: Vec<u8> = #[]
+        for row in rows {
+            data.extend(copy_text_row(&row).as_bytes())
+            data.push(10)
+        }
+        self.pg.copy_in(sql, &data)
+    }
+
+    // Reads a `COPY ... TO STDOUT` in full.
+    pub fn copy_out(&mut self, sql: &String) -> Result<Vec<u8>, errors::Error> {
+        self.pg.copy_out(sql)
+    }
+
+    // Reads a `COPY ... TO STDOUT` and splits it into lines, dropping the
+    // trailing empty line the final newline leaves.
+    pub fn copy_out_lines(&mut self, sql: &String) -> Result<Vec<String>, errors::Error> {
+        let raw = self.pg.copy_out(sql)?
+        let mut lines = buf::utf8_lossy(&raw).split("\n")
+        if lines.last() == Some("") {
+            let _ = lines.pop()
+        }
+        Ok(lines)
+    }
+
+    // --- LISTEN / NOTIFY --------------------------------------------
+
+    // Subscribes to a notification channel.
+    pub fn listen(&mut self, channel: String) -> Result<(), errors::Error> {
+        self.pg.batch_execute(&format!("LISTEN {}", quote_ident(&channel)))
+    }
+
+    // Unsubscribes from a channel, or from all of them when `channel` is
+    // empty.
+    pub fn unlisten(&mut self, channel: String) -> Result<(), errors::Error> {
+        if channel == "" {
+            return self.pg.batch_execute(&"UNLISTEN *")
+        }
+        self.pg.batch_execute(&format!("UNLISTEN {}", quote_ident(&channel)))
+    }
+
+    // Sends a notification with a payload.
+    pub fn notify(&mut self, channel: String, payload: String) -> Result<(), errors::Error> {
+        let _ = self.pg.simple_query(&format!(
+            "SELECT pg_notify({}, {})"
+            quote_literal(&channel)
+            quote_literal(&payload)
+        ))?
+        Ok(())
+    }
+
+    // The next notification already delivered, without waiting.
+    pub fn take_notification(&mut self) -> Option<conn::Notification> {
+        self.pg.take_notification()
+    }
+
+    // Waits up to `timeout_ms` for a notification.
+    pub fn poll_notification(
+        &mut self
+        timeout_ms: i64
+    ) -> Result<Option<conn::Notification>, errors::Error> {
+        self.pg.poll_notification(timeout_ms)
+    }
+
+    // --- cancellation -----------------------------------------------
+
+    // A token another goroutine can use to cancel this session's query.
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken {
+            host: self.pg.host_addr()
+            pid: self.pg.backend_pid
+            secret: self.pg.backend_secret
+        }
+    }
+
+    // Asks the server to cancel whatever this session is running.
+    pub fn cancel(&self) -> Result<(), errors::Error> {
+        self.pg.cancel()
+    }
+
+    // A statement whose preparation the server has since invalidated must
+    // not stay cached: the next call would bind against a plan the server
+    // has dropped. A failure of any other kind leaves the cache alone.
+    fn forget_if_failed<T>(&mut self, sql: &String, outcome: &Result<T, errors::Error>) {
+        if let Err(e) = outcome {
+            // 26000 is invalid_sql_statement_name and 0A000 is the "cached
+            // plan must not change result type" report.
+            if matches!(dberror::sqlstate_of(e), "26000" | "0A000") {
+                let _ = Map::pop(&mut self.cache, sql)
+            }
+        }
+    }
+}
+
+// An open transaction. The client runs the statements; this tracks whether
+// the block is still open and how deep its savepoints go.
+pub struct Transaction {
+    pub (package) open: bool
+    pub (package) depth: i64
+}
+
+impl Transaction {
+    // True while the transaction has neither committed nor rolled back.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+}
+
+// Isolation level for a transaction.
+pub enum Isolation {
+    // The server's `default_transaction_isolation`.
+    Default
+    ReadUncommitted
+    ReadCommitted
+    RepeatableRead
+    Serializable
+}
+
+// Characteristics of a transaction, as `BEGIN` takes them.
+pub struct TxOptions {
+    pub isolation: Isolation
+    // True for `READ ONLY`.
+    pub read_only: bool
+    // True for `DEFERRABLE`, which only affects a serializable read-only
+    // transaction: it waits until it can run without serialization failure.
+    pub deferrable: bool
+}
+
+impl TxOptions {
+    // The server's defaults.
+    pub fn defaults() -> TxOptions {
+        TxOptions { isolation: Isolation::Default, read_only: false, deferrable: false }
+    }
+
+    // The `BEGIN` statement these options describe.
+    pub fn render(&self) -> String {
+        let mut out = "BEGIN"
+        match self.isolation {
+            Isolation::Default => ()
+            Isolation::ReadUncommitted => { out += " ISOLATION LEVEL READ UNCOMMITTED" }
+            Isolation::ReadCommitted => { out += " ISOLATION LEVEL READ COMMITTED" }
+            Isolation::RepeatableRead => { out += " ISOLATION LEVEL REPEATABLE READ" }
+            Isolation::Serializable => { out += " ISOLATION LEVEL SERIALIZABLE" }
+        }
+        if self.read_only {
+            out += " READ ONLY"
+        }
+        if self.deferrable {
+            out += " DEFERRABLE"
+        }
+        out
+    }
+}
+
+// The identity a cancel request needs. Copyable, so it can be handed to
+// another goroutine while the session it names is busy.
+pub struct CancelToken {
+    pub (package) host: config::HostAddr
+    pub (package) pid: i64
+    pub (package) secret: i64
+}
+
+impl CancelToken {
+    // Sends the cancel request on its own connection.
+    pub fn cancel(&self) -> Result<(), errors::Error> {
+        if self.pid == 0 {
+            return Err(errors::new("no backend key: the server sent no BackendKeyData"))
+        }
+        conn::send_cancel(&self.host, self.pid, self.secret)
+    }
+}
+
+// --- helpers -------------------------------------------------------
+
+// Quotes an identifier by doubling embedded quotes, so a channel or
+// savepoint name cannot end a statement and start another.
+pub fn quote_ident(name: &String) -> String {
+    "\"" + &name.replace("\"", "\"\"") + "\""
+}
+
+// Quotes a string literal by doubling embedded quotes. Used only for the
+// `pg_notify` arguments, which cannot be parameters in a simple query.
+pub fn quote_literal(text: &String) -> String {
+    "'" + &text.replace("'", "''") + "'"
+}
+
+// One row in COPY's default text format: tab-separated fields, `\N` for
+// NULL, and backslash escapes for the characters the format reserves.
+pub fn copy_text_row(row: &Vec<value::Value>) -> String {
+    let fields = row.map(|cell| match cell {
+        value::Value::Null => "\\N"
+        _ => escape_copy_field(&cell.render())
+    })
+    fields.join("\t")
+}
+
+// One COPY text field with the format's reserved characters escaped. Byte
+// offsets: every escape the format defines is ASCII, so a multi-byte
+// character copies through untouched.
+fn escape_copy_field(text: &String) -> String {
+    let mut out: Vec<u8> = #[]
+    for byte in text.bytes() {
+        match byte {
+            92 => out.extend(&#[92, 92])
+            9 => out.extend(&#[92, 116])
+            10 => out.extend(&#[92, 110])
+            13 => out.extend(&#[92, 114])
+            _ => out.push(byte)
+        }
+    }
+    buf::utf8_lossy(&out)
+}
+
+// A PostgreSQL timestamp rendered as RFC 3339: `T` between the date and the
+// time, and a two-part UTC offset.
+pub fn rfc3339_of(text: &String) -> String {
+    let mut out = text.trim().replace(" ", "T")
+    if out.ends_with("Z") {
+        return out
+    }
+    // A trailing `+00` or `-05` needs its minutes; `+00:00` already has them.
+    let n = out.byte_len()
+    if n >= 3 {
+        let sign = out.byte_at(n - 3)
+        if sign == 43 || sign == 45 {
+            return out + ":00"
+        }
+    }
+    // A timestamp without a time zone has no offset at all; UTC is the only
+    // reading available, and it is what the server used to compute it.
+    if !out.contains("+") && !out.contains("Z") && count_colons(&out) <= 2 {
+        return out + "Z"
+    }
+    out
+}
+
+fn count_colons(text: &String) -> i64 {
+    text.bytes().count(|byte| byte == 58)
+}
+
+#[cfg(test)]
+mod client_tests {
+    use std::testing
+
+    #[test]
+    fn tx_options_render_the_begin_statement() {
+        let _ = testing::check_eq(
+            &super::TxOptions::defaults().render()
+            &"BEGIN"
+            "default begin"
+        )
+        let serializable = super::TxOptions {
+            isolation: super::Isolation::Serializable
+            read_only: true
+            deferrable: true
+        }
+        let _ = testing::check_eq(
+            &serializable.render()
+            &"BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE"
+            "serializable read-only deferrable"
+        )
+        let repeatable = super::TxOptions {
+            isolation: super::Isolation::RepeatableRead
+            read_only: false
+            deferrable: false
+        }
+        let _ = testing::check_eq(
+            &repeatable.render()
+            &"BEGIN ISOLATION LEVEL REPEATABLE READ"
+            "repeatable read"
+        )
+    }
+
+    #[test]
+    fn identifiers_and_literals_are_quoted_against_injection() {
+        let _ = testing::check_eq(
+            &super::quote_ident(&"events\"; DROP TABLE t; --")
+            &"\"events\"\"; DROP TABLE t; --\""
+            "identifier quoting doubles the quote"
+        )
+        let _ = testing::check_eq(
+            &super::quote_literal(&"it's")
+            &"'it''s'"
+            "literal quoting doubles the apostrophe"
+        )
+    }
+
+    #[test]
+    fn copy_text_rows_escape_the_reserved_characters() {
+        let row = #[
+            value::Value::Int(1),
+            value::Value::Text("has\ttab"),
+            value::Value::Null,
+            value::Value::Text("line\nbreak"),
+        ]
+        let _ = testing::check_eq(
+            &super::copy_text_row(&row)
+            &"1\thas\\ttab\t\\N\tline\\nbreak"
+            "copy text row"
+        )
+    }
+
+    #[test]
+    fn postgres_timestamps_normalize_to_rfc3339() {
+        let _ = testing::check_eq(
+            &super::rfc3339_of(&"2026-08-16 12:34:56+00")
+            &"2026-08-16T12:34:56+00:00"
+            "offset gains its minutes"
+        )
+        let _ = testing::check_eq(
+            &super::rfc3339_of(&"2026-08-16 12:34:56.789+02:00")
+            &"2026-08-16T12:34:56.789+02:00"
+            "a complete offset is unchanged"
+        )
+        let _ = testing::check_eq(
+            &super::rfc3339_of(&"2026-08-16 12:34:56")
+            &"2026-08-16T12:34:56Z"
+            "a naive timestamp reads as UTC"
+        )
+    }
+}

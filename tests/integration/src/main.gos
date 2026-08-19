@@ -1,0 +1,1000 @@
+// Integration tests: every one of these talks to a real PostgreSQL server.
+//
+// The server is named by `GOS_PGSQL_TEST_URL`, defaulting to a local Unix
+// socket. Every test opens its own connection, so an unreachable server
+// fails them all with the same report.
+//
+//     GOS_PGSQL_TEST_URL='host=/var/run/postgresql dbname=gos_pgsql_test' \
+//         gos test .
+//
+// Each test owns its own tables, named after the test, and drops them on the
+// way in, so a run leaves nothing behind and a crashed run does not poison
+// the next one.
+//
+// A test whose steps are fallible is a wrapper around a `_steps` function
+// that returns them: `check_ok` records the failure, so a step that fails
+// reports as one rather than as a test that ended early.
+
+use std::{env, errors, testing, time}
+
+use "github.com/danpozmanter/pgsql-gos" as pgsql
+
+fn test_url() -> String {
+    match env::var("GOS_PGSQL_TEST_URL") {
+        Some(v) => v
+        None => "host=/var/run/postgresql dbname=gos_pgsql_test"
+    }
+}
+
+// Named for the package, not `connect`: a bare `connect()` would be
+// ambiguous with the driver's own one-argument `connect`.
+fn open_test_db() -> Result<pgsql::client::Client, errors::Error> {
+    pgsql::connect(&test_url())
+}
+
+// --- connection and session ---------------------------------------
+
+#[test]
+fn a_connection_reports_the_session_it_opened() {
+    let _ = testing::check_ok(a_connection_reports_the_session_it_opened_steps(), "steps")
+}
+
+fn a_connection_reports_the_session_it_opened_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let _ = testing::check(db.server_version() != "", "server_version is reported")
+    let _ = testing::check(db.backend_pid() > 0, "backend pid is reported")
+    let _ = testing::check(!db.is_closed(), "connection is open")
+    let _ = testing::check(!db.in_transaction(), "session starts outside a transaction")
+    let _ = testing::check_eq(
+        &db.parameter("client_encoding").unwrap_or("")
+        &"UTF8"
+        "client_encoding was set by the startup message"
+    )
+    let _ = testing::check(
+        db.parameter("application_name").unwrap_or("") == "pgsql-gos"
+        "application_name defaults to the driver name"
+    )
+    db.ping()?
+    Ok(())
+}
+
+#[test]
+fn a_bad_password_is_reported_rather_than_hanging() {
+    // A TCP connection to a server that wants a password, with none given,
+    // must report that plainly. Skipped when no TCP server is configured.
+    match env::var("GOS_PGSQL_TCP_URL") {
+        Some(url) => {
+            let stripped = url.replace("password=gos_pgsql_test", "")
+            match pgsql::connect(&stripped) {
+                Ok(mut db) => {
+                    // A trust-authenticated server is a valid answer too.
+                    db.close()
+                    let _ = testing::check(true, "server did not ask for a password")
+                }
+                Err(e) => {
+                    let text = format!("{}", e)
+                    let _ = testing::check(
+                        text.contains("password") || text.contains("authentication")
+                        &format!("reported: {}", text)
+                    )
+                }
+            }
+        }
+        None => { let _ = testing::check(true, "no TCP server configured") }
+    }
+}
+
+#[test]
+fn an_unreachable_host_reports_the_address_it_tried() {
+    // Port 1 is reserved and never a PostgreSQL server.
+    match pgsql::connect(&"host=127.0.0.1 port=1 dbname=nothing user=nobody connect_timeout=2") {
+        Ok(mut db) => { db.close(); let _ = testing::check(false, "expected a failure") }
+        Err(e) => {
+            let text = format!("{}", e)
+            let _ = testing::check(
+                text.contains("127.0.0.1:1")
+                &format!("names the address it tried: {}", text)
+            )
+        }
+    }
+}
+
+// --- statements and types -----------------------------------------
+
+#[test]
+fn scalars_round_trip_through_bound_parameters() {
+    let _ = testing::check_ok(scalars_round_trip_through_bound_parameters_steps(), "steps")
+}
+
+fn scalars_round_trip_through_bound_parameters_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(
+        &"SELECT $1::int4 AS i, $2::int8 AS big, $3::float8 AS f, $4::bool AS b, $5::text AS t"
+        &#[pgsql::int(42), pgsql::int(9_007_199_254_740_991), pgsql::float(1.5), pgsql::boolean(true), pgsql::text("hello")]
+    )?
+    let _ = testing::check_eq(&row.i64_of("i")?, &42, "int4")
+    let _ = testing::check_eq(&row.i64_of("big")?, &9_007_199_254_740_991, "int8")
+    let _ = testing::check_eq(&row.f64_of("f")?, &1.5, "float8")
+    let _ = testing::check(row.bool_of("b")?, "bool")
+    let _ = testing::check_eq(&row.text_of("t")?, &"hello", "text")
+    Ok(())
+}
+
+#[test]
+fn null_binds_and_reads_back_as_null() {
+    let _ = testing::check_ok(null_binds_and_reads_back_as_null_steps(), "steps")
+}
+
+fn null_binds_and_reads_back_as_null_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(
+        &"SELECT $1::int4 AS maybe, $2::text AS words"
+        &#[pgsql::null(), pgsql::opt_text(None)]
+    )?
+    let _ = testing::check(row.is_null_of("maybe"), "null int is null")
+    let _ = testing::check(row.is_null_of("words"), "null text is null")
+    let _ = testing::check(row.opt_i64_of("maybe")?.is_none(), "opt_i64 answers None")
+    let _ = testing::check(row.opt_text_of("words")?.is_none(), "opt_text answers None")
+    Ok(())
+}
+
+#[test]
+fn numeric_keeps_every_digit_the_server_sent() {
+    let _ = testing::check_ok(numeric_keeps_every_digit_the_server_sent_steps(), "steps")
+}
+
+fn numeric_keeps_every_digit_the_server_sent_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(
+        &"SELECT $1::numeric AS exact, 12345678901234567890.123456789::numeric AS wide"
+        &#[pgsql::numeric("0.10000000000000000001")]
+    )?
+    let _ = testing::check_eq(
+        &row.text_of("exact")?
+        &"0.10000000000000000001"
+        "a bound numeric round-trips exactly"
+    )
+    let _ = testing::check_eq(
+        &row.text_of("wide")?
+        &"12345678901234567890.123456789"
+        "a numeric wider than f64 keeps its digits"
+    )
+    Ok(())
+}
+
+#[test]
+fn bytea_round_trips_including_embedded_nul() {
+    let _ = testing::check_ok(bytea_round_trips_including_embedded_nul_steps(), "steps")
+}
+
+fn bytea_round_trips_including_embedded_nul_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let payload: Vec<u8> = #[0, 1, 254, 255, 10, 13, 92]
+    let row = db.query_one(&"SELECT $1::bytea AS blob", &#[pgsql::bytes(payload)])?
+    let back = row.bytes_of("blob")?
+    let _ = testing::check_eq(&back.len(), &7, "byte count")
+    let _ = testing::check_eq(&(back[0] as i64), &0, "embedded NUL survives")
+    let _ = testing::check_eq(&(back[3] as i64), &255, "high byte survives")
+    let _ = testing::check_eq(&(back[6] as i64), &92, "backslash survives")
+    Ok(())
+}
+
+#[test]
+fn arrays_round_trip_with_nulls_and_quoting() {
+    let _ = testing::check_ok(arrays_round_trip_with_nulls_and_quoting_steps(), "steps")
+}
+
+fn arrays_round_trip_with_nulls_and_quoting_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(
+        &"SELECT $1::int4[] AS ints, $2::text[] AS words, ARRAY[1, NULL, 3]::int4[] AS holey"
+        &#[pgsql::int_array(#[1, 2, 3]), pgsql::text_array(#["plain", "has,comma", "has\"quote"])]
+    )?
+    let ints = row.array_of("ints")?
+    let _ = testing::check_eq(&ints.len(), &3, "three ints")
+    let _ = testing::check_eq(&ints[2].as_int().unwrap_or(0), &3, "third int")
+
+    let words = row.array_of("words")?
+    let _ = testing::check_eq(&words.len(), &3, "three words")
+    let _ = testing::check_eq(&words[1].as_text().unwrap_or(""), &"has,comma", "comma survives")
+    let _ = testing::check_eq(&words[2].as_text().unwrap_or(""), &"has\"quote", "quote survives")
+
+    let holey = row.array_of("holey")?
+    let _ = testing::check_eq(&holey.len(), &3, "three slots")
+    let _ = testing::check(holey[1].is_null(), "the middle element is NULL")
+    Ok(())
+}
+
+#[test]
+fn a_nested_array_keeps_its_shape() {
+    let _ = testing::check_ok(a_nested_array_keeps_its_shape_steps(), "steps")
+}
+
+fn a_nested_array_keeps_its_shape_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(&"SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]]::int4[][] AS grid", &#[])?
+    let rows = row.array_of("grid")?
+    let _ = testing::check_eq(&rows.len(), &2, "two rows")
+    match rows[1].as_array() {
+        Some(second) => {
+            let _ = testing::check_eq(&second.len(), &2, "two columns")
+            let _ = testing::check_eq(&second[0].as_int().unwrap_or(0), &3, "value at [1][0]")
+        }
+        None => { let _ = testing::check(false, "the second row is an array") }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_composite_and_a_range_decode_to_their_parts() {
+    let _ = testing::check_ok(a_composite_and_a_range_decode_to_their_parts_steps(), "steps")
+}
+
+fn a_composite_and_a_range_decode_to_their_parts_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(
+        &"SELECT ROW(1, 'two, three', NULL)::record AS r, int4range(1, 5) AS span"
+        &#[]
+    )?
+    let fields = row.record_of("r")?
+    let _ = testing::check_eq(&fields.len(), &3, "three fields")
+    let _ = testing::check_eq(&fields[0].as_int().unwrap_or(0), &1, "first field")
+    let _ = testing::check_eq(
+        &fields[1].as_text().unwrap_or("")
+        &"two, three"
+        "a field with a comma keeps it"
+    )
+    let _ = testing::check(fields[2].is_null(), "the empty field is NULL")
+
+    let span = row.range_of("span")?
+    let _ = testing::check(span.lower_inclusive, "lower bound is inclusive")
+    let _ = testing::check(!span.upper_inclusive, "upper bound is exclusive")
+    let _ = testing::check_eq(&span.lower.as_int().unwrap_or(0), &1, "lower bound")
+    let _ = testing::check_eq(&span.upper.as_int().unwrap_or(0), &5, "upper bound")
+    Ok(())
+}
+
+#[test]
+fn timestamps_uuids_and_json_read_as_their_text_and_typed_forms() {
+    let _ = testing::check_ok(timestamps_uuids_and_json_read_as_their_text_and_typed_forms_steps(), "steps")
+}
+
+fn timestamps_uuids_and_json_read_as_their_text_and_typed_forms_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let row = db.query_one(
+        &"""
+        SELECT '2026-08-16 12:34:56+00'::timestamptz AS at,
+               '00112233-4455-6677-8899-aabbccddeeff'::uuid AS id,
+               '{"a": 1}'::jsonb AS doc,
+               '192.168.1.1'::inet AS addr
+        """
+        &#[]
+    )?
+    let _ = testing::check_eq(
+        &row.text_of("id")?
+        &"00112233-4455-6677-8899-aabbccddeeff"
+        "uuid text"
+    )
+    let _ = testing::check(row.text_of("doc")?.contains("\"a\""), "jsonb text")
+    let _ = testing::check_eq(&row.text_of("addr")?, &"192.168.1.1", "inet text")
+    let at = row.timestamp_of("at")?
+    let rendered = time::format_rfc3339(at)?
+    let _ = testing::check(
+        rendered.starts_with("2026-08-16T12:34:56")
+        &format!("timestamptz parsed: {}", rendered)
+    )
+    Ok(())
+}
+
+#[test]
+fn binary_result_format_decodes_the_same_values() {
+    let _ = testing::check_ok(binary_result_format_decodes_the_same_values_steps(), "steps")
+}
+
+fn binary_result_format_decodes_the_same_values_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.set_result_format(pgsql::value::FORMAT_BINARY)
+    let row = db.query_one(
+        &"""
+        SELECT 42::int4 AS i, 9007199254740991::int8 AS big, true AS b,
+               'hello'::text AS t, '\\x00ff'::bytea AS blob,
+               '00112233-4455-6677-8899-aabbccddeeff'::uuid AS id,
+               123.45::numeric AS n
+        """
+        &#[]
+    )?
+    let _ = testing::check_eq(&row.i64_of("i")?, &42, "int4 in binary")
+    let _ = testing::check_eq(&row.i64_of("big")?, &9_007_199_254_740_991, "int8 in binary")
+    let _ = testing::check(row.bool_of("b")?, "bool in binary")
+    let _ = testing::check_eq(&row.text_of("t")?, &"hello", "text in binary")
+    let _ = testing::check_eq(&row.bytes_of("blob")?.len(), &2, "bytea in binary")
+    let _ = testing::check_eq(
+        &row.text_of("id")?
+        &"00112233-4455-6677-8899-aabbccddeeff"
+        "uuid in binary"
+    )
+    let _ = testing::check_eq(&row.text_of("n")?, &"123.45", "numeric in binary")
+    Ok(())
+}
+
+// --- executing and querying ---------------------------------------
+
+#[test]
+fn a_table_takes_inserts_updates_and_deletes() {
+    let _ = testing::check_ok(a_table_takes_inserts_updates_and_deletes_steps(), "steps")
+}
+
+fn a_table_takes_inserts_updates_and_deletes_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_crud")?
+    db.batch_execute(&"CREATE TABLE t_crud (id serial PRIMARY KEY, name text NOT NULL, score int4)")?
+
+    let inserted = db.execute(
+        &"INSERT INTO t_crud (name, score) VALUES ($1, $2), ($3, $4)"
+        &#[pgsql::text("ada"), pgsql::int(10), pgsql::text("grace"), pgsql::int(20)]
+    )?
+    let _ = testing::check_eq(&inserted, &2, "two rows inserted")
+
+    let updated = db.execute(&"UPDATE t_crud SET score = score + 1 WHERE name = $1", &#[pgsql::text("ada")])?
+    let _ = testing::check_eq(&updated, &1, "one row updated")
+
+    let rows = db.query(&"SELECT name, score FROM t_crud ORDER BY name", &#[])?
+    let _ = testing::check_eq(&rows.len(), &2, "two rows read back")
+    let _ = testing::check_eq(&rows[0].text_of("name")?, &"ada", "first name")
+    let _ = testing::check_eq(&rows[0].i64_of("score")?, &11, "updated score")
+
+    let deleted = db.execute(&"DELETE FROM t_crud WHERE score > $1", &#[pgsql::int(15)])?
+    let _ = testing::check_eq(&deleted, &1, "one row deleted")
+
+    let remaining = db.query_value(&"SELECT count(*) FROM t_crud", &#[])?
+    let _ = testing::check_eq(&remaining.as_int().unwrap_or(-1), &1, "one row remains")
+
+    db.batch_execute(&"DROP TABLE t_crud")?
+    Ok(())
+}
+
+#[test]
+fn returning_answers_the_generated_row() {
+    let _ = testing::check_ok(returning_answers_the_generated_row_steps(), "steps")
+}
+
+fn returning_answers_the_generated_row_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_returning")?
+    db.batch_execute(&"CREATE TABLE t_returning (id serial PRIMARY KEY, name text)")?
+    let id = db.query_value(
+        &"INSERT INTO t_returning (name) VALUES ($1) RETURNING id"
+        &#[pgsql::text("first")]
+    )?
+    let _ = testing::check_eq(&id.as_int().unwrap_or(-1), &1, "the first serial id")
+    db.batch_execute(&"DROP TABLE t_returning")?
+    Ok(())
+}
+
+#[test]
+fn query_one_and_query_opt_report_the_wrong_row_count() {
+    let _ = testing::check_ok(query_one_and_query_opt_report_the_wrong_row_count_steps(), "steps")
+}
+
+fn query_one_and_query_opt_report_the_wrong_row_count_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let _ = testing::check(
+        db.query_one(&"SELECT 1 WHERE false", &#[]).is_err()
+        "query_one reports an empty result"
+    )
+    let _ = testing::check(
+        db.query_one(&"SELECT * FROM (VALUES (1), (2)) AS v", &#[]).is_err()
+        "query_one reports two rows"
+    )
+    let _ = testing::check(
+        db.query_opt(&"SELECT 1 WHERE false", &#[])?.is_none()
+        "query_opt accepts no rows"
+    )
+    let _ = testing::check(
+        db.query_opt(&"SELECT 1", &#[])?.is_some()
+        "query_opt accepts one row"
+    )
+    let _ = testing::check(
+        db.query_opt(&"SELECT * FROM (VALUES (1), (2)) AS v", &#[]).is_err()
+        "query_opt reports two rows"
+    )
+    Ok(())
+}
+
+#[test]
+fn a_row_stream_reads_a_large_result_without_holding_it() {
+    let _ = testing::check_ok(a_row_stream_reads_a_large_result_without_holding_it_steps(), "steps")
+}
+
+fn a_row_stream_reads_a_large_result_without_holding_it_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let mut stream = db.query_raw(&"SELECT i FROM generate_series(1, 5000) AS s(i)", &#[])?
+    let mut count = 0
+    let mut total = 0
+    loop {
+        match db.next_row(&mut stream)? {
+            Some(row) => {
+                count += 1
+                total += row.i64_at(0)?
+            }
+            None => break
+        }
+    }
+    let _ = testing::check_eq(&count, &5_000, "every row arrived")
+    let _ = testing::check_eq(&total, &12_502_500, "the values are the series")
+    let _ = testing::check(stream.is_done(), "the stream reports it is finished")
+    // The connection is usable straight after a drained stream.
+    db.ping()?
+    Ok(())
+}
+
+#[test]
+fn an_abandoned_stream_leaves_the_connection_usable() {
+    let _ = testing::check_ok(an_abandoned_stream_leaves_the_connection_usable_steps(), "steps")
+}
+
+fn an_abandoned_stream_leaves_the_connection_usable_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let mut stream = db.query_raw(&"SELECT i FROM generate_series(1, 5000) AS s(i)", &#[])?
+    let _ = db.next_row(&mut stream)?
+    db.close_stream(&mut stream)?
+    // Whatever the server was still sending has been drained.
+    let after = db.query_value(&"SELECT 7", &#[])?
+    let _ = testing::check_eq(&after.as_int().unwrap_or(0), &7, "the next query is unaffected")
+    Ok(())
+}
+
+#[test]
+fn a_prepared_statement_runs_repeatedly_and_reports_its_shape() {
+    let _ = testing::check_ok(a_prepared_statement_runs_repeatedly_and_reports_its_shape_steps(), "steps")
+}
+
+fn a_prepared_statement_runs_repeatedly_and_reports_its_shape_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let stmt = db.prepare(&"SELECT $1::int4 + $2::int4 AS total")?
+    let _ = testing::check_eq(&stmt.param_count(), &2, "two parameters")
+    let _ = testing::check_eq(&stmt.columns.len(), &1, "one column")
+    let _ = testing::check_eq(&stmt.columns[0].name, &"total", "column name")
+    let _ = testing::check_eq(
+        &stmt.columns[0].type_oid
+        &pgsql::oid::INT4
+        "column type"
+    )
+    let mut sum = 0
+    let inputs: Vec<i64> = #[1, 2, 3]
+    for n in inputs {
+        let row = db.query_one(&"SELECT $1::int4 + $2::int4 AS total", &#[pgsql::int(n), pgsql::int(10)])?
+        sum += row.i64_of("total")?
+    }
+    let _ = testing::check_eq(&sum, &36, "three runs of the cached statement")
+    db.close_statement(&stmt)?
+    Ok(())
+}
+
+#[test]
+fn prepare_typed_pins_a_parameter_the_server_cannot_infer() {
+    let _ = testing::check_ok(prepare_typed_pins_a_parameter_the_server_cannot_infer_steps(), "steps")
+}
+
+fn prepare_typed_pins_a_parameter_the_server_cannot_infer_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let stmt = db.prepare_typed(&"SELECT $1 IS NULL AS empty", &#[pgsql::oid::TEXT])?
+    let _ = testing::check_eq(&stmt.param_oids.len(), &1, "one parameter")
+    let _ = testing::check_eq(&stmt.param_oids[0], &pgsql::oid::TEXT, "pinned as text")
+    let row = db.query_one(&"SELECT $1::text IS NULL AS empty", &#[pgsql::null()])?
+    let _ = testing::check(row.bool_of("empty")?, "a null text parameter is null")
+    Ok(())
+}
+
+#[test]
+fn a_simple_query_answers_every_result_set() {
+    let _ = testing::check_ok(a_simple_query_answers_every_result_set_steps(), "steps")
+}
+
+fn a_simple_query_answers_every_result_set_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let results = db.simple_query(&"SELECT 1 AS a; SELECT 'x' AS b, 'y' AS c")?
+    let _ = testing::check_eq(&results.len(), &2, "two result sets")
+    let _ = testing::check_eq(&results[0].columns.len(), &1, "first set has one column")
+    let _ = testing::check_eq(&results[1].columns.len(), &2, "second set has two columns")
+    let _ = testing::check_eq(&results[1].rows.len(), &1, "second set has one row")
+    let _ = testing::check_eq(
+        &results[1].rows[0][1].as_text().unwrap_or("")
+        &"y"
+        "value from the second set"
+    )
+    Ok(())
+}
+
+#[test]
+fn a_portal_fetches_a_result_in_batches() {
+    let _ = testing::check_ok(a_portal_fetches_a_result_in_batches_steps(), "steps")
+}
+
+fn a_portal_fetches_a_result_in_batches_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let mut tx = db.transaction()?
+    let mut portal = db.open_portal(&"SELECT i FROM generate_series(1, 25) AS s(i)", &#[])?
+    let mut fetched = 0
+    let mut batches = 0
+    loop {
+        let batch = db.fetch(&mut portal, 10)?
+        if batch.len() == 0 {
+            break
+        }
+        batches += 1
+        fetched += batch.len()
+    }
+    let _ = testing::check_eq(&fetched, &25, "every row arrived")
+    let _ = testing::check_eq(&batches, &3, "three batches of ten")
+    let _ = testing::check(portal.is_exhausted(), "the portal is exhausted")
+    db.commit(&mut tx)?
+    Ok(())
+}
+
+#[test]
+fn a_pipeline_runs_several_statements_in_one_round_trip() {
+    let _ = testing::check_ok(a_pipeline_runs_several_statements_in_one_round_trip_steps(), "steps")
+}
+
+fn a_pipeline_runs_several_statements_in_one_round_trip_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_pipeline")?
+    db.batch_execute(&"CREATE TABLE t_pipeline (id int4 PRIMARY KEY, name text)")?
+    let counts = db.pipeline(
+        &#[
+            "INSERT INTO t_pipeline (id, name) VALUES ($1, $2)",
+            "INSERT INTO t_pipeline (id, name) VALUES ($1, $2)",
+            "UPDATE t_pipeline SET name = $2 WHERE id = $1",
+        ]
+        &#[
+            #[pgsql::int(1), pgsql::text("one")],
+            #[pgsql::int(2), pgsql::text("two")],
+            #[pgsql::int(1), pgsql::text("uno")],
+        ]
+    )?
+    let _ = testing::check_eq(&counts.len(), &3, "three counts")
+    let _ = testing::check_eq(&counts[2], &1, "the update touched one row")
+    let name = db.query_value(&"SELECT name FROM t_pipeline WHERE id = 1", &#[])?
+    let _ = testing::check_eq(&name.as_text().unwrap_or(""), &"uno", "the update applied")
+    db.batch_execute(&"DROP TABLE t_pipeline")?
+    Ok(())
+}
+
+// --- transactions -------------------------------------------------
+
+#[test]
+fn a_committed_transaction_keeps_its_work_and_a_rolled_back_one_discards_it() {
+    let _ = testing::check_ok(a_committed_transaction_keeps_its_work_and_a_rolled_back_one_discards_it_steps(), "steps")
+}
+
+fn a_committed_transaction_keeps_its_work_and_a_rolled_back_one_discards_it_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_tx")?
+    db.batch_execute(&"CREATE TABLE t_tx (id int4)")?
+
+    let mut committed = db.transaction()?
+    let _ = testing::check(db.in_transaction(), "the session is in a transaction")
+    let _ = db.execute(&"INSERT INTO t_tx VALUES ($1)", &#[pgsql::int(1)])?
+    db.commit(&mut committed)?
+    let _ = testing::check(!db.in_transaction(), "the transaction is finished")
+    let _ = testing::check(!committed.is_open(), "the handle reports it is closed")
+
+    let mut rolled_back = db.transaction()?
+    let _ = db.execute(&"INSERT INTO t_tx VALUES ($1)", &#[pgsql::int(2)])?
+    db.rollback(&mut rolled_back)?
+
+    let total = db.query_value(&"SELECT count(*) FROM t_tx", &#[])?
+    let _ = testing::check_eq(&total.as_int().unwrap_or(-1), &1, "only the committed row remains")
+    db.batch_execute(&"DROP TABLE t_tx")?
+    Ok(())
+}
+
+#[test]
+fn a_savepoint_recovers_a_transaction_whose_statement_failed() {
+    let _ = testing::check_ok(a_savepoint_recovers_a_transaction_whose_statement_failed_steps(), "steps")
+}
+
+fn a_savepoint_recovers_a_transaction_whose_statement_failed_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_savepoint")?
+    db.batch_execute(&"CREATE TABLE t_savepoint (id int4 PRIMARY KEY)")?
+
+    let mut tx = db.transaction()?
+    let _ = db.execute(&"INSERT INTO t_savepoint VALUES ($1)", &#[pgsql::int(1)])?
+    let point = db.savepoint(&mut tx)?
+    // A duplicate key fails and poisons the transaction.
+    let failed = db.execute(&"INSERT INTO t_savepoint VALUES ($1)", &#[pgsql::int(1)])
+    let _ = testing::check(failed.is_err(), "the duplicate insert failed")
+    match failed {
+        Ok(_) => ()
+        Err(e) => {
+            let _ = testing::check(
+                pgsql::unique_violation(&e)
+                &format!("reported as a unique violation: {}", e)
+            )
+        }
+    }
+    // Rolling back to the savepoint makes the transaction usable again.
+    db.rollback_to(point)?
+    let _ = db.execute(&"INSERT INTO t_savepoint VALUES ($1)", &#[pgsql::int(2)])?
+    db.commit(&mut tx)?
+
+    let ids = db.query(&"SELECT id FROM t_savepoint ORDER BY id", &#[])?
+    let _ = testing::check_eq(&ids.len(), &2, "both surviving rows committed")
+    db.batch_execute(&"DROP TABLE t_savepoint")?
+    Ok(())
+}
+
+#[test]
+fn a_read_only_transaction_refuses_to_write() {
+    let _ = testing::check_ok(a_read_only_transaction_refuses_to_write_steps(), "steps")
+}
+
+fn a_read_only_transaction_refuses_to_write_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_readonly")?
+    db.batch_execute(&"CREATE TABLE t_readonly (id int4)")?
+    let options = pgsql::client::TxOptions {
+        isolation: pgsql::client::Isolation::Serializable
+        read_only: true
+        deferrable: false
+    }
+    let mut tx = db.begin_with(&options)?
+    let outcome = db.execute(&"INSERT INTO t_readonly VALUES ($1)", &#[pgsql::int(1)])
+    let _ = testing::check(outcome.is_err(), "a write in a read-only transaction fails")
+    db.rollback(&mut tx)?
+    db.batch_execute(&"DROP TABLE t_readonly")?
+    Ok(())
+}
+
+// --- COPY ---------------------------------------------------------
+
+#[test]
+fn copy_moves_rows_in_and_out() {
+    let _ = testing::check_ok(copy_moves_rows_in_and_out_steps(), "steps")
+}
+
+fn copy_moves_rows_in_and_out_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_copy")?
+    db.batch_execute(&"CREATE TABLE t_copy (id int4, name text, note text)")?
+
+    let copied = db.copy_in_rows(
+        &"COPY t_copy (id, name, note) FROM STDIN"
+        &#[
+            #[pgsql::int(1), pgsql::text("ada"), pgsql::text("has\ttab")],
+            #[pgsql::int(2), pgsql::text("grace"), pgsql::null()],
+            #[pgsql::int(3), pgsql::text("line\nbreak"), pgsql::text("plain")],
+        ]
+    )?
+    let _ = testing::check_eq(&copied, &3, "three rows copied in")
+
+    let stored = db.query(&"SELECT id, name, note FROM t_copy ORDER BY id", &#[])?
+    let _ = testing::check_eq(&stored.len(), &3, "three rows stored")
+    let _ = testing::check_eq(&stored[0].text_of("note")?, &"has\ttab", "an escaped tab survives")
+    let _ = testing::check(stored[1].is_null_of("note"), "a NULL field stays NULL")
+    let _ = testing::check_eq(
+        &stored[2].text_of("name")?
+        &"line\nbreak"
+        "an escaped newline survives"
+    )
+
+    let lines = db.copy_out_lines(&"COPY t_copy (id, name) TO STDOUT")?
+    let _ = testing::check_eq(&lines.len(), &3, "three lines copied out")
+    let _ = testing::check(lines[0].starts_with("1\t"), &format!("first line: {}", lines[0]))
+
+    let csv = db.copy_out(&"COPY t_copy (id) TO STDOUT WITH (FORMAT csv)")?
+    let _ = testing::check(csv.len() > 0, "csv output arrived")
+
+    db.batch_execute(&"DROP TABLE t_copy")?
+    Ok(())
+}
+
+#[test]
+fn a_copy_into_a_missing_table_is_reported() {
+    let _ = testing::check_ok(a_copy_into_a_missing_table_is_reported_steps(), "steps")
+}
+
+fn a_copy_into_a_missing_table_is_reported_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let outcome = db.copy_in(&"COPY t_copy_absent FROM STDIN", &#[])
+    let _ = testing::check(outcome.is_err(), "the failure is reported")
+    // The connection survives it.
+    db.ping()?
+    Ok(())
+}
+
+// --- LISTEN / NOTIFY ----------------------------------------------
+
+#[test]
+fn a_notification_arrives_on_the_channel_it_was_sent_to() {
+    let _ = testing::check_ok(a_notification_arrives_on_the_channel_it_was_sent_to_steps(), "steps")
+}
+
+fn a_notification_arrives_on_the_channel_it_was_sent_to_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.listen("gos_pgsql_events")?
+    db.notify("gos_pgsql_events", "row 7 changed")?
+    // The delivery rides the next exchange, or the poll waits for it.
+    match db.poll_notification(2_000)? {
+        Some(n) => {
+            let _ = testing::check_eq(&n.channel, &"gos_pgsql_events", "channel")
+            let _ = testing::check_eq(&n.payload, &"row 7 changed", "payload")
+            let _ = testing::check(n.pid > 0, "sender pid")
+        }
+        None => { let _ = testing::check(false, "a notification was expected") }
+    }
+    db.unlisten("gos_pgsql_events")?
+    Ok(())
+}
+
+#[test]
+fn polling_with_no_notification_answers_none() {
+    let _ = testing::check_ok(polling_with_no_notification_answers_none_steps(), "steps")
+}
+
+fn polling_with_no_notification_answers_none_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.listen("gos_pgsql_quiet")?
+    let _ = testing::check(
+        db.poll_notification(0)?.is_none()
+        "a zero timeout answers None on a quiet channel"
+    )
+    db.unlisten("")?
+    db.ping()?
+    Ok(())
+}
+
+// --- errors -------------------------------------------------------
+
+#[test]
+fn a_server_error_carries_its_sqlstate_and_leaves_the_connection_usable() {
+    let _ = testing::check_ok(a_server_error_carries_its_sqlstate_and_leaves_the_connection_usable_steps(), "steps")
+}
+
+fn a_server_error_carries_its_sqlstate_and_leaves_the_connection_usable_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let outcome = db.query(&"SELECT * FROM a_table_that_does_not_exist", &#[])
+    match outcome {
+        Ok(_) => { let _ = testing::check(false, "expected a failure") }
+        Err(e) => {
+            let _ = testing::check_eq(
+                &pgsql::sqlstate_of(&e)
+                &"42P01"
+                &format!("undefined_table sqlstate: {}", e)
+            )
+            let _ = testing::check(pgsql::in_error_class(&e, "42"), "syntax / access class")
+            let _ = testing::check(!pgsql::retryable(&e), "not retryable")
+        }
+    }
+    // The session is still usable after the failure.
+    let after = db.query_value(&"SELECT 1", &#[])?
+    let _ = testing::check_eq(&after.as_int().unwrap_or(0), &1, "the next query works")
+    Ok(())
+}
+
+#[test]
+fn a_constraint_violation_is_classified() {
+    let _ = testing::check_ok(a_constraint_violation_is_classified_steps(), "steps")
+}
+
+fn a_constraint_violation_is_classified_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_constraints")?
+    db.batch_execute(
+        &"""
+        CREATE TABLE t_constraints (
+            id int4 PRIMARY KEY,
+            parent int4 REFERENCES t_constraints(id),
+            name text NOT NULL
+        )
+        """
+    )?
+    let _ = db.execute(&"INSERT INTO t_constraints (id, name) VALUES (1, 'root')", &#[])?
+
+    match db.execute(&"INSERT INTO t_constraints (id, name) VALUES (1, 'again')", &#[]) {
+        Ok(_) => { let _ = testing::check(false, "a duplicate key must fail") }
+        Err(e) => { let _ = testing::check(pgsql::unique_violation(&e), &format!("unique: {}", e)) }
+    }
+    match db.execute(&"INSERT INTO t_constraints (id, parent, name) VALUES (2, 99, 'orphan')", &#[]) {
+        Ok(_) => { let _ = testing::check(false, "a missing parent must fail") }
+        Err(e) => {
+            let _ = testing::check(pgsql::foreign_key_violation(&e), &format!("foreign key: {}", e))
+        }
+    }
+    match db.execute(&"INSERT INTO t_constraints (id, name) VALUES (3, NULL)", &#[]) {
+        Ok(_) => { let _ = testing::check(false, "a NULL in a NOT NULL column must fail") }
+        Err(e) => { let _ = testing::check(pgsql::not_null_violation(&e), &format!("not null: {}", e)) }
+    }
+    db.batch_execute(&"DROP TABLE t_constraints")?
+    Ok(())
+}
+
+#[test]
+fn a_wrong_parameter_count_is_reported_before_the_wire() {
+    let _ = testing::check_ok(a_wrong_parameter_count_is_reported_before_the_wire_steps(), "steps")
+}
+
+fn a_wrong_parameter_count_is_reported_before_the_wire_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let outcome = db.execute(&"SELECT $1::int4 + $2::int4", &#[pgsql::int(1)])
+    match outcome {
+        Ok(_) => { let _ = testing::check(false, "expected a failure") }
+        Err(e) => {
+            let _ = testing::check(
+                format!("{}", e).contains("parameter")
+                &format!("names the mismatch: {}", e)
+            )
+        }
+    }
+    db.ping()?
+    Ok(())
+}
+
+#[test]
+fn a_notice_is_collected_rather_than_raised() {
+    let _ = testing::check_ok(a_notice_is_collected_rather_than_raised_steps(), "steps")
+}
+
+fn a_notice_is_collected_rather_than_raised_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS t_notice")?
+    // `DROP TABLE IF EXISTS` on a missing table is a notice, not an error.
+    db.batch_execute(&"DROP TABLE IF EXISTS t_notice")?
+    let notices = db.take_notices()
+    let _ = testing::check(notices.len() > 0, "the notice was collected")
+    let _ = testing::check(
+        notices[0].code != ""
+        &format!("the notice carries a sqlstate: {}", notices[0].render())
+    )
+    let _ = testing::check_eq(&db.take_notices().len(), &0, "taking them clears the queue")
+    Ok(())
+}
+
+// --- cancellation -------------------------------------------------
+
+#[test]
+fn a_cancel_token_stops_a_running_query() {
+    let _ = testing::check_ok(a_cancel_token_stops_a_running_query_steps(), "steps")
+}
+
+fn a_cancel_token_stops_a_running_query_steps() -> Result<(), errors::Error> {
+    let mut db = open_test_db()?
+    defer db.close()
+    let token = db.cancel_token()
+    // The cancel goes out on its own connection while this one sleeps. The
+    // token is captured by the closure rather than passed as a `go`
+    // argument: the compiled concurrency ABI moves no aggregate across that
+    // boundary, while a capture reaches it by reference.
+    let cancel = || {
+        time::sleep(300)
+        let _ = token.cancel()
+    }
+    go cancel()
+    let outcome = db.query(&"SELECT pg_sleep(10)", &#[])
+    match outcome {
+        Ok(_) => { let _ = testing::check(false, "the sleep should have been cancelled") }
+        Err(e) => {
+            let _ = testing::check(
+                pgsql::sqlstate_of(&e) == "57014"
+                &format!("query_canceled sqlstate: {}", e)
+            )
+        }
+    }
+    // The session survives a cancellation.
+    let after = db.query_value(&"SELECT 5", &#[])?
+    let _ = testing::check_eq(&after.as_int().unwrap_or(0), &5, "the next query works")
+    Ok(())
+}
+
+// --- pool ---------------------------------------------------------
+
+#[test]
+fn a_pool_reuses_its_connections_and_caps_them() {
+    let _ = testing::check_ok(a_pool_reuses_its_connections_and_caps_them_steps(), "steps")
+}
+
+fn a_pool_reuses_its_connections_and_caps_them_steps() -> Result<(), errors::Error> {
+    let mut pool = pgsql::pool_open(&test_url(), 2)?
+    pool.warm(2)?
+    let _ = testing::check_eq(&pool.idle_count(), &2, "two connections warmed")
+
+    let mut first = pool.acquire()?
+    let mut second = pool.acquire()?
+    let _ = testing::check_eq(&pool.idle_count(), &0, "both are checked out")
+    let _ = testing::check(
+        pool.acquire().is_err()
+        "a third checkout reports the pool is at its cap"
+    )
+
+    let a = first.query_value(&"SELECT 1", &#[])?
+    let b = second.query_value(&"SELECT 2", &#[])?
+    let _ = testing::check_eq(&a.as_int().unwrap_or(0), &1, "the first connection works")
+    let _ = testing::check_eq(&b.as_int().unwrap_or(0), &2, "the second connection works")
+    let _ = testing::check(
+        first.backend_pid() != second.backend_pid()
+        "they are different sessions"
+    )
+
+    pool.release(first)
+    pool.release(second)
+    let _ = testing::check_eq(&pool.idle_count(), &2, "both came back")
+
+    // A connection left in a transaction is cleaned before it is reused.
+    let mut third = pool.acquire()?
+    let _ = third.transaction()?
+    pool.release(third)
+    let mut fourth = pool.acquire()?
+    let _ = testing::check(
+        !fourth.in_transaction()
+        "the reused connection is not in a transaction"
+    )
+    pool.release(fourth)
+    pool.close_idle()
+    let _ = testing::check_eq(&pool.idle_count(), &0, "closing drops the idle connections")
+    Ok(())
+}
+
+// --- concurrency --------------------------------------------------
+
+#[test]
+fn goroutines_each_work_on_their_own_connection() {
+    let _ = testing::check_ok(goroutines_each_work_on_their_own_connection_steps(), "steps")
+}
+
+fn goroutines_each_work_on_their_own_connection_steps() -> Result<(), errors::Error> {
+    // A connection is a request/response stream, so concurrent work takes
+    // one connection each; a cohort keeps them accounted for.
+    let url = test_url()
+    cohort {
+        let a = spawn(|| shard_total(&url, 1, 100))
+        let b = spawn(|| shard_total(&url, 101, 200))
+        let first = a.join()??
+        let second = b.join()??
+        let _ = testing::check_eq(&first, &5_050, "the first shard's sum")
+        let _ = testing::check_eq(&second, &15_050, "the second shard's sum")
+    }?
+    Ok(())
+}
+
+fn shard_total(url: &String, low: i64, high: i64) -> Result<i64, errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    let total = db.query_value(
+        &"SELECT sum(i)::int8 FROM generate_series($1::int4, $2::int4) AS s(i)"
+        &#[pgsql::int(low), pgsql::int(high)]
+    )?
+    Ok(total.as_int().unwrap_or(0))
+}

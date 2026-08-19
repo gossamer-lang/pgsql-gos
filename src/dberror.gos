@@ -1,0 +1,266 @@
+// A server ErrorResponse or NoticeResponse, with every field the protocol
+// defines. `code` is the five-character SQLSTATE, which is the field to
+// branch on: it is stable across server versions and locales, while
+// `message` is localized.
+
+use std::errors
+
+use crate::buf
+
+// A message the server reports out of band or as a query failure.
+pub struct DbError {
+    // Localized severity ("ERROR", "FATAL", "PANIC", "WARNING", "NOTICE",
+    // "DEBUG", "INFO", "LOG").
+    pub severity: String
+    // Severity in English, sent unlocalized by servers from 9.6 on.
+    pub severity_unlocalized: String
+    // Five-character SQLSTATE.
+    pub code: String
+    // Primary human-readable message.
+    pub message: String
+    // Optional secondary detail.
+    pub detail: String
+    // Optional suggestion of what to do about the problem.
+    pub hint: String
+    // Cursor position into the original query string, 1-based; 0 when absent.
+    pub position: i64
+    // Cursor position into an internally generated command.
+    pub internal_position: i64
+    // Text of a failed internally generated command.
+    pub internal_query: String
+    // Context in which the error occurred: a call stack traceback.
+    pub context_trace: String
+    // Schema, table, column, data type, and constraint the error concerns.
+    pub schema: String
+    pub table: String
+    pub column: String
+    pub datatype: String
+    pub constraint: String
+    // Server source location that reported the error.
+    pub file: String
+    pub line: i64
+    pub routine: String
+}
+
+impl DbError {
+    // An empty report, to be filled from a wire message.
+    pub fn blank() -> DbError {
+        DbError {
+            severity: ""
+            severity_unlocalized: ""
+            code: ""
+            message: ""
+            detail: ""
+            hint: ""
+            position: 0
+            internal_position: 0
+            internal_query: ""
+            context_trace: ""
+            schema: ""
+            table: ""
+            column: ""
+            datatype: ""
+            constraint: ""
+            file: ""
+            line: 0
+            routine: ""
+        }
+    }
+
+    // True when the error's SQLSTATE class (its first two characters)
+    // matches `class`. Class "23" is an integrity-constraint violation,
+    // "40" a transaction rollback, "42" a syntax or access-rule error.
+    pub fn in_class(&self, class: &String) -> bool {
+        self.code.starts_with(class)
+    }
+
+    // True when the failure is a serialization failure or deadlock, the
+    // two SQLSTATEs a caller retries.
+    pub fn is_retryable(&self) -> bool {
+        self.code == "40001" || self.code == "40P01"
+    }
+
+    // True when the error reports a unique-constraint violation.
+    pub fn is_unique_violation(&self) -> bool {
+        self.code == "23505"
+    }
+
+    // True when the error reports a foreign-key violation.
+    pub fn is_foreign_key_violation(&self) -> bool {
+        self.code == "23503"
+    }
+
+    // True when the error reports a not-null violation.
+    pub fn is_not_null_violation(&self) -> bool {
+        self.code == "23502"
+    }
+
+    // True when the connection cannot be used further: the server is
+    // shutting down, the session was terminated, or an admin cancelled it.
+    pub fn is_fatal(&self) -> bool {
+        self.severity_unlocalized == "FATAL" || self.severity_unlocalized == "PANIC"
+    }
+
+    // `[SQLSTATE] message`, with detail and hint appended when present.
+    pub fn render(&self) -> String {
+        let mut out = if self.code == "" {
+            self.message.clone()
+        } else {
+            format!("[{}] {}", self.code, self.message)
+        }
+        if self.detail != "" {
+            out += format!(": {}", self.detail)
+        }
+        if self.hint != "" {
+            out += format!(" (hint: {})", self.hint)
+        }
+        out
+    }
+
+    // The report as an `errors::Error`, so a caller propagates it with `?`.
+    pub fn as_error(&self) -> errors::Error {
+        errors::new(self.render())
+    }
+}
+
+// The SQLSTATE of a driver error, or `""` when the failure did not come from
+// the server. Every server error is reported as `[SQLSTATE] message`, which
+// is what this reads back.
+pub fn sqlstate_of(e: &errors::Error) -> String {
+    let text = format!("{}", e)
+    if !text.starts_with("[") {
+        return ""
+    }
+    let Some(end) = text.find("]") else { return "" }
+    let code = text.substring(1, end)
+    if code.byte_len() == 5 { code } else { "" }
+}
+
+// Parses an ErrorResponse / NoticeResponse body: a sequence of
+// field-type-byte + NUL-terminated value, ended by a zero byte.
+pub fn parse(body: &Vec<u8>) -> DbError {
+    let mut out = DbError::blank()
+    let n = body.len()
+    let mut i = 0
+    while i < n {
+        let kind = buf::u8_at(body, i)
+        if kind == 0 {
+            break
+        }
+        let (value, next) = buf::cstr_at(body, i + 1)
+        assign(&mut out, kind, &value)
+        i = next
+    }
+    out
+}
+
+// Field type bytes, from the protocol's ErrorResponse definition.
+const FIELD_SEVERITY: i64 = 83
+const FIELD_SEVERITY_UNLOCALIZED: i64 = 86
+const FIELD_CODE: i64 = 67
+const FIELD_MESSAGE: i64 = 77
+const FIELD_DETAIL: i64 = 68
+const FIELD_HINT: i64 = 72
+const FIELD_POSITION: i64 = 80
+const FIELD_INTERNAL_POSITION: i64 = 112
+const FIELD_INTERNAL_QUERY: i64 = 113
+const FIELD_WHERE: i64 = 87
+const FIELD_SCHEMA: i64 = 115
+const FIELD_TABLE: i64 = 116
+const FIELD_COLUMN: i64 = 99
+const FIELD_DATATYPE: i64 = 100
+const FIELD_CONSTRAINT: i64 = 110
+const FIELD_FILE: i64 = 70
+const FIELD_LINE: i64 = 76
+const FIELD_ROUTINE: i64 = 82
+
+fn assign(out: &mut DbError, kind: i64, value: &String) {
+    match kind {
+        FIELD_SEVERITY => { out.severity = value.clone() }
+        FIELD_SEVERITY_UNLOCALIZED => { out.severity_unlocalized = value.clone() }
+        FIELD_CODE => { out.code = value.clone() }
+        FIELD_MESSAGE => { out.message = value.clone() }
+        FIELD_DETAIL => { out.detail = value.clone() }
+        FIELD_HINT => { out.hint = value.clone() }
+        FIELD_POSITION => { out.position = to_int(value) }
+        FIELD_INTERNAL_POSITION => { out.internal_position = to_int(value) }
+        FIELD_INTERNAL_QUERY => { out.internal_query = value.clone() }
+        FIELD_WHERE => { out.context_trace = value.clone() }
+        FIELD_SCHEMA => { out.schema = value.clone() }
+        FIELD_TABLE => { out.table = value.clone() }
+        FIELD_COLUMN => { out.column = value.clone() }
+        FIELD_DATATYPE => { out.datatype = value.clone() }
+        FIELD_CONSTRAINT => { out.constraint = value.clone() }
+        FIELD_FILE => { out.file = value.clone() }
+        FIELD_LINE => { out.line = to_int(value) }
+        FIELD_ROUTINE => { out.routine = value.clone() }
+        _ => ()
+    }
+}
+
+fn to_int(text: &String) -> i64 {
+    text.to_i64().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod dberror_tests {
+    use std::testing
+
+    fn sample() -> Vec<u8> {
+        let mut b: Vec<u8> = #[]
+        buf::put_u8(&mut b, 83)
+        buf::put_cstr(&mut b, &"ERROR")
+        buf::put_u8(&mut b, 86)
+        buf::put_cstr(&mut b, &"ERROR")
+        buf::put_u8(&mut b, 67)
+        buf::put_cstr(&mut b, &"23505")
+        buf::put_u8(&mut b, 77)
+        buf::put_cstr(&mut b, &"duplicate key value violates unique constraint \"t_pkey\"")
+        buf::put_u8(&mut b, 68)
+        buf::put_cstr(&mut b, &"Key (id)=(1) already exists.")
+        buf::put_u8(&mut b, 110)
+        buf::put_cstr(&mut b, &"t_pkey")
+        buf::put_u8(&mut b, 116)
+        buf::put_cstr(&mut b, &"t")
+        buf::put_u8(&mut b, 80)
+        buf::put_cstr(&mut b, &"17")
+        buf::put_u8(&mut b, 76)
+        buf::put_cstr(&mut b, &"239")
+        buf::put_u8(&mut b, 0)
+        b
+    }
+
+    #[test]
+    fn parse_reads_every_field_it_is_sent() {
+        let e = super::parse(&sample())
+        let _ = testing::check_eq(&e.code, &"23505", "sqlstate")
+        let _ = testing::check_eq(&e.constraint, &"t_pkey", "constraint")
+        let _ = testing::check_eq(&e.table, &"t", "table")
+        let _ = testing::check_eq(&e.position, &17, "position")
+        let _ = testing::check_eq(&e.line, &239, "server line")
+        let _ = testing::check_eq(&e.detail, &"Key (id)=(1) already exists.", "detail")
+    }
+
+    #[test]
+    fn classification_reads_the_sqlstate() {
+        let e = super::parse(&sample())
+        let _ = testing::check(e.is_unique_violation(), "unique violation")
+        let _ = testing::check(e.in_class(&"23"), "integrity constraint class")
+        let _ = testing::check(!e.is_retryable(), "not retryable")
+        let _ = testing::check(!e.is_fatal(), "not fatal")
+    }
+
+    #[test]
+    fn render_includes_the_sqlstate_and_detail() {
+        let text = super::parse(&sample()).render()
+        let _ = testing::check(text.starts_with("[23505]"), &format!("rendered: {}", text))
+        let _ = testing::check(text.contains("already exists"), "detail included")
+    }
+
+    #[test]
+    fn parse_of_an_empty_body_is_blank() {
+        let e = super::parse(&#[])
+        let _ = testing::check_eq(&e.code, &"", "no sqlstate")
+        let _ = testing::check_eq(&e.render(), &"", "empty render")
+    }
+}

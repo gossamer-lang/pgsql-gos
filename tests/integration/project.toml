@@ -1,0 +1,7 @@
+[project]
+id      = "example.com/pgsql-gos-integration"
+version = "0.1.0"
+gossamer-version = "v0.52.1"
+
+[dependencies]
+"github.com/danpozmanter/pgsql-gos" = { path = "../.." }

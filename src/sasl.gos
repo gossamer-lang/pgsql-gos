@@ -1,0 +1,369 @@
+// Authentication exchanges: the MD5 challenge, and SCRAM-SHA-256
+// (RFC 5802 / RFC 7677) as PostgreSQL wraps it in SASL messages.
+//
+// SCRAM proves knowledge of the password without sending it, and proves the
+// server knows the stored verifier: the client checks the server's signature
+// before treating the session as authenticated.
+
+use std::{encoding, errors}
+use std::crypto::{hmac, insecure, kdf, rand, sha256}
+
+use crate::buf
+
+// PostgreSQL's md5 challenge response: `md5` followed by the hex of
+// md5(hex(md5(password + user)) + salt).
+//
+// The second digest covers bytes rather than text: the salt is four random
+// bytes, which are not UTF-8 in general, so it is hashed as it arrived.
+pub fn md5_response(password: &String, user: &String, salt: &Vec<u8>) -> String {
+    let mut challenge: Vec<u8> = insecure::md5_hex(password.clone() + user).as_bytes()
+    challenge.extend(salt)
+    "md5" + &buf::to_hex(&insecure::md5(challenge))
+}
+
+// A SCRAM exchange in progress. The client drives it: `client_first`, then
+// `client_final` with the server's first message, then `verify_server` with
+// the signature that step derived and the server's final message.
+pub struct Scram {
+    // The client nonce, as sent.
+    pub (package) client_nonce: String
+    // The client-first-message-bare, which the auth message replays.
+    pub (package) client_first_bare: String
+    // The GS2 header, which the client-final message echoes base64-encoded.
+    pub (package) gs2_header: String
+}
+
+// The client-final message and the server signature one exchange derives.
+//
+// The signature is carried out rather than kept on the exchange, so
+// verification depends on the message having been computed: the two are one
+// step's answer, not two pieces of state to keep in step.
+pub struct ScramFinal {
+    pub message: String
+    pub server_signature: Vec<u8>
+}
+
+// The SASL mechanism names PostgreSQL offers.
+pub const MECHANISM_SCRAM_SHA_256: String = "SCRAM-SHA-256"
+pub const MECHANISM_SCRAM_SHA_256_PLUS: String = "SCRAM-SHA-256-PLUS"
+
+impl Scram {
+    // Starts an exchange with a fresh 18-byte client nonce.
+    pub fn start() -> Result<Scram, errors::Error> {
+        let raw = rand::bytes(18)?
+        Scram::with_nonce(&encoding::base64::encode(&raw).replace("=", ""))
+    }
+
+    // Starts an exchange with a caller-supplied nonce, so a test can pin
+    // the exchange to the RFC's published vectors.
+    pub fn with_nonce(nonce: &String) -> Result<Scram, errors::Error> {
+        if nonce == "" {
+            return Err(errors::new("scram: client nonce must not be empty"))
+        }
+        Ok(Scram {
+            client_nonce: nonce.clone()
+            client_first_bare: "n=,r=" + nonce
+            // Channel binding is not used: `n` says the client does not
+            // support it, so the server must offer plain SCRAM-SHA-256.
+            gs2_header: "n,,"
+        })
+    }
+
+    // The client-first message, as the SASLInitialResponse payload.
+    pub fn client_first(&self) -> String {
+        self.gs2_header.clone() + &self.client_first_bare
+    }
+
+    // The client-final message, carrying the proof, computed from the
+    // server's first message.
+    pub fn client_final(
+        &self
+        password: &String
+        server_first: &String
+    ) -> Result<ScramFinal, errors::Error> {
+        let combined_nonce = field(server_first, "r")
+        let salt_b64 = field(server_first, "s")
+        let iterations_text = field(server_first, "i")
+        if combined_nonce == "" || salt_b64 == "" || iterations_text == "" {
+            return Err(errors::newf("scram: server-first message is incomplete: {}", server_first))
+        }
+        // The server must echo the client nonce as a prefix; anything else
+        // means the exchange is not the one this client started.
+        if !combined_nonce.starts_with(&self.client_nonce) {
+            return Err(errors::new("scram: server nonce does not extend the client nonce"))
+        }
+        let salt = match encoding::base64::decode(&salt_b64) {
+            Ok(s) => s
+            Err(e) => return Err(errors::wrap(e, "scram: salt is not base64"))
+        }
+        let iterations = match iterations_text.to_i64() {
+            Some(n) => n
+            None => return Err(errors::newf("scram: iteration count `{}` is not a number", iterations_text))
+        }
+        if iterations < 1 {
+            return Err(errors::newf("scram: iteration count {} is not positive", iterations))
+        }
+
+        let salted = kdf::pbkdf2_sha256(normalize(password).as_bytes(), salt, iterations, 32)
+        let client_key = hmac::sha256_mac(salted.clone(), "Client Key".as_bytes())
+        let stored_key = sha256::digest(client_key.clone())
+        let server_key = hmac::sha256_mac(salted, "Server Key".as_bytes())
+
+        let channel_binding = encoding::base64::encode(&self.gs2_header.as_bytes())
+        let final_without_proof = "c=" + &channel_binding + ",r=" + &combined_nonce
+        let auth_message =
+            self.client_first_bare.clone() + "," + server_first + "," + &final_without_proof
+
+        let client_signature = hmac::sha256_mac(stored_key, auth_message.as_bytes())
+        let proof = xor(&client_key, &client_signature)
+
+        Ok(ScramFinal {
+            message: final_without_proof + ",p=" + &encoding::base64::encode(&proof)
+            server_signature: hmac::sha256_mac(server_key, auth_message.as_bytes())
+        })
+    }
+}
+
+// Checks the server's final message proves it holds the stored verifier.
+//
+// `expected` is the signature the client's own final step derived, so a
+// server that cannot answer with the same one is rejected. An exchange that
+// skipped this check would accept any server that echoed a well-formed
+// message.
+pub fn verify_server(expected: &Vec<u8>, server_final: &String) -> Result<(), errors::Error> {
+    let error_field = field(server_final, "e")
+    if error_field != "" {
+        return Err(errors::newf("scram: server rejected authentication: {}", error_field))
+    }
+    let verifier_b64 = field(server_final, "v")
+    if verifier_b64 == "" {
+        return Err(errors::newf("scram: server-final message has no verifier: {}", server_final))
+    }
+    let verifier = match encoding::base64::decode(&verifier_b64) {
+        Ok(v) => v
+        Err(e) => return Err(errors::wrap(e, "scram: server verifier is not base64"))
+    }
+    if expected.len() == 0 {
+        return Err(errors::new("scram: client-final message was never computed"))
+    }
+    if !constant_time_eq(&verifier, expected) {
+        return Err(errors::new("scram: server signature does not match"))
+    }
+    Ok(())
+}
+
+// Picks the mechanism to use from the list the server advertises.
+//
+// Channel binding needs the TLS server certificate to hash, which no
+// Gossamer socket API exposes, so the client never claims support for it.
+// `require_binding` therefore reports the situation rather than silently
+// authenticating without the protection the caller asked for.
+pub fn choose_mechanism(
+    offered: &Vec<String>
+    require_binding: bool
+) -> Result<String, errors::Error> {
+    if require_binding {
+        return Err(errors::new(
+            "channel_binding=require: SCRAM channel binding needs the server certificate, which std::net does not expose; use channel_binding=prefer or sslmode=verify-full"
+        ))
+    }
+    if offered.contains(MECHANISM_SCRAM_SHA_256) {
+        return Ok(MECHANISM_SCRAM_SHA_256)
+    }
+    if offered.is_empty() {
+        return Err(errors::new("scram: server offered no SASL mechanism"))
+    }
+    Err(errors::newf(
+        "scram: server offers only {}; this driver speaks {}"
+        offered.join(", ")
+        MECHANISM_SCRAM_SHA_256
+    ))
+}
+
+// The value of `key=value` in a comma-separated SCRAM message.
+fn field(message: &String, key: String) -> String {
+    for part in message.split(",") {
+        let Some((k, v)) = part.split_once("=") else { continue }
+        if k == key {
+            return v
+        }
+    }
+    ""
+}
+
+// SASLprep (RFC 4013) as it applies to a PostgreSQL password.
+//
+// The mapping that matters in practice is that a non-ASCII password must
+// already be in normalization form KC. A password of printable ASCII - the
+// overwhelming majority - is unchanged, and one carrying other scalars is
+// passed through as written rather than mangled by a partial
+// implementation: a wrong normalization fails authentication in a way that
+// is much harder to diagnose than an unnormalized one.
+fn normalize(password: &String) -> String {
+    password.clone()
+}
+
+// XOR of two equal-length byte strings.
+fn xor(a: &Vec<u8>, b: &Vec<u8>) -> Vec<u8> {
+    a.iter().zip(b.iter()).map(|(x, y)| ((x as i64) ^ (y as i64)) as u8).collect()
+}
+
+// Compares two byte strings without an early exit, so the time taken does
+// not reveal how many leading bytes matched.
+fn constant_time_eq(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    a.iter().zip(b.iter()).fold(0, |diff, (x, y)| diff | ((x as i64) ^ (y as i64))) == 0
+}
+
+#[cfg(test)]
+mod sasl_tests {
+    use std::{encoding, testing}
+
+    // RFC 7677 section 3 test vector, with PostgreSQL's `n=` (empty
+    // username, which the protocol carries in the startup message
+    // instead) in place of the RFC's `n=user`.
+    #[test]
+    fn scram_computes_the_rfc_proof_shape() {
+        match super::Scram::with_nonce(&"rOprNGfwEbeRWgbNEkqO") {
+            Ok(s) => {
+                let _ = testing::check_eq(
+                    &s.client_first()
+                    &"n,,n=,r=rOprNGfwEbeRWgbNEkqO"
+                    "client-first"
+                )
+                let server_first =
+                    "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+                match s.client_final(&"pencil", &server_first) {
+                    Ok(step) => {
+                        let _ = testing::check(
+                            step.message.starts_with("c=biws,r=rOprNGfwEbeRWgbNEkqO")
+                            &format!("client-final prefix: {}", step.message)
+                        )
+                        let _ = testing::check(
+                            step.message.contains(",p=")
+                            "client-final carries a proof"
+                        )
+                        // The server signature comes out of the same step, so
+                        // the exchange can be verified against it.
+                        let _ = testing::check_eq(
+                            &step.server_signature.len()
+                            &32
+                            "server signature length"
+                        )
+                    }
+                    Err(e) => { let _ = testing::check(false, &format!("client_final: {}", e)) }
+                }
+            }
+            Err(e) => { let _ = testing::check(false, &format!("start: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn scram_rejects_a_server_nonce_that_does_not_extend_the_client_nonce() {
+        match super::Scram::with_nonce(&"clientnonce") {
+            Ok(s) => {
+                let bad = "r=someoneelse,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+                let _ = testing::check(
+                    s.client_final(&"pencil", &bad).is_err()
+                    "mismatched nonce rejected"
+                )
+            }
+            Err(e) => { let _ = testing::check(false, &format!("start: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn scram_rejects_an_incomplete_server_first_message() {
+        match super::Scram::with_nonce(&"clientnonce") {
+            Ok(s) => {
+                let _ = testing::check(
+                    s.client_final(&"pencil", &"r=clientnonceX,i=4096").is_err()
+                    "missing salt rejected"
+                )
+                let _ = testing::check(
+                    s.client_final(&"pencil", &"r=clientnonceX,s=W22ZaJ0SNY7soEsUEjb6gQ==").is_err()
+                    "missing iteration count rejected"
+                )
+            }
+            Err(e) => { let _ = testing::check(false, &format!("start: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn scram_verifies_the_server_signature_it_computed() {
+        match super::Scram::with_nonce(&"clientnonce") {
+            Ok(s) => {
+                let server_first = "r=clientnonceSERVER,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+                match s.client_final(&"pencil", &server_first) {
+                    Ok(step) => {
+                        let signature = step.server_signature
+                        let good = "v=" + &encoding::base64::encode(&signature)
+                        let _ = testing::check(
+                            super::verify_server(&signature, &good).is_ok()
+                            "matching signature"
+                        )
+                        let _ = testing::check(
+                            super::verify_server(
+                                &signature
+                                &"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                            )
+                                .is_err()
+                            "wrong signature rejected"
+                        )
+                        let _ = testing::check(
+                            super::verify_server(&signature, &"e=invalid-proof").is_err()
+                            "server error reported"
+                        )
+                        let _ = testing::check(
+                            super::verify_server(&signature, &"r=nothing").is_err()
+                            "missing verifier rejected"
+                        )
+                        let _ = testing::check(
+                            super::verify_server(&#[], &good).is_err()
+                            "an uncomputed exchange cannot verify"
+                        )
+                    }
+                    Err(e) => { let _ = testing::check(false, &format!("client_final: {}", e)) }
+                }
+            }
+            Err(e) => { let _ = testing::check(false, &format!("start: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn md5_response_matches_the_servers_own_digest() {
+        let _ = testing::check_eq(
+            &super::md5_response(&"secret", &"me", &#[1, 2, 3, 4])
+            &"md58322d584bf59f0253d58346307bb6ba3"
+            "md5(hex(md5(password + user)) + salt)"
+        )
+        // Most salts are not valid UTF-8, so the digest covers raw bytes.
+        let _ = testing::check_eq(
+            &super::md5_response(&"secret", &"me", &#[222, 173, 190, 239])
+            &"md54126c9389903905008bcf46cb62308e4"
+            "a high-byte salt hashes as it arrived"
+        )
+    }
+
+    #[test]
+    fn mechanism_choice_takes_plain_scram_and_reports_anything_else() {
+        match super::choose_mechanism(&#["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"], false) {
+            Ok(name) => { let _ = testing::check_eq(&name, &"SCRAM-SHA-256", "plain scram chosen") }
+            Err(e) => { let _ = testing::check(false, &format!("choice: {}", e)) }
+        }
+        let _ = testing::check(
+            super::choose_mechanism(&#["SCRAM-SHA-256"], true).is_err()
+            "channel_binding=require is reported, not silently ignored"
+        )
+        let _ = testing::check(
+            super::choose_mechanism(&#["GSSAPI"], false).is_err()
+            "an unsupported mechanism is reported"
+        )
+        let _ = testing::check(
+            super::choose_mechanism(&#[], false).is_err()
+            "no mechanism is reported"
+        )
+    }
+}

@@ -1,0 +1,186 @@
+// Message tags and framing for the PostgreSQL frontend/backend protocol,
+// version 3.0.
+//
+// Every message except the startup, SSL-request, and cancel-request packets
+// is a one-byte tag, an Int32 length covering the length field and the body,
+// then the body. The constants are spelled as their ASCII byte so a trace of
+// the wire reads directly against them.
+
+use crate::buf
+
+// Protocol version 3.0, as the startup message's first Int32.
+pub const PROTOCOL_VERSION: i64 = 196_608
+// Request codes sent in place of a protocol version.
+pub const SSL_REQUEST_CODE: i64 = 80_877_103
+pub const GSSENC_REQUEST_CODE: i64 = 80_877_104
+pub const CANCEL_REQUEST_CODE: i64 = 80_877_102
+
+// Backend message tags.
+pub const B_AUTHENTICATION: i64 = 82
+pub const B_BACKEND_KEY_DATA: i64 = 75
+pub const B_BIND_COMPLETE: i64 = 50
+pub const B_CLOSE_COMPLETE: i64 = 51
+pub const B_COMMAND_COMPLETE: i64 = 67
+pub const B_COPY_DATA: i64 = 100
+pub const B_COPY_DONE: i64 = 99
+pub const B_COPY_IN_RESPONSE: i64 = 71
+pub const B_COPY_OUT_RESPONSE: i64 = 72
+pub const B_COPY_BOTH_RESPONSE: i64 = 87
+pub const B_DATA_ROW: i64 = 68
+pub const B_EMPTY_QUERY_RESPONSE: i64 = 73
+pub const B_ERROR_RESPONSE: i64 = 69
+pub const B_FUNCTION_CALL_RESPONSE: i64 = 86
+pub const B_NEGOTIATE_PROTOCOL_VERSION: i64 = 118
+pub const B_NO_DATA: i64 = 110
+pub const B_NOTICE_RESPONSE: i64 = 78
+pub const B_NOTIFICATION_RESPONSE: i64 = 65
+pub const B_PARAMETER_DESCRIPTION: i64 = 116
+pub const B_PARAMETER_STATUS: i64 = 83
+pub const B_PARSE_COMPLETE: i64 = 49
+pub const B_PORTAL_SUSPENDED: i64 = 115
+pub const B_READY_FOR_QUERY: i64 = 90
+pub const B_ROW_DESCRIPTION: i64 = 84
+
+// Frontend message tags.
+pub const F_BIND: i64 = 66
+pub const F_CLOSE: i64 = 67
+pub const F_COPY_DATA: i64 = 100
+pub const F_COPY_DONE: i64 = 99
+pub const F_COPY_FAIL: i64 = 102
+pub const F_DESCRIBE: i64 = 68
+pub const F_EXECUTE: i64 = 69
+pub const F_FLUSH: i64 = 72
+pub const F_FUNCTION_CALL: i64 = 70
+pub const F_PARSE: i64 = 80
+pub const F_PASSWORD: i64 = 112
+pub const F_QUERY: i64 = 81
+pub const F_SYNC: i64 = 83
+pub const F_TERMINATE: i64 = 88
+
+// Describe / Close target bytes.
+pub const TARGET_STATEMENT: i64 = 83
+pub const TARGET_PORTAL: i64 = 80
+
+// Authentication request subtypes, from the Authentication message's Int32.
+pub const AUTH_OK: i64 = 0
+pub const AUTH_KERBEROS_V5: i64 = 2
+pub const AUTH_CLEARTEXT_PASSWORD: i64 = 3
+pub const AUTH_MD5_PASSWORD: i64 = 5
+pub const AUTH_SCM_CREDENTIAL: i64 = 6
+pub const AUTH_GSS: i64 = 7
+pub const AUTH_GSS_CONTINUE: i64 = 8
+pub const AUTH_SSPI: i64 = 9
+pub const AUTH_SASL: i64 = 10
+pub const AUTH_SASL_CONTINUE: i64 = 11
+pub const AUTH_SASL_FINAL: i64 = 12
+
+// Transaction status, as ReadyForQuery reports it.
+pub const TX_IDLE: i64 = 73
+pub const TX_IN_TRANSACTION: i64 = 84
+pub const TX_FAILED: i64 = 69
+
+// A tagged frontend message: the tag, an Int32 length covering itself and
+// the body, then the body.
+pub fn frame(tag: i64, body: &Vec<u8>) -> Vec<u8> {
+    let mut out: Vec<u8> = #[]
+    buf::put_u8(&mut out, tag)
+    buf::put_i32(&mut out, 4 + body.len())
+    buf::put_bytes(&mut out, body)
+    out
+}
+
+// An untagged message: an Int32 length covering itself and the body, then
+// the body. The startup, SSL-request, and cancel-request packets use this
+// shape because they precede any tag negotiation.
+pub fn untagged(body: &Vec<u8>) -> Vec<u8> {
+    let mut out: Vec<u8> = #[]
+    buf::put_i32(&mut out, 4 + body.len())
+    buf::put_bytes(&mut out, body)
+    out
+}
+
+// The SSLRequest packet.
+pub fn ssl_request() -> Vec<u8> {
+    let mut body: Vec<u8> = #[]
+    buf::put_i32(&mut body, SSL_REQUEST_CODE)
+    untagged(&body)
+}
+
+// A CancelRequest for the given backend, sent on its own connection.
+pub fn cancel_request(pid: i64, secret: i64) -> Vec<u8> {
+    let mut body: Vec<u8> = #[]
+    buf::put_i32(&mut body, CANCEL_REQUEST_CODE)
+    buf::put_i32(&mut body, pid)
+    buf::put_i32(&mut body, secret)
+    untagged(&body)
+}
+
+// The name a `CommandComplete` tag reports, and the row count it carries.
+//
+// The count is the tag's last whitespace-separated field for the commands
+// that report one (`INSERT 0 3`, `UPDATE 2`, `SELECT 5`); a command with no
+// count (`BEGIN`, `CREATE TABLE`) reports 0.
+pub fn command_complete(body: &Vec<u8>) -> (String, i64) {
+    let n = body.len()
+    let end = if n > 0 && body[n - 1] == 0 { n - 1 } else { n }
+    let tag = buf::utf8_lossy(&buf::slice(body, 0, end))
+    let fields = tag.split(" ").filter(|field| field != "")
+    let count = fields.last().unwrap_or("").to_i64().unwrap_or(0)
+    (tag, count)
+}
+
+#[cfg(test)]
+mod proto_tests {
+    use std::testing
+
+    #[test]
+    fn frame_writes_the_tag_and_a_self_inclusive_length() {
+        let body: Vec<u8> = #[1, 2, 3]
+        let msg = super::frame(super::F_QUERY, &body)
+        let _ = testing::check_eq(&msg.len(), &8, "tag plus length plus body")
+        let _ = testing::check_eq(&(msg[0] as i64), &super::F_QUERY, "tag byte")
+        let _ = testing::check_eq(&buf::i32_at(&msg, 1), &7, "length covers itself")
+    }
+
+    #[test]
+    fn untagged_writes_only_the_length_and_body() {
+        let mut body: Vec<u8> = #[]
+        buf::put_i32(&mut body, super::PROTOCOL_VERSION)
+        let msg = super::untagged(&body)
+        let _ = testing::check_eq(&msg.len(), &8, "length plus body")
+        let _ = testing::check_eq(&buf::i32_at(&msg, 0), &8, "self-inclusive length")
+        let _ = testing::check_eq(
+            &buf::i32_at(&msg, 4)
+            &super::PROTOCOL_VERSION
+            "protocol version"
+        )
+    }
+
+    #[test]
+    fn cancel_request_carries_the_backend_key() {
+        let msg = super::cancel_request(4_242, 987_654)
+        let _ = testing::check_eq(&msg.len(), &16, "cancel packet length")
+        let _ = testing::check_eq(
+            &buf::i32_at(&msg, 4)
+            &super::CANCEL_REQUEST_CODE
+            "cancel code"
+        )
+        let _ = testing::check_eq(&buf::i32_at(&msg, 8), &4_242, "pid")
+        let _ = testing::check_eq(&buf::i32_at(&msg, 12), &987_654, "secret")
+    }
+
+    #[test]
+    fn command_complete_reads_the_tag_and_row_count() {
+        let mut body: Vec<u8> = #[]
+        buf::put_cstr(&mut body, &"INSERT 0 3")
+        let (tag, count) = super::command_complete(&body)
+        let _ = testing::check_eq(&tag, &"INSERT 0 3", "tag text")
+        let _ = testing::check_eq(&count, &3, "row count")
+
+        let mut begin: Vec<u8> = #[]
+        buf::put_cstr(&mut begin, &"BEGIN")
+        let (begin_tag, begin_count) = super::command_complete(&begin)
+        let _ = testing::check_eq(&begin_tag, &"BEGIN", "countless tag")
+        let _ = testing::check_eq(&begin_count, &0, "countless tag reports zero")
+    }
+}

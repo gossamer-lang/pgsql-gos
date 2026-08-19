@@ -1,0 +1,645 @@
+// Connection parameters, and the two spellings a caller supplies them in:
+// a libpq keyword string (`host=localhost user=me dbname=db`) or a URI
+// (`postgresql://me:secret@localhost:5432/db?sslmode=require`).
+//
+// Anything a parameter does not name falls back to the standard `PG*`
+// environment variable, then to the same default libpq uses. Multiple hosts
+// are supported: they are tried in order, and `target_session_attrs`
+// decides whether a connected server is acceptable.
+
+use std::{env, errors}
+
+use crate::buf
+
+// Whether and how strictly TLS is negotiated.
+pub enum SslMode {
+    // Never negotiate TLS.
+    Disable
+    // Negotiate TLS, but continue in cleartext when the server declines.
+    Prefer
+    // Require TLS; fail when the server declines. The certificate is not
+    // checked against a trust root.
+    Require
+    // Require TLS and verify the server certificate chains to a trusted
+    // root. `sslrootcert` supplies the root when set.
+    VerifyCa
+    // Require TLS, verify the chain, and verify the certificate identifies
+    // the host being connected to.
+    VerifyFull
+}
+
+// Which server in a multi-host list is acceptable.
+pub enum TargetSessionAttrs {
+    // Any server.
+    Any
+    // Only a server that accepts writes.
+    ReadWrite
+    // Only a server that refuses writes (a hot standby).
+    ReadOnly
+    // Only a standby.
+    Standby
+    // Prefer a standby, but accept any server when none is reachable.
+    PreferStandby
+    // Only a primary.
+    Primary
+}
+
+// Whether SCRAM channel binding is required. Spelled as codes rather than
+// an enum because `Disable` / `Prefer` / `Require` already name `SslMode`
+// variants, and enum variants share their module's namespace.
+pub const CHANNEL_BINDING_DISABLE: i64 = 0
+pub const CHANNEL_BINDING_PREFER: i64 = 1
+pub const CHANNEL_BINDING_REQUIRE: i64 = 2
+
+// One host to try: a TCP host and port, or a Unix socket directory.
+pub struct HostAddr {
+    pub host: String
+    pub port: i64
+}
+
+impl HostAddr {
+    // True when the host names a Unix socket directory rather than a
+    // hostname. libpq's rule: an absolute path, or the `@` abstract-socket
+    // prefix on Linux.
+    pub fn is_unix(&self) -> bool {
+        self.host.starts_with("/") || self.host.starts_with("@")
+    }
+
+    // The Unix socket path for this entry: the directory plus the
+    // `.s.PGSQL.<port>` name the server binds.
+    pub fn socket_path(&self) -> String {
+        let dir = if self.host.ends_with("/") {
+            self.host.substring(0, self.host.byte_len() - 1)
+        } else {
+            self.host.clone()
+        }
+        format!("{}/.s.PGSQL.{}", dir, self.port)
+    }
+
+    // `host:port`, for a TCP connect and for diagnostics.
+    pub fn tcp_addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+// A resolved set of connection parameters.
+pub struct Config {
+    // Hosts to try, in order.
+    pub hosts: Vec<HostAddr>
+    pub user: String
+    pub password: Option<String>
+    pub dbname: String
+    pub sslmode: SslMode
+    // PEM-encoded root certificate for `verify-ca` / `verify-full`.
+    pub sslrootcert: Option<String>
+    // One of the `CHANNEL_BINDING_*` codes.
+    pub channel_binding: i64
+    pub application_name: Option<String>
+    pub target_session_attrs: TargetSessionAttrs
+    // Connect timeout in milliseconds; 0 for none.
+    pub connect_timeout_ms: i64
+    // Bound on a single statement, sent as `statement_timeout`; 0 for none.
+    pub statement_timeout_ms: i64
+    // Extra `-c name=value` command-line options for the session.
+    pub options: Option<String>
+    // Any other startup parameter, sent verbatim in the startup message.
+    pub runtime_params: Map<String, String>
+}
+
+impl Config {
+    // Parameters for a local connection with everything defaulted.
+    pub fn defaults() -> Config {
+        Config {
+            hosts: #[]
+            user: ""
+            password: None
+            dbname: ""
+            sslmode: SslMode::Prefer
+            sslrootcert: None
+            channel_binding: CHANNEL_BINDING_PREFER
+            application_name: None
+            target_session_attrs: TargetSessionAttrs::Any
+            connect_timeout_ms: 0
+            statement_timeout_ms: 0
+            options: None
+            runtime_params: Map::new()
+        }
+    }
+
+    // True when TLS is to be attempted at all.
+    pub fn wants_tls(&self) -> bool {
+        !matches!(self.sslmode, SslMode::Disable)
+    }
+
+    // True when a server that declines TLS must be rejected.
+    pub fn requires_tls(&self) -> bool {
+        matches!(
+            self.sslmode
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
+        )
+    }
+
+    // True when the server certificate must chain to a trusted root.
+    pub fn verifies_certificate(&self) -> bool {
+        matches!(self.sslmode, SslMode::VerifyCa | SslMode::VerifyFull)
+    }
+
+    // The `application_name` the session reports, defaulting to the
+    // driver's own name so a connection is identifiable in `pg_stat_activity`.
+    pub fn app_name(&self) -> String {
+        match self.application_name {
+            Some(name) => name
+            None => "pgsql-gos"
+        }
+    }
+}
+
+// Parses a libpq keyword string or a `postgres://` URI into a Config,
+// filling anything absent from the environment and then from libpq's
+// defaults.
+pub fn parse(text: &String) -> Result<Config, errors::Error> {
+    let trimmed = text.trim()
+    let mut kv = if trimmed.starts_with("postgresql://") || trimmed.starts_with("postgres://") {
+        parse_uri(&trimmed)?
+    } else {
+        parse_keywords(&trimmed)?
+    }
+    from_params(&mut kv)
+}
+
+// Builds a Config from an already-parsed parameter map. Consumes the
+// recognized keys; whatever is left becomes a startup runtime parameter, so
+// a setting this driver has no field for still reaches the server.
+pub fn from_params(kv: &mut Map<String, String>) -> Result<Config, errors::Error> {
+    let mut cfg = Config::defaults()
+
+    cfg.user = take_param(kv, &"user")
+        .unwrap_or(first_nonempty(#[getenv(&"PGUSER"), getenv(&"USER"), "postgres"]))
+    cfg.dbname = take_param(kv, &"dbname")
+        .unwrap_or(first_nonempty(#[getenv(&"PGDATABASE"), cfg.user.clone()]))
+    cfg.password = param_or_env(kv, &"password", &"PGPASSWORD")
+    cfg.application_name = param_or_env(kv, &"application_name", &"PGAPPNAME")
+    cfg.options = param_or_env(kv, &"options", &"PGOPTIONS")
+    cfg.sslrootcert = take_param(kv, &"sslrootcert")
+
+    let host_spec = take_param(kv, &"host")
+        .unwrap_or(first_nonempty(#[getenv(&"PGHOST"), "localhost"]))
+    let port_spec = take_param(kv, &"port")
+        .unwrap_or(first_nonempty(#[getenv(&"PGPORT"), "5432"]))
+    cfg.hosts = parse_hosts(&host_spec, &port_spec)?
+
+    let ssl_spec = take_param(kv, &"sslmode")
+        .unwrap_or(first_nonempty(#[getenv(&"PGSSLMODE"), "prefer"]))
+    cfg.sslmode = parse_sslmode(&ssl_spec)?
+
+    if let Some(v) = take_param(kv, &"channel_binding") {
+        cfg.channel_binding = parse_channel_binding(&v)?
+    }
+    if let Some(v) = take_param(kv, &"target_session_attrs") {
+        cfg.target_session_attrs = parse_target_session_attrs(&v)?
+    }
+
+    let timeout_spec = take_param(kv, &"connect_timeout").unwrap_or(getenv(&"PGCONNECT_TIMEOUT"))
+    if timeout_spec != "" {
+        // libpq's connect_timeout is in seconds, and a value below 2 is
+        // raised to 2 to avoid a timeout so short it cannot succeed.
+        let secs = parse_int(&timeout_spec, &"connect_timeout")?
+        cfg.connect_timeout_ms = if secs <= 0 { 0 } else { max(secs, 2) * 1_000 }
+    }
+    if let Some(v) = take_param(kv, &"statement_timeout") {
+        cfg.statement_timeout_ms = max(parse_int(&v, &"statement_timeout")?, 0)
+    }
+
+    // Whatever is left is a session setting the startup message carries.
+    for (key, value) in kv.iter() {
+        cfg.runtime_params.insert(key, value)
+    }
+    Ok(cfg)
+}
+
+// Splits a comma-separated host list against a comma-separated port list.
+// One port applies to every host; otherwise the counts must match, which is
+// libpq's rule.
+pub fn parse_hosts(host_spec: &String, port_spec: &String) -> Result<Vec<HostAddr>, errors::Error> {
+    let hosts = host_spec.split(",").map($.trim)
+    let mut ports: Vec<i64> = #[]
+    for part in port_spec.split(",") {
+        let trimmed = part.trim()
+        ports.push(if trimmed == "" { 5_432 } else { parse_int(&trimmed, &"port")? })
+    }
+    if ports.len() != 1 && ports.len() != hosts.len() {
+        return Err(errors::newf(
+            "{} host(s) but {} port(s): give one port, or one per host"
+            hosts.len()
+            ports.len()
+        ))
+    }
+    let mut out: Vec<HostAddr> = #[]
+    for (i, host) in hosts.iter().enumerate() {
+        out.push(HostAddr {
+            host: if host == "" { "localhost" } else { host }
+            port: if ports.len() == 1 { ports[0] } else { ports[i] }
+        })
+    }
+    Ok(out)
+}
+
+pub fn parse_sslmode(text: &String) -> Result<SslMode, errors::Error> {
+    match text {
+        "disable" => Ok(SslMode::Disable)
+        "allow" | "prefer" => Ok(SslMode::Prefer)
+        "require" => Ok(SslMode::Require)
+        "verify-ca" => Ok(SslMode::VerifyCa)
+        "verify-full" => Ok(SslMode::VerifyFull)
+        _ => Err(errors::newf("invalid sslmode `{}`", text))
+    }
+}
+
+pub fn parse_channel_binding(text: &String) -> Result<i64, errors::Error> {
+    match text {
+        "disable" => Ok(CHANNEL_BINDING_DISABLE)
+        "prefer" => Ok(CHANNEL_BINDING_PREFER)
+        "require" => Ok(CHANNEL_BINDING_REQUIRE)
+        _ => Err(errors::newf("invalid channel_binding `{}`", text))
+    }
+}
+
+pub fn parse_target_session_attrs(text: &String) -> Result<TargetSessionAttrs, errors::Error> {
+    match text {
+        "any" => Ok(TargetSessionAttrs::Any)
+        "read-write" => Ok(TargetSessionAttrs::ReadWrite)
+        "read-only" => Ok(TargetSessionAttrs::ReadOnly)
+        "standby" => Ok(TargetSessionAttrs::Standby)
+        "prefer-standby" => Ok(TargetSessionAttrs::PreferStandby)
+        "primary" => Ok(TargetSessionAttrs::Primary)
+        _ => Err(errors::newf("invalid target_session_attrs `{}`", text))
+    }
+}
+
+// Splits a libpq `key=value` keyword string, honoring single-quoted values
+// with backslash escapes.
+pub fn parse_keywords(text: &String) -> Result<Map<String, String>, errors::Error> {
+    let mut out: Map<String, String> = Map::new()
+    let n = text.byte_len()
+    let mut i = 0
+    while i < n {
+        while i < n && is_space(text.byte_at(i)) {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        let key_start = i
+        while i < n && text.byte_at(i) != 61 && !is_space(text.byte_at(i)) {
+            i += 1
+        }
+        let key = text.substring(key_start, i)
+        while i < n && is_space(text.byte_at(i)) {
+            i += 1
+        }
+        if i >= n || text.byte_at(i) != 61 {
+            return Err(errors::newf("connection string: missing `=` after `{}`", key))
+        }
+        i += 1
+        while i < n && is_space(text.byte_at(i)) {
+            i += 1
+        }
+        let (value, next) = read_keyword_value(text, i)?
+        out.insert(key, value)
+        i = next
+    }
+    Ok(out)
+}
+
+fn read_keyword_value(text: &String, start: i64) -> Result<(String, i64), errors::Error> {
+    let n = text.byte_len()
+    let mut bytes: Vec<u8> = #[]
+    let mut i = start
+    if i < n && text.byte_at(i) == 39 {
+        i += 1
+        while i < n {
+            let c = text.byte_at(i)
+            if c == 92 && i + 1 < n {
+                bytes.push(text.byte_at(i + 1) as u8)
+                i += 2
+                continue
+            }
+            if c == 39 {
+                return Ok((buf::utf8_lossy(&bytes), i + 1))
+            }
+            bytes.push(c as u8)
+            i += 1
+        }
+        return Err(errors::new("connection string: unterminated quoted value"))
+    }
+    while i < n && !is_space(text.byte_at(i)) {
+        let c = text.byte_at(i)
+        if c == 92 && i + 1 < n {
+            bytes.push(text.byte_at(i + 1) as u8)
+            i += 2
+            continue
+        }
+        bytes.push(c as u8)
+        i += 1
+    }
+    Ok((buf::utf8_lossy(&bytes), i))
+}
+
+// Parses a `postgresql://user:pass@host:port,host:port/dbname?k=v` URI into
+// the same parameter map the keyword form produces.
+pub fn parse_uri(text: &String) -> Result<Map<String, String>, errors::Error> {
+    let rest = match text.strip_prefix("postgresql://") {
+        Some(r) => r
+        None => text.strip_prefix("postgres://").unwrap_or(text.clone())
+    }
+    let mut out: Map<String, String> = Map::new()
+
+    let (authority_path, query) = match rest.split_once("?") {
+        Some((head, q)) => (head, q)
+        None => (rest, "")
+    }
+    let (authority, path) = match authority_path.split_once("/") {
+        Some((a, p)) => (a, p)
+        None => (authority_path, "")
+    }
+
+    let host_port = match authority.rsplit_once("@") {
+        Some((userinfo, hp)) => {
+            let (user, password, has_password) = match userinfo.split_once(":") {
+                Some((u, p)) => (u, p, true)
+                None => (userinfo, "", false)
+            }
+            if user != "" {
+                out.insert("user", percent_decode(&user))
+            }
+            if has_password {
+                out.insert("password", percent_decode(&password))
+            }
+            hp
+        }
+        None => authority
+    }
+    if host_port != "" {
+        let (hosts, ports) = split_uri_hosts(&host_port)?
+        if hosts != "" {
+            out.insert("host", hosts)
+        }
+        if ports != "" {
+            out.insert("port", ports)
+        }
+    }
+    if path != "" {
+        out.insert("dbname", percent_decode(&path))
+    }
+    for pair in query.split("&") {
+        if pair == "" {
+            continue
+        }
+        match pair.split_once("=") {
+            Some((k, v)) => { out.insert(percent_decode(&k), percent_decode(&v)) }
+            None => return Err(errors::newf("connection URI: query parameter `{}` has no value", pair))
+        }
+    }
+    Ok(out)
+}
+
+// Splits a URI authority's `host:port,host:port` list into a host list and
+// a port list. A bracketed IPv6 literal keeps its colons.
+fn split_uri_hosts(authority: &String) -> Result<(String, String), errors::Error> {
+    let mut hosts: Vec<String> = #[]
+    let mut ports: Vec<String> = #[]
+    let mut any_port = false
+    for entry in authority.split(",") {
+        let trimmed = entry.trim()
+        if trimmed.starts_with("[") {
+            match trimmed.rsplit_once("]") {
+                Some((bracketed, tail)) => {
+                    hosts.push(percent_decode(&(bracketed.substring(1, bracketed.byte_len()))))
+                    match tail.strip_prefix(":") {
+                        Some(port) => { ports.push(port); any_port = true }
+                        None => ports.push("5432")
+                    }
+                }
+                None => return Err(errors::newf("connection URI: unterminated IPv6 host `{}`", trimmed))
+            }
+            continue
+        }
+        match trimmed.rsplit_once(":") {
+            Some((host, port)) => {
+                hosts.push(percent_decode(&host))
+                ports.push(port)
+                any_port = true
+            }
+            None => {
+                hosts.push(percent_decode(&trimmed))
+                ports.push("5432")
+            }
+        }
+    }
+    Ok((hosts.join(","), if any_port { ports.join(",") } else { "" }))
+}
+
+// Decodes `%XX` escapes; a malformed escape is left as written, which is
+// what libpq does.
+pub fn percent_decode(text: &String) -> String {
+    let n = text.byte_len()
+    let mut bytes: Vec<u8> = #[]
+    let mut i = 0
+    while i < n {
+        if text.byte_at(i) == 37 && i + 2 < n {
+            let hi = hex_value(text.byte_at(i + 1))
+            let lo = hex_value(text.byte_at(i + 2))
+            if hi >= 0 && lo >= 0 {
+                bytes.push(((hi << 4) | lo) as u8)
+                i += 3
+                continue
+            }
+        }
+        bytes.push(text.byte_at(i) as u8)
+        i += 1
+    }
+    buf::utf8_lossy(&bytes)
+}
+
+fn hex_value(c: i64) -> i64 {
+    match c {
+        48..=57 => c - 48
+        97..=102 => c - 87
+        65..=70 => c - 55
+        _ => -1
+    }
+}
+
+fn is_space(c: i64) -> bool {
+    c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn take_param(kv: &mut Map<String, String>, key: &String) -> Option<String> {
+    Map::pop(kv, key)
+}
+
+// A parameter, or the `PG*` variable that stands in for it; `None` when
+// neither is set, so the field keeps its default.
+fn param_or_env(kv: &mut Map<String, String>, key: &String, env: &String) -> Option<String> {
+    match take_param(kv, key) {
+        Some(v) => Some(v)
+        None => {
+            let value = getenv(env)
+            if value == "" { None } else { Some(value) }
+        }
+    }
+}
+
+fn getenv(name: &String) -> String {
+    env::var(name).unwrap_or("")
+}
+
+fn first_nonempty(candidates: Vec<String>) -> String {
+    candidates.iter().find(|candidate| candidate != "").unwrap_or("")
+}
+
+fn parse_int(text: &String, what: &String) -> Result<i64, errors::Error> {
+    match text.to_i64() {
+        Some(v) => Ok(v)
+        None => Err(errors::newf("invalid {} `{}`", what, text))
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use std::testing
+
+    #[test]
+    fn keyword_form_parses_every_recognized_key() {
+        match super::parse(&"host=db.example.com port=6000 user=me password=secret dbname=app sslmode=require application_name=tool connect_timeout=10") {
+            Ok(cfg) => {
+                let _ = testing::check_eq(&cfg.hosts.len(), &1, "one host")
+                let _ = testing::check_eq(&cfg.hosts[0].host, &"db.example.com", "host")
+                let _ = testing::check_eq(&cfg.hosts[0].port, &6_000, "port")
+                let _ = testing::check_eq(&cfg.user, &"me", "user")
+                let _ = testing::check_eq(&cfg.password.unwrap_or(""), &"secret", "password")
+                let _ = testing::check_eq(&cfg.dbname, &"app", "dbname")
+                let _ = testing::check_eq(&cfg.app_name(), &"tool", "application name")
+                let _ = testing::check_eq(&cfg.connect_timeout_ms, &10_000, "timeout ms")
+                let _ = testing::check(cfg.requires_tls(), "sslmode=require")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("parse failed: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn a_quoted_keyword_value_keeps_its_spaces_and_escapes() {
+        match super::parse_keywords(&"password='a b\\'c' user=me") {
+            Ok(kv) => {
+                let _ = testing::check_eq(
+                    &kv.get("password").unwrap_or("")
+                    &"a b'c"
+                    "quoted password"
+                )
+                let _ = testing::check_eq(&kv.get("user").unwrap_or(""), &"me", "next key")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("parse failed: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn a_keyword_string_without_an_equals_is_rejected() {
+        let _ = testing::check(super::parse_keywords(&"hostlocalhost").is_err(), "missing =")
+    }
+
+    #[test]
+    fn uri_form_parses_userinfo_host_path_and_query() {
+        match super::parse(&"postgresql://me:s%40cret@db.example.com:6000/app?sslmode=disable&application_name=tool") {
+            Ok(cfg) => {
+                let _ = testing::check_eq(&cfg.user, &"me", "user")
+                let _ = testing::check_eq(&cfg.password.unwrap_or(""), &"s@cret", "decoded password")
+                let _ = testing::check_eq(&cfg.hosts[0].host, &"db.example.com", "host")
+                let _ = testing::check_eq(&cfg.hosts[0].port, &6_000, "port")
+                let _ = testing::check_eq(&cfg.dbname, &"app", "dbname")
+                let _ = testing::check(!cfg.wants_tls(), "sslmode=disable")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("parse failed: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn a_multi_host_list_pairs_hosts_with_ports() {
+        match super::parse_hosts(&"a,b,c", &"1,2,3") {
+            Ok(hosts) => {
+                let _ = testing::check_eq(&hosts.len(), &3, "three hosts")
+                let _ = testing::check_eq(&hosts[2].port, &3, "third port")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("list: {}", e)) }
+        }
+        match super::parse_hosts(&"a,b", &"5432") {
+            Ok(hosts) => {
+                let _ = testing::check_eq(&hosts[1].port, &5_432, "shared port")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("shared: {}", e)) }
+        }
+        let _ = testing::check(super::parse_hosts(&"a,b,c", &"1,2").is_err(), "count mismatch")
+    }
+
+    #[test]
+    fn a_unix_socket_host_builds_the_server_socket_path() {
+        match super::parse(&"host=/var/run/postgresql dbname=app user=me") {
+            Ok(cfg) => {
+                let _ = testing::check(cfg.hosts[0].is_unix(), "unix host")
+                let _ = testing::check_eq(
+                    &cfg.hosts[0].socket_path()
+                    &"/var/run/postgresql/.s.PGSQL.5432"
+                    "socket path"
+                )
+            }
+            Err(e) => { let _ = testing::check(false, &format!("unix: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_key_becomes_a_startup_runtime_parameter() {
+        match super::parse(&"user=me dbname=app search_path=app,public") {
+            Ok(cfg) => {
+                let _ = testing::check_eq(
+                    &cfg.runtime_params.get("search_path").unwrap_or("")
+                    &"app,public"
+                    "runtime parameter"
+                )
+            }
+            Err(e) => { let _ = testing::check(false, &format!("runtime: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn an_invalid_enum_value_is_rejected_by_name() {
+        let _ = testing::check(super::parse(&"user=me sslmode=sometimes").is_err(), "bad sslmode")
+        let _ = testing::check(
+            super::parse(&"user=me target_session_attrs=maybe").is_err()
+            "bad target_session_attrs"
+        )
+        let _ = testing::check(
+            super::parse(&"user=me channel_binding=sometimes").is_err()
+            "bad channel_binding"
+        )
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_host_keeps_its_colons() {
+        match super::parse(&"postgresql://me@[::1]:6000/app") {
+            Ok(cfg) => {
+                let _ = testing::check_eq(&cfg.hosts[0].host, &"::1", "ipv6 host")
+                let _ = testing::check_eq(&cfg.hosts[0].port, &6_000, "ipv6 port")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("ipv6: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn dbname_defaults_to_the_user_name() {
+        match super::parse(&"user=someone_specific") {
+            Ok(cfg) => {
+                let _ = testing::check_eq(&cfg.dbname, &"someone_specific", "dbname default")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("default: {}", e)) }
+        }
+    }
+}

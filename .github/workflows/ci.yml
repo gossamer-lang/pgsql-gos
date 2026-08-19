@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOSSAMER_REPO: danpozmanter/gossamer
+  # A release tag (`v0.52.0`) pins the toolchain; `latest` tracks the
+  # newest Gossamer release.
+  GOSSAMER_VERSION: latest
+
+jobs:
+  build:
+    name: check, lint, test
+    runs-on: ubuntu-latest
+
+    # The integration suite under `tests/` talks to a real server, so the
+    # test step needs one running before it starts.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: gos_pgsql_test
+          POSTGRES_DB: gos_pgsql_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      GOS_PGSQL_TEST_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
+      # The same server over TCP, which the suite uses to exercise
+      # SCRAM-SHA-256 and the passwordless rejection path.
+      GOS_PGSQL_TCP_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Gossamer toolchain
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Report the toolchain version
+        run: gos --version
+
+      - name: Build
+        run: gos check .
+
+      - name: Lint
+        run: gos lint .
+
+      - name: Test
+        run: gos test .

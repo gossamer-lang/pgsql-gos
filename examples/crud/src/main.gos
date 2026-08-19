@@ -1,0 +1,58 @@
+// A walk through the driver: connect, create, insert with parameters, read
+// back with typed accessors, and finish inside a transaction.
+
+use std::{env, errors}
+use "github.com/danpozmanter/pgsql-gos" as pgsql
+
+fn main() -> Result<(), errors::Error> {
+    let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
+    let mut db = pgsql::connect(&url)?
+    defer db.close()
+
+    println!("connected to PostgreSQL {} as backend {}", db.server_version(), db.backend_pid())
+    println!("tls: {}", db.is_tls())
+
+    db.batch_execute(&"DROP TABLE IF EXISTS people")?
+    db.batch_execute(&"""
+    CREATE TABLE people (
+        id     serial PRIMARY KEY,
+        name   text NOT NULL,
+        score  numeric(6,2),
+        tags   text[],
+        joined timestamptz NOT NULL DEFAULT now()
+    )
+    """)?
+
+    let inserted = db.execute(
+        &"INSERT INTO people (name, score, tags) VALUES ($1, $2, $3)"
+        &#[pgsql::text("Ada"), pgsql::numeric("99.50"), pgsql::text_array(#["math", "engines"])]
+    )?
+    println!("inserted {} row(s)", inserted)
+
+    let id = db.query_value(
+        &"INSERT INTO people (name, score) VALUES ($1, $2) RETURNING id"
+        &#[pgsql::text("Grace"), pgsql::numeric("100.00")]
+    )?
+    println!("second row got id {}", id.as_int().unwrap_or(-1))
+
+    for row in db.query(&"SELECT id, name, score, tags FROM people ORDER BY id", &#[])? {
+        let tags = row.opt_text_of("tags")?.unwrap_or("-")
+        println!(
+            "  {} {} score={} tags={}"
+            row.i64_of("id")?
+            row.text_of("name")?
+            row.text_of("score")?
+            tags
+        )
+    }
+
+    // A transaction that rolls back leaves nothing behind.
+    let mut tx = db.transaction()?
+    let _ = db.execute(&"DELETE FROM people", &#[])?
+    db.rollback(&mut tx)?
+    let remaining = db.query_value(&"SELECT count(*) FROM people", &#[])?
+    println!("after rollback, {} row(s) remain", remaining.as_int().unwrap_or(-1))
+
+    db.batch_execute(&"DROP TABLE people")?
+    Ok(())
+}

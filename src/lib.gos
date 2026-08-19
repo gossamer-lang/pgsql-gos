@@ -1,0 +1,251 @@
+// pgsql-gos: a PostgreSQL driver written entirely in Gossamer.
+//
+// The driver speaks the PostgreSQL frontend/backend protocol (version 3.0)
+// over a TCP or Unix socket: no libpq, no Rust binding, nothing outside the
+// standard library. It covers the surface a program needs from a database:
+//
+//   - connection parameters as a libpq keyword string or a `postgres://`
+//     URI, with `PG*` environment fallbacks, multiple hosts, and
+//     `target_session_attrs`
+//   - TLS at every `sslmode`, and trust / password / MD5 / SCRAM-SHA-256
+//     authentication
+//   - the simple and the extended query protocol: prepared statements with
+//     a cache, parameter binding, row streaming, portals fetched in batches,
+//     and pipelining
+//   - a type codec in both wire formats, including arrays, composites, and
+//     ranges
+//   - transactions with isolation levels and savepoints
+//   - COPY in both directions
+//   - LISTEN / NOTIFY, and query cancellation
+//   - a connection pool
+//
+// The whole surface is reached through this module.
+//
+//     use "github.com/danpozmanter/pgsql-gos" as pgsql
+//
+//     fn main() -> Result<(), errors::Error> {
+//         let mut db = pgsql::connect(&"host=/var/run/postgresql dbname=app")?
+//         defer db.close()
+//
+//         let _ = db.execute(
+//             &"INSERT INTO people (name, age) VALUES ($1, $2)",
+//             &#[pgsql::text("Ada"), pgsql::int(36)],
+//         )?
+//         for row in db.query(&"SELECT name, age FROM people", &#[])? {
+//             println!("{} is {}", row.text_of("name")?, row.i64_of("age")?)
+//         }
+//         Ok(())
+//     }
+
+use std::errors
+
+use crate::{client, config, dberror, oid, pool, value}
+
+// The driver's version.
+pub const VERSION: String = "0.1.0"
+
+// The protocol version the driver speaks.
+pub const PROTOCOL_VERSION: String = "3.0"
+
+// --- connecting ----------------------------------------------------
+
+// Connects using a libpq keyword string (`host=localhost dbname=app`) or a
+// URI (`postgres://me@localhost/app`).
+pub fn connect(url: &String) -> Result<client::Client, errors::Error> {
+    client::connect(url)
+}
+
+// Connects using parameters built or edited by hand.
+pub fn connect_with(cfg: &config::Config) -> Result<client::Client, errors::Error> {
+    client::connect_with(cfg)
+}
+
+// Parses a connection string into parameters, so a caller can adjust them
+// before connecting.
+pub fn parse_config(url: &String) -> Result<config::Config, errors::Error> {
+    config::parse(url)
+}
+
+// Opens a pool of at most `max_size` connections.
+pub fn pool_open(url: &String, max_size: i64) -> Result<pool::Pool, errors::Error> {
+    pool::open(url, max_size)
+}
+
+// --- parameter constructors ---------------------------------------
+//
+// A bound parameter is a `value::Value`. These build the common ones, so a
+// call site reads as the values it is binding rather than as the enum.
+
+// SQL NULL.
+pub fn null() -> value::Value {
+    value::Value::Null
+}
+
+// A boolean parameter.
+pub fn boolean(v: bool) -> value::Value {
+    value::Value::Bool(v)
+}
+
+// An integer parameter, for any of `int2` / `int4` / `int8` / `oid`.
+pub fn int(v: i64) -> value::Value {
+    value::Value::Int(v)
+}
+
+// A floating-point parameter, for `float4` / `float8`.
+pub fn float(v: f64) -> value::Value {
+    value::Value::Float(v)
+}
+
+// An exact decimal parameter for `numeric`, given as the digits themselves
+// so nothing is rounded on the way.
+pub fn numeric(text: String) -> value::Value {
+    value::Value::Numeric(text)
+}
+
+// A text parameter. Also the way to bind any type whose text form the caller
+// already has: a timestamp, a UUID, JSON, an inet.
+pub fn text(v: String) -> value::Value {
+    value::Value::Text(v)
+}
+
+// A `bytea` parameter.
+pub fn bytes(v: Vec<u8>) -> value::Value {
+    value::Value::Bytes(v)
+}
+
+// An array parameter. The value is the array literal, which is the form the
+// server reads for every array type, so the element type only has to match
+// the column.
+pub fn array(items: Vec<value::Value>) -> value::Value {
+    value::Value::Text(value::render_array_literal(&items))
+}
+
+// An integer-array parameter.
+pub fn int_array(items: Vec<i64>) -> value::Value {
+    array(items.map(|item| value::Value::Int(item)))
+}
+
+// A text-array parameter.
+pub fn text_array(items: Vec<String>) -> value::Value {
+    array(items.map(|item| value::Value::Text(item)))
+}
+
+// A composite parameter, as its literal.
+pub fn record(fields: Vec<value::Value>) -> value::Value {
+    value::Value::Text(value::render_record_literal(&fields))
+}
+
+// An `Option<i64>`, as a parameter: `None` binds NULL.
+pub fn opt_int(v: Option<i64>) -> value::Value {
+    match v {
+        Some(n) => value::Value::Int(n)
+        None => value::Value::Null
+    }
+}
+
+// An `Option<String>`, as a parameter: `None` binds NULL.
+pub fn opt_text(v: Option<String>) -> value::Value {
+    match v {
+        Some(s) => value::Value::Text(s)
+        None => value::Value::Null
+    }
+}
+
+// --- error classification -----------------------------------------
+//
+// These read a failed call's `errors::Error`. `DbError` carries the same
+// judgements as `is_*` methods, for a notice or a report held directly.
+
+// The SQLSTATE of a driver error, or `""` when the failure did not come
+// from the server. Every server error is reported as `[SQLSTATE] message`,
+// which is what this reads back.
+pub fn sqlstate_of(e: &errors::Error) -> String {
+    dberror::sqlstate_of(e)
+}
+
+// True when the error is one a caller retries: a serialization failure or a
+// deadlock, the two outcomes a correct transaction can hit through no fault
+// of its own.
+pub fn retryable(e: &errors::Error) -> bool {
+    let code = sqlstate_of(e)
+    code == "40001" || code == "40P01"
+}
+
+// True when the error reports a unique-constraint violation.
+pub fn unique_violation(e: &errors::Error) -> bool {
+    sqlstate_of(e) == "23505"
+}
+
+// True when the error reports a foreign-key violation.
+pub fn foreign_key_violation(e: &errors::Error) -> bool {
+    sqlstate_of(e) == "23503"
+}
+
+// True when the error reports a not-null violation.
+pub fn not_null_violation(e: &errors::Error) -> bool {
+    sqlstate_of(e) == "23502"
+}
+
+// True when the error's SQLSTATE class (its first two characters) is
+// `class`: `23` integrity constraint, `40` transaction rollback, `42`
+// syntax or access rule, `08` connection exception.
+pub fn in_error_class(e: &errors::Error, class: String) -> bool {
+    sqlstate_of(e).starts_with(&class)
+}
+
+// --- type names ---------------------------------------------------
+
+// The `pg_type` name of a type OID, for a diagnostic or a schema dump.
+pub fn type_name(type_oid: i64) -> String {
+    oid::name_of(type_oid)
+}
+
+#[cfg(test)]
+mod lib_tests {
+    use std::{errors, testing}
+
+    #[test]
+    fn parameter_constructors_build_the_matching_values() {
+        let _ = testing::check(super::null().is_null(), "null")
+        let _ = testing::check_eq(&super::int(7).as_int().unwrap_or(0), &7, "int")
+        let _ = testing::check_eq(&super::text("hi").as_text().unwrap_or(""), &"hi", "text")
+        let _ = testing::check(super::boolean(true).as_bool().unwrap_or(false), "bool")
+        let _ = testing::check_eq(
+            &super::numeric("1.250").as_text().unwrap_or("")
+            &"1.250"
+            "numeric keeps its digits"
+        )
+        let _ = testing::check(super::opt_int(None).is_null(), "None binds NULL")
+        let _ = testing::check_eq(&super::opt_int(Some(3)).as_int().unwrap_or(0), &3, "Some binds")
+    }
+
+    #[test]
+    fn array_constructors_carry_their_element_type() {
+        let ints = super::int_array(#[1, 2, 3])
+        let _ = testing::check_eq(&ints.render(), &"{1,2,3}", "int array literal")
+        let texts = super::text_array(#["a", "b,c"])
+        let _ = testing::check_eq(&texts.render(), &"{a,\"b,c\"}", "text array quotes as needed")
+    }
+
+    #[test]
+    fn sqlstate_reads_back_out_of_a_server_error() {
+        let e = errors::new("[23505] duplicate key value violates unique constraint")
+        let _ = testing::check_eq(&super::sqlstate_of(&e), &"23505", "sqlstate")
+        let _ = testing::check(super::unique_violation(&e), "unique violation")
+        let _ = testing::check(super::in_error_class(&e, "23"), "integrity class")
+        let _ = testing::check(!super::retryable(&e), "not retryable")
+
+        let serialization = errors::new("[40001] could not serialize access")
+        let _ = testing::check(super::retryable(&serialization), "serialization failure retries")
+
+        let local = errors::new("connecting to 127.0.0.1:5432: refused")
+        let _ = testing::check_eq(&super::sqlstate_of(&local), &"", "a local failure has none")
+        let _ = testing::check(!super::unique_violation(&local), "no false classification")
+    }
+
+    #[test]
+    fn type_names_come_from_the_oid_catalogue() {
+        let _ = testing::check_eq(&super::type_name(oid::INT4), &"int4", "int4")
+        let _ = testing::check_eq(&super::type_name(oid::TEXT_ARRAY), &"text[]", "text[]")
+    }
+}

@@ -1,0 +1,364 @@
+// PostgreSQL builtin type OIDs, and the relations between them the codec
+// needs: which OIDs are arrays, what a given array's element type is, and
+// which OIDs carry a binary representation this driver reads.
+//
+// The values are the ones in `pg_type` for every supported server version;
+// they are part of the wire contract and never change.
+
+pub const BOOL: i64 = 16
+pub const BYTEA: i64 = 17
+pub const CHAR: i64 = 18
+pub const NAME: i64 = 19
+pub const INT8: i64 = 20
+pub const INT2: i64 = 21
+pub const INT2VECTOR: i64 = 22
+pub const INT4: i64 = 23
+pub const REGPROC: i64 = 24
+pub const TEXT: i64 = 25
+pub const OID: i64 = 26
+pub const TID: i64 = 27
+pub const XID: i64 = 28
+pub const CID: i64 = 29
+pub const OIDVECTOR: i64 = 30
+pub const JSON: i64 = 114
+pub const XML: i64 = 142
+pub const PG_NODE_TREE: i64 = 194
+pub const POINT: i64 = 600
+pub const LSEG: i64 = 601
+pub const PATH: i64 = 602
+pub const BOX: i64 = 603
+pub const POLYGON: i64 = 604
+pub const LINE: i64 = 628
+pub const CIDR: i64 = 650
+pub const FLOAT4: i64 = 700
+pub const FLOAT8: i64 = 701
+pub const UNKNOWN: i64 = 705
+pub const CIRCLE: i64 = 718
+pub const MACADDR8: i64 = 774
+pub const MONEY: i64 = 790
+pub const MACADDR: i64 = 829
+pub const INET: i64 = 869
+pub const ACLITEM: i64 = 1033
+pub const BPCHAR: i64 = 1042
+pub const VARCHAR: i64 = 1043
+pub const DATE: i64 = 1082
+pub const TIME: i64 = 1083
+pub const TIMESTAMP: i64 = 1114
+pub const TIMESTAMPTZ: i64 = 1184
+pub const INTERVAL: i64 = 1186
+pub const TIMETZ: i64 = 1266
+pub const BIT: i64 = 1560
+pub const VARBIT: i64 = 1562
+pub const NUMERIC: i64 = 1700
+pub const REFCURSOR: i64 = 1790
+pub const REGPROCEDURE: i64 = 2202
+pub const REGOPER: i64 = 2203
+pub const REGOPERATOR: i64 = 2204
+pub const REGCLASS: i64 = 2205
+pub const REGTYPE: i64 = 2206
+pub const RECORD: i64 = 2249
+pub const CSTRING: i64 = 2275
+pub const ANY: i64 = 2276
+pub const VOID: i64 = 2278
+pub const UUID: i64 = 2950
+pub const TXID_SNAPSHOT: i64 = 2970
+pub const JSONB: i64 = 3802
+pub const JSONPATH: i64 = 4072
+pub const REGNAMESPACE: i64 = 4089
+pub const REGROLE: i64 = 4096
+pub const PG_LSN: i64 = 3220
+pub const TSVECTOR: i64 = 3614
+pub const TSQUERY: i64 = 3615
+pub const REGCONFIG: i64 = 3734
+pub const REGDICTIONARY: i64 = 3769
+
+// Array OIDs.
+pub const BOOL_ARRAY: i64 = 1000
+pub const BYTEA_ARRAY: i64 = 1001
+pub const CHAR_ARRAY: i64 = 1002
+pub const NAME_ARRAY: i64 = 1003
+pub const INT2_ARRAY: i64 = 1005
+pub const INT4_ARRAY: i64 = 1007
+pub const TEXT_ARRAY: i64 = 1009
+pub const BPCHAR_ARRAY: i64 = 1014
+pub const VARCHAR_ARRAY: i64 = 1015
+pub const INT8_ARRAY: i64 = 1016
+pub const POINT_ARRAY: i64 = 1017
+pub const FLOAT4_ARRAY: i64 = 1021
+pub const FLOAT8_ARRAY: i64 = 1022
+pub const ACLITEM_ARRAY: i64 = 1034
+pub const MACADDR_ARRAY: i64 = 1040
+pub const INET_ARRAY: i64 = 1041
+pub const CIDR_ARRAY: i64 = 651
+pub const DATE_ARRAY: i64 = 1182
+pub const TIME_ARRAY: i64 = 1183
+pub const TIMESTAMP_ARRAY: i64 = 1115
+pub const TIMESTAMPTZ_ARRAY: i64 = 1185
+pub const INTERVAL_ARRAY: i64 = 1187
+pub const TIMETZ_ARRAY: i64 = 1270
+pub const BIT_ARRAY: i64 = 1561
+pub const VARBIT_ARRAY: i64 = 1563
+pub const NUMERIC_ARRAY: i64 = 1231
+pub const OID_ARRAY: i64 = 1028
+pub const UUID_ARRAY: i64 = 2951
+pub const JSON_ARRAY: i64 = 199
+pub const JSONB_ARRAY: i64 = 3807
+pub const XML_ARRAY: i64 = 143
+pub const MONEY_ARRAY: i64 = 791
+pub const RECORD_ARRAY: i64 = 2287
+
+// Range OIDs.
+pub const INT4RANGE: i64 = 3904
+pub const NUMRANGE: i64 = 3906
+pub const TSRANGE: i64 = 3908
+pub const TSTZRANGE: i64 = 3910
+pub const DATERANGE: i64 = 3912
+pub const INT8RANGE: i64 = 3926
+pub const INT4MULTIRANGE: i64 = 4451
+pub const NUMMULTIRANGE: i64 = 4532
+pub const TSMULTIRANGE: i64 = 4533
+pub const TSTZMULTIRANGE: i64 = 4534
+pub const DATEMULTIRANGE: i64 = 4535
+pub const INT8MULTIRANGE: i64 = 4536
+
+// Element type of an array OID, or 0 when `oid` is not a builtin array.
+//
+// A composite or domain array declared in the database is not in this
+// table; its elements decode as text, which is what the server sends for a
+// type the driver has no more specific reading for.
+pub fn element_of(oid: i64) -> i64 {
+    match oid {
+        BOOL_ARRAY => BOOL
+        BYTEA_ARRAY => BYTEA
+        CHAR_ARRAY => CHAR
+        NAME_ARRAY => NAME
+        INT2_ARRAY => INT2
+        INT4_ARRAY => INT4
+        INT8_ARRAY => INT8
+        TEXT_ARRAY => TEXT
+        BPCHAR_ARRAY => BPCHAR
+        VARCHAR_ARRAY => VARCHAR
+        POINT_ARRAY => POINT
+        FLOAT4_ARRAY => FLOAT4
+        FLOAT8_ARRAY => FLOAT8
+        ACLITEM_ARRAY => ACLITEM
+        MACADDR_ARRAY => MACADDR
+        INET_ARRAY => INET
+        CIDR_ARRAY => CIDR
+        DATE_ARRAY => DATE
+        TIME_ARRAY => TIME
+        TIMESTAMP_ARRAY => TIMESTAMP
+        TIMESTAMPTZ_ARRAY => TIMESTAMPTZ
+        INTERVAL_ARRAY => INTERVAL
+        TIMETZ_ARRAY => TIMETZ
+        BIT_ARRAY => BIT
+        VARBIT_ARRAY => VARBIT
+        NUMERIC_ARRAY => NUMERIC
+        OID_ARRAY => OID
+        UUID_ARRAY => UUID
+        JSON_ARRAY => JSON
+        JSONB_ARRAY => JSONB
+        XML_ARRAY => XML
+        MONEY_ARRAY => MONEY
+        RECORD_ARRAY => RECORD
+        _ => 0
+    }
+}
+
+// Array OID carrying `oid` as its element, or 0 when there is no builtin
+// array over it.
+pub fn array_of(oid: i64) -> i64 {
+    match oid {
+        BOOL => BOOL_ARRAY
+        BYTEA => BYTEA_ARRAY
+        CHAR => CHAR_ARRAY
+        NAME => NAME_ARRAY
+        INT2 => INT2_ARRAY
+        INT4 => INT4_ARRAY
+        INT8 => INT8_ARRAY
+        TEXT => TEXT_ARRAY
+        BPCHAR => BPCHAR_ARRAY
+        VARCHAR => VARCHAR_ARRAY
+        FLOAT4 => FLOAT4_ARRAY
+        FLOAT8 => FLOAT8_ARRAY
+        NUMERIC => NUMERIC_ARRAY
+        DATE => DATE_ARRAY
+        TIME => TIME_ARRAY
+        TIMESTAMP => TIMESTAMP_ARRAY
+        TIMESTAMPTZ => TIMESTAMPTZ_ARRAY
+        INTERVAL => INTERVAL_ARRAY
+        UUID => UUID_ARRAY
+        JSON => JSON_ARRAY
+        JSONB => JSONB_ARRAY
+        INET => INET_ARRAY
+        OID => OID_ARRAY
+        _ => 0
+    }
+}
+
+// True when `oid` names a builtin array type.
+pub fn is_array(oid: i64) -> bool {
+    element_of(oid) != 0
+}
+
+// True when `oid` names a builtin range type.
+pub fn is_range(oid: i64) -> bool {
+    matches!(
+        oid
+        INT4RANGE | NUMRANGE | TSRANGE | TSTZRANGE | DATERANGE | INT8RANGE
+    )
+}
+
+// True when `oid` names a builtin multirange type.
+pub fn is_multirange(oid: i64) -> bool {
+    matches!(
+        oid
+        INT4MULTIRANGE
+        | NUMMULTIRANGE
+        | TSMULTIRANGE
+        | TSTZMULTIRANGE
+        | DATEMULTIRANGE
+        | INT8MULTIRANGE
+    )
+}
+
+// Element type of a range OID's bounds, or 0 when `oid` is not a range.
+pub fn range_element_of(oid: i64) -> i64 {
+    match oid {
+        INT4RANGE | INT4MULTIRANGE => INT4
+        INT8RANGE | INT8MULTIRANGE => INT8
+        NUMRANGE | NUMMULTIRANGE => NUMERIC
+        TSRANGE | TSMULTIRANGE => TIMESTAMP
+        TSTZRANGE | TSTZMULTIRANGE => TIMESTAMPTZ
+        DATERANGE | DATEMULTIRANGE => DATE
+        _ => 0
+    }
+}
+
+// True when the type's text form is a decimal integer the driver reads as
+// an `i64`.
+pub fn is_integer(oid: i64) -> bool {
+    matches!(oid, INT2 | INT4 | INT8 | OID | XID | CID | REGPROC)
+}
+
+// True when the type's text form is a decimal float the driver reads as an
+// `f64`. `numeric` is deliberately absent: it is arbitrary precision, and
+// reading it as a float would lose digits, so it stays exact text.
+pub fn is_float(oid: i64) -> bool {
+    matches!(oid, FLOAT4 | FLOAT8)
+}
+
+// True when the type carries a date or time, so a caller can ask for the
+// value as a timestamp.
+pub fn is_temporal(oid: i64) -> bool {
+    matches!(oid, DATE | TIME | TIMETZ | TIMESTAMP | TIMESTAMPTZ | INTERVAL)
+}
+
+// The `pg_type` name for a builtin OID, or `"oid <n>"` for one this table
+// does not cover. Used in error messages so a decode failure names the
+// type the server actually sent.
+pub fn name_of(oid: i64) -> String {
+    match oid {
+        BOOL => "bool"
+        BYTEA => "bytea"
+        CHAR => "char"
+        NAME => "name"
+        INT8 => "int8"
+        INT2 => "int2"
+        INT4 => "int4"
+        TEXT => "text"
+        OID => "oid"
+        JSON => "json"
+        JSONB => "jsonb"
+        XML => "xml"
+        POINT => "point"
+        LSEG => "lseg"
+        PATH => "path"
+        BOX => "box"
+        POLYGON => "polygon"
+        LINE => "line"
+        CIRCLE => "circle"
+        CIDR => "cidr"
+        INET => "inet"
+        MACADDR => "macaddr"
+        MACADDR8 => "macaddr8"
+        FLOAT4 => "float4"
+        FLOAT8 => "float8"
+        MONEY => "money"
+        BPCHAR => "bpchar"
+        VARCHAR => "varchar"
+        DATE => "date"
+        TIME => "time"
+        TIMETZ => "timetz"
+        TIMESTAMP => "timestamp"
+        TIMESTAMPTZ => "timestamptz"
+        INTERVAL => "interval"
+        BIT => "bit"
+        VARBIT => "varbit"
+        NUMERIC => "numeric"
+        UUID => "uuid"
+        RECORD => "record"
+        VOID => "void"
+        UNKNOWN => "unknown"
+        TSVECTOR => "tsvector"
+        TSQUERY => "tsquery"
+        PG_LSN => "pg_lsn"
+        INT4RANGE => "int4range"
+        INT8RANGE => "int8range"
+        NUMRANGE => "numrange"
+        TSRANGE => "tsrange"
+        TSTZRANGE => "tstzrange"
+        DATERANGE => "daterange"
+        _ => {
+            let elem = element_of(oid)
+            if elem != 0 { name_of(elem) + "[]" } else { format!("oid {}", oid) }
+        }
+    }
+}
+
+#[cfg(test)]
+mod oid_tests {
+    use std::testing
+
+    #[test]
+    fn array_and_element_are_inverses_for_builtin_types() {
+        let scalars: Vec<i64> = #[
+            super::INT4
+            super::TEXT
+            super::BOOL
+            super::UUID
+            super::NUMERIC
+        ]
+        for oid in scalars {
+            let arr = super::array_of(oid)
+            let _ = testing::check(arr != 0, &format!("{} has an array type", super::name_of(oid)))
+            let _ = testing::check_eq(&super::element_of(arr), &oid, "round trip")
+        }
+    }
+
+    #[test]
+    fn is_array_rejects_a_scalar() {
+        let _ = testing::check(!super::is_array(super::INT4), "int4 is not an array")
+        let _ = testing::check(super::is_array(super::INT4_ARRAY), "int4[] is an array")
+    }
+
+    #[test]
+    fn name_of_renders_an_array_as_the_element_name_with_brackets() {
+        let _ = testing::check_eq(&super::name_of(super::TEXT_ARRAY), &"text[]", "text array name")
+    }
+
+    #[test]
+    fn name_of_falls_back_to_the_numeric_oid() {
+        let _ = testing::check_eq(&super::name_of(999_999), &"oid 999999", "unknown oid")
+    }
+
+    #[test]
+    fn range_elements_resolve() {
+        let _ = testing::check_eq(
+            &super::range_element_of(super::INT8RANGE)
+            &super::INT8
+            "int8range bounds"
+        )
+        let _ = testing::check(super::is_range(super::TSRANGE), "tsrange is a range")
+    }
+}

@@ -1,0 +1,1933 @@
+// One connection to one PostgreSQL backend: the socket, the message loop,
+// startup and authentication, and every protocol exchange built on them.
+//
+// A connection is driven request/response by its owner. Backend messages
+// that can arrive at any time are absorbed by the message loop rather than
+// surfacing to callers: `ParameterStatus` updates the session's parameter
+// map, `NoticeResponse` queues a notice, and `NotificationResponse` queues a
+// LISTEN payload. Everything else is returned to the exchange that asked
+// for it.
+
+use std::{errors, net, time}
+
+use crate::{buf, client, config, dberror, oid, proto, sasl, value}
+
+// A socket, whichever family it was opened on. TLS upgrade replaces a TCP
+// socket in place; a Unix socket is already local and is never upgraded.
+pub enum Socket {
+    Tcp(net::TcpStream)
+    Unix(net::UnixStream)
+}
+
+// An asynchronous LISTEN/NOTIFY delivery.
+pub struct Notification {
+    pub channel: String
+    pub payload: String
+    // The backend PID that issued the NOTIFY.
+    pub pid: i64
+}
+
+// One result column's shape, from a RowDescription.
+pub struct Column {
+    pub name: String
+    // OID of the table the column came from, 0 when it is not a table column.
+    pub table_oid: i64
+    // Attribute number within that table, 0 when not applicable.
+    pub column_id: i64
+    pub type_oid: i64
+    // Type-specific modifier (`varchar(n)`'s n + 4, `numeric`'s precision
+    // and scale), -1 when there is none.
+    pub type_modifier: i64
+    // Declared size in bytes; negative for a variable-length type.
+    pub type_size: i64
+    // Wire format the server is sending this column in.
+    pub format: i64
+}
+
+// A prepared statement on the server.
+pub struct Statement {
+    pub name: String
+    // Parameter type OIDs, as the server inferred or the caller pinned them.
+    pub param_oids: Vec<i64>
+    pub columns: Vec<Column>
+}
+
+impl Statement {
+    // Number of parameters the statement takes.
+    pub fn param_count(&self) -> i64 {
+        self.param_oids.len()
+    }
+}
+
+// A live connection.
+pub struct PgConn {
+    pub (package) sock: Socket
+    // Bytes read from the socket and not yet framed, and how far into them
+    // the framer has consumed. Compacted rather than re-sliced per message.
+    pub (package) inbox: Vec<u8>
+    pub (package) inbox_pos: i64
+    // Session parameters the server reports, keyed by name.
+    pub (package) params: Map<String, String>
+    // Backend identity, for a CancelRequest on a second connection.
+    pub (package) backend_pid: i64
+    pub (package) backend_secret: i64
+    // Transaction status from the last ReadyForQuery.
+    pub (package) tx_status: i64
+    // Notices and notifications the message loop absorbed.
+    pub (package) notices: Vec<dberror::DbError>
+    pub (package) pending: Vec<Notification>
+    // True once the socket is unusable.
+    pub (package) closed: bool
+    // True while a portal is mid-stream, so the next exchange drains first.
+    pub (package) portal_open: bool
+    // Names handed out to prepared statements and portals.
+    pub (package) name_counter: i64
+    // Which host of the config this connection reached.
+    pub (package) host: config::HostAddr
+    // Whether the session is running over TLS.
+    pub (package) tls: bool
+}
+
+// --- socket plumbing ----------------------------------------------
+
+// The two arms read alike but bind different socket types, so the call in
+// each resolves to that type's own method.
+#[lint(allow(match_same_arms))]
+fn socket_write(sock: &Socket, data: &Vec<u8>) -> Result<(), errors::Error> {
+    match sock {
+        Socket::Tcp(stream) => stream.write_all(data.clone())
+        Socket::Unix(stream) => stream.write_all(data.clone())
+    }
+}
+
+#[lint(allow(match_same_arms))]
+fn socket_read(sock: &Socket, max: i64) -> Result<Vec<u8>, errors::Error> {
+    match sock {
+        Socket::Tcp(stream) => stream.read(max)
+        Socket::Unix(stream) => stream.read(max)
+    }
+}
+
+#[lint(allow(match_same_arms))]
+fn socket_close(sock: &Socket) {
+    match sock {
+        Socket::Tcp(stream) => stream.close()
+        Socket::Unix(stream) => stream.close()
+    }
+}
+
+// How much to ask the socket for per read. Large enough that a wide row or
+// a COPY chunk usually arrives in one call.
+const READ_CHUNK: i64 = 65_536
+
+impl PgConn {
+    // Sends raw bytes, marking the connection dead if the socket fails.
+    pub (package) fn send(&mut self, data: &Vec<u8>) -> Result<(), errors::Error> {
+        if self.closed {
+            return Err(errors::new("connection is closed"))
+        }
+        match socket_write(&self.sock, data) {
+            Ok(_) => Ok(())
+            Err(e) => {
+                self.closed = true
+                Err(errors::wrap(e, "sending to server"))
+            }
+        }
+    }
+
+    // Reads one more chunk into the inbox, compacting first so the buffer
+    // does not grow without bound across a long stream of messages.
+    fn fill(&mut self) -> Result<(), errors::Error> {
+        if self.inbox_pos > 0 {
+            self.inbox = buf::slice(&self.inbox, self.inbox_pos, self.inbox.len())
+            self.inbox_pos = 0
+        }
+        match socket_read(&self.sock, READ_CHUNK) {
+            Ok(chunk) => {
+                if chunk.len() == 0 {
+                    self.closed = true
+                    return Err(errors::new("server closed the connection"))
+                }
+                self.inbox.extend(chunk)
+                Ok(())
+            }
+            Err(e) => {
+                self.closed = true
+                Err(errors::wrap(e, "reading from server"))
+            }
+        }
+    }
+
+    // Takes one complete message out of the inbox, or `None` when more
+    // bytes are needed.
+    fn take_message(&mut self) -> Option<(i64, Vec<u8>)> {
+        let available = self.inbox.len() - self.inbox_pos
+        if available < 5 {
+            return None
+        }
+        let length = buf::i32_at(&self.inbox, self.inbox_pos + 1)
+        if length < 4 {
+            return None
+        }
+        let total = 1 + length
+        if available < total {
+            return None
+        }
+        let tag = buf::u8_at(&self.inbox, self.inbox_pos)
+        let body = buf::slice(&self.inbox, self.inbox_pos + 5, self.inbox_pos + total)
+        self.inbox_pos += total
+        Some((tag, body))
+    }
+
+    // One message, blocking until it arrives, with no interpretation.
+    fn recv_raw(&mut self) -> Result<(i64, Vec<u8>), errors::Error> {
+        loop {
+            match self.take_message() {
+                Some(message) => return Ok(message)
+                None => self.fill()?
+            }
+        }
+    }
+
+    // One message, with the asynchronous ones absorbed.
+    pub (package) fn recv(&mut self) -> Result<(i64, Vec<u8>), errors::Error> {
+        loop {
+            let (tag, body) = self.recv_raw()?
+            match tag {
+                proto::B_PARAMETER_STATUS => {
+                    let (name, setting) = parse_parameter_status(&body)
+                    let _ = self.params.insert(name, setting)
+                }
+                proto::B_NOTICE_RESPONSE => self.notices.push(dberror::parse(&body))
+                proto::B_NOTIFICATION_RESPONSE => self.pending.push(parse_notification(&body))
+                _ => return Ok((tag, body))
+            }
+        }
+    }
+
+    // True when a message is already buffered, so a poll can answer without
+    // touching the socket.
+    fn has_buffered_message(&self) -> bool {
+        let available = self.inbox.len() - self.inbox_pos
+        if available < 5 {
+            return false
+        }
+        let length = buf::i32_at(&self.inbox, self.inbox_pos + 1)
+        length >= 4 && available >= 1 + length
+    }
+
+    // --- session state --------------------------------------------
+
+    // A session parameter the server reported (`server_version`,
+    // `client_encoding`, `TimeZone`, ...).
+    pub fn parameter(&self, name: &String) -> Option<String> {
+        self.params.get(name)
+    }
+
+    // The server's version string, as `server_version` reports it.
+    pub fn server_version(&self) -> String {
+        match self.params.get("server_version") {
+            Some(v) => v
+            None => ""
+        }
+    }
+
+    // The backend PID, which a CancelRequest and `pg_stat_activity` name.
+    pub fn backend_pid(&self) -> i64 {
+        self.backend_pid
+    }
+
+    // True when the session is inside a transaction block.
+    pub fn in_transaction(&self) -> bool {
+        self.tx_status == proto::TX_IN_TRANSACTION || self.tx_status == proto::TX_FAILED
+    }
+
+    // True when the session is in a failed transaction and only ROLLBACK
+    // will be accepted.
+    pub fn in_failed_transaction(&self) -> bool {
+        self.tx_status == proto::TX_FAILED
+    }
+
+    // True when the connection is unusable.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    // True when the session is running over TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls
+    }
+
+    // The host this connection reached.
+    pub fn host_addr(&self) -> config::HostAddr {
+        self.host
+    }
+
+    // Notices the server reported since the last call, and clears them.
+    pub fn take_notices(&mut self) -> Vec<dberror::DbError> {
+        let out = self.notices.clone()
+        self.notices = #[]
+        out
+    }
+
+    // A fresh name for a statement or portal, unique within the session.
+    pub (package) fn next_name(&mut self, prefix: &String) -> String {
+        self.name_counter += 1
+        format!("gos_pgsql_{}{}", prefix, self.name_counter)
+    }
+
+    // --- ready-state plumbing -------------------------------------
+
+    // Records what a ReadyForQuery reports: the transaction status, and that
+    // no portal is mid-stream.
+    fn mark_ready(&mut self, body: &Vec<u8>) {
+        self.tx_status = buf::u8_at(body, 0)
+        self.portal_open = false
+    }
+
+    // Reads to the next ReadyForQuery, collecting one row count per
+    // CommandComplete and reporting the first error the server sent along
+    // the way. This is the shape every exchange that ends in a Sync takes.
+    pub (package) fn collect_counts(&mut self) -> Result<Vec<i64>, errors::Error> {
+        let mut counts: Vec<i64> = #[]
+        let mut failure: Option<dberror::DbError> = None
+        loop {
+            let (tag, body) = self.recv()?
+            match tag {
+                proto::B_COMMAND_COMPLETE => {
+                    let (_, count) = proto::command_complete(&body)
+                    counts.push(count)
+                }
+                proto::B_ERROR_RESPONSE => {
+                    if failure.is_none() {
+                        failure = Some(dberror::parse(&body))
+                    }
+                }
+                proto::B_READY_FOR_QUERY => {
+                    self.mark_ready(&body)
+                    break
+                }
+                _ => ()
+            }
+        }
+        match failure {
+            Some(e) => Err(e.as_error())
+            None => Ok(counts)
+        }
+    }
+
+    // Reads to the next ReadyForQuery for its effect alone.
+    pub (package) fn drain_to_ready(&mut self) -> Result<(), errors::Error> {
+        let _ = self.collect_counts()?
+        Ok(())
+    }
+
+    // Brings the connection back to a ready point before a new exchange,
+    // draining a portal left mid-stream by an abandoned row walk.
+    pub (package) fn ensure_ready(&mut self) -> Result<(), errors::Error> {
+        if self.portal_open {
+            self.portal_open = false
+            self.drain_to_ready()?
+        }
+        Ok(())
+    }
+
+    // --- simple query protocol ------------------------------------
+
+    // One result set from the simple query protocol. A simple query may
+    // carry several statements, so a call answers a list of these.
+    pub fn simple_query(&mut self, sql: &String) -> Result<Vec<SimpleResult>, errors::Error> {
+        self.ensure_ready()?
+        let mut body: Vec<u8> = #[]
+        buf::put_cstr(&mut body, sql)
+        let message = proto::frame(proto::F_QUERY, &body)
+        self.send(&message)?
+
+        let mut results: Vec<SimpleResult> = #[]
+        let mut columns: Vec<Column> = #[]
+        let mut rows: Vec<Vec<value::Value>> = #[]
+        let mut failure: Option<dberror::DbError> = None
+        loop {
+            let (tag, msg) = self.recv()?
+            match tag {
+                proto::B_ROW_DESCRIPTION => {
+                    columns = parse_row_description(&msg)
+                    rows = #[]
+                }
+                proto::B_DATA_ROW => rows.push(decode_data_row(&msg, &columns))
+                proto::B_COMMAND_COMPLETE => {
+                    let (tag_text, count) = proto::command_complete(&msg)
+                    results.push(SimpleResult {
+                        tag: tag_text
+                        rows_affected: count
+                        columns: columns.clone()
+                        rows: rows.clone()
+                    })
+                    columns = #[]
+                    rows = #[]
+                }
+                proto::B_EMPTY_QUERY_RESPONSE => {
+                    results.push(SimpleResult {
+                        tag: ""
+                        rows_affected: 0
+                        columns: #[]
+                        rows: #[]
+                    })
+                }
+                proto::B_ERROR_RESPONSE => {
+                    if failure.is_none() {
+                        failure = Some(dberror::parse(&msg))
+                    }
+                }
+                proto::B_READY_FOR_QUERY => {
+                    self.mark_ready(&msg)
+                    break
+                }
+                _ => ()
+            }
+        }
+        match failure {
+            Some(e) => Err(e.as_error())
+            None => Ok(results)
+        }
+    }
+
+    // Runs one or more statements for their effect, reporting the first
+    // failure. This is the simple query protocol, so the statements share a
+    // single implicit transaction unless the text opens one.
+    pub fn batch_execute(&mut self, sql: &String) -> Result<(), errors::Error> {
+        let _ = self.simple_query(sql)?
+        Ok(())
+    }
+
+    // --- extended query protocol ----------------------------------
+
+    // Parses a statement and describes it, so its parameter and result
+    // shapes are known before it runs. `param_oids` pins parameter types;
+    // an empty list lets the server infer them.
+    pub fn prepare(
+        &mut self
+        sql: &String
+        param_oids: &Vec<i64>
+    ) -> Result<Statement, errors::Error> {
+        let name = self.next_name(&"s")
+        self.prepare_named(&name, sql, param_oids)
+    }
+
+    // As `prepare`, under a caller-chosen server-side name.
+    pub fn prepare_named(
+        &mut self
+        name: &String
+        sql: &String
+        param_oids: &Vec<i64>
+    ) -> Result<Statement, errors::Error> {
+        self.ensure_ready()?
+        let mut out: Vec<u8> = #[]
+
+        let mut parse_body: Vec<u8> = #[]
+        buf::put_cstr(&mut parse_body, name)
+        buf::put_cstr(&mut parse_body, sql)
+        buf::put_i16(&mut parse_body, param_oids.len())
+        for oid in param_oids {
+            buf::put_i32(&mut parse_body, oid)
+        }
+        out.extend(proto::frame(proto::F_PARSE, &parse_body))
+
+        let mut describe_body: Vec<u8> = #[]
+        buf::put_u8(&mut describe_body, proto::TARGET_STATEMENT)
+        buf::put_cstr(&mut describe_body, name)
+        out.extend(proto::frame(proto::F_DESCRIBE, &describe_body))
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+
+        let mut described_params: Vec<i64> = param_oids.clone()
+        let mut columns: Vec<Column> = #[]
+        let mut failure: Option<dberror::DbError> = None
+        loop {
+            let (tag, msg) = self.recv()?
+            match tag {
+                proto::B_PARAMETER_DESCRIPTION => {
+                    let mut oids: Vec<i64> = #[]
+                    for i in 0..buf::i16_at(&msg, 0) {
+                        oids.push(buf::u32_at(&msg, 2 + i * 4))
+                    }
+                    described_params = oids
+                }
+                proto::B_ROW_DESCRIPTION => { columns = parse_row_description(&msg) }
+                proto::B_ERROR_RESPONSE => {
+                    if failure.is_none() {
+                        failure = Some(dberror::parse(&msg))
+                    }
+                }
+                proto::B_READY_FOR_QUERY => {
+                    self.mark_ready(&msg)
+                    break
+                }
+                // ParseComplete and NoData carry no shape of their own.
+                _ => ()
+            }
+        }
+        match failure {
+            Some(e) => Err(e.as_error())
+            None => Ok(Statement {
+                name: name.clone()
+                param_oids: described_params
+                columns: columns
+            })
+        }
+    }
+
+    // Drops a prepared statement from the server.
+    pub fn close_statement(&mut self, statement: &Statement) -> Result<(), errors::Error> {
+        if self.closed {
+            return Ok(())
+        }
+        self.ensure_ready()?
+        let mut body: Vec<u8> = #[]
+        buf::put_u8(&mut body, proto::TARGET_STATEMENT)
+        buf::put_cstr(&mut body, &statement.name)
+        let mut out: Vec<u8> = #[]
+        out.extend(proto::frame(proto::F_CLOSE, &body))
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+        self.drain_to_ready()
+    }
+
+    // Binds parameters to a statement, producing a named portal ready to be
+    // executed. `result_format` is one of the `value::FORMAT_*` codes and
+    // applies to every column.
+    pub (package) fn bind(
+        &mut self
+        statement: &Statement
+        portal: &String
+        params: &Vec<value::Value>
+        result_format: i64
+    ) -> Result<Vec<u8>, errors::Error> {
+        if params.len() != statement.param_oids.len() && statement.param_oids.len() > 0 {
+            return Err(errors::newf(
+                "statement takes {} parameter(s) but {} were bound"
+                statement.param_oids.len()
+                params.len()
+            ))
+        }
+        let mut body: Vec<u8> = #[]
+        buf::put_cstr(&mut body, portal)
+        buf::put_cstr(&mut body, &statement.name)
+
+        // Each parameter carries its own format code, so a `bytea` goes as
+        // binary while the rest go as text. The encodings are concatenated
+        // into one buffer with a length per parameter (-1 for SQL NULL),
+        // because the Bind message wants every format code before the first
+        // value and this keeps a single pass over the parameters.
+        let mut formats: Vec<i64> = #[]
+        let mut lengths: Vec<i64> = #[]
+        let mut blob: Vec<u8> = #[]
+        for param in params {
+            if param.is_null() {
+                formats.push(value::FORMAT_TEXT)
+                lengths.push(-1)
+                continue
+            }
+            let type_oid = if formats.len() < statement.param_oids.len() {
+                statement.param_oids[formats.len()]
+            } else {
+                0
+            }
+            match value::encode_binary(&param, type_oid) {
+                Some(bytes) => {
+                    formats.push(value::FORMAT_BINARY)
+                    lengths.push(bytes.len())
+                    blob.extend(bytes)
+                }
+                None => {
+                    let text = param.render().as_bytes()
+                    formats.push(value::FORMAT_TEXT)
+                    lengths.push(text.len())
+                    blob.extend(text)
+                }
+            }
+        }
+
+        buf::put_i16(&mut body, formats.len())
+        for format in formats {
+            buf::put_i16(&mut body, format)
+        }
+        buf::put_i16(&mut body, lengths.len())
+        let mut offset = 0
+        for length in lengths {
+            buf::put_i32(&mut body, length)
+            if length > 0 {
+                buf::put_bytes(&mut body, &buf::slice(&blob, offset, offset + length))
+                offset += length
+            }
+        }
+        // One result format code applied to every column.
+        buf::put_i16(&mut body, 1)
+        buf::put_i16(&mut body, result_format)
+        Ok(proto::frame(proto::F_BIND, &body))
+    }
+
+    // An Execute message for `portal`, fetching at most `max_rows` rows (0
+    // for all of them).
+    pub (package) fn execute_message(portal: &String, max_rows: i64) -> Vec<u8> {
+        let mut body: Vec<u8> = #[]
+        buf::put_cstr(&mut body, portal)
+        buf::put_i32(&mut body, max(max_rows, 0))
+        proto::frame(proto::F_EXECUTE, &body)
+    }
+
+    // Runs a statement for its effect and reports the rows it affected.
+    pub fn execute(
+        &mut self
+        statement: &Statement
+        params: &Vec<value::Value>
+    ) -> Result<i64, errors::Error> {
+        self.ensure_ready()?
+        let bind_message = self.bind(statement, &"", params, value::FORMAT_TEXT)?
+        let mut out: Vec<u8> = #[]
+        out.extend(bind_message)
+        out.extend(PgConn::execute_message(&"", 0))
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+        Ok(self.collect_counts()?.last().unwrap_or(0))
+    }
+
+    // Opens a row stream for a statement. Rows are pulled with `next_row`;
+    // the portal stays open until the stream is drained or closed.
+    pub fn query(
+        &mut self
+        statement: &Statement
+        params: &Vec<value::Value>
+        result_format: i64
+    ) -> Result<RowStream, errors::Error> {
+        self.ensure_ready()?
+        let portal = self.next_name(&"p")
+        let bind_message = self.bind(statement, &portal, params, result_format)?
+        let mut out: Vec<u8> = #[]
+        out.extend(bind_message)
+        out.extend(PgConn::execute_message(&portal, 0))
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+
+        // The Bind is the first thing that can fail: a parameter the server
+        // cannot coerce is reported here, before any row arrives.
+        let (tag, msg) = self.recv()?
+        if tag == proto::B_ERROR_RESPONSE {
+            let failure = dberror::parse(&msg)
+            self.drain_to_ready()?
+            return Err(failure.as_error())
+        }
+        self.portal_open = true
+        // Result columns come from the Describe done at prepare time; a
+        // binary-format request re-labels them so decoding matches the wire.
+        let columns = relabel_formats(&statement.columns, result_format)
+        Ok(RowStream {
+            portal: portal
+            columns: columns
+            done: false
+            rows_affected: 0
+            tag: ""
+        })
+    }
+
+    // The next row of an open stream, or `None` at the end of the result.
+    //
+    // Reaching the end drains to the ready point, so the connection is
+    // usable again without any further call.
+    pub fn next_row(&mut self, stream: &mut RowStream) -> Result<Option<Row>, errors::Error> {
+        if stream.done {
+            return Ok(None)
+        }
+        loop {
+            let (tag, msg) = self.recv()?
+            match tag {
+                proto::B_DATA_ROW => {
+                    return Ok(Some(Row {
+                        columns: stream.columns.clone()
+                        values: decode_data_row(&msg, &stream.columns)
+                    }))
+                }
+                proto::B_COMMAND_COMPLETE => {
+                    let (tag_text, count) = proto::command_complete(&msg)
+                    stream.tag = tag_text
+                    stream.rows_affected = count
+                    stream.done = true
+                    self.portal_open = false
+                    self.drain_to_ready()?
+                    return Ok(None)
+                }
+                proto::B_EMPTY_QUERY_RESPONSE => {
+                    stream.done = true
+                    self.portal_open = false
+                    self.drain_to_ready()?
+                    return Ok(None)
+                }
+                proto::B_PORTAL_SUSPENDED => {
+                    // Only a row-limited Execute suspends, and `query` never
+                    // sets a limit; treat it as the end of the stream.
+                    stream.done = true
+                    self.portal_open = false
+                    self.drain_to_ready()?
+                    return Ok(None)
+                }
+                proto::B_ERROR_RESPONSE => {
+                    let failure = dberror::parse(&msg)
+                    stream.done = true
+                    self.portal_open = false
+                    self.drain_to_ready()?
+                    return Err(failure.as_error())
+                }
+                // BindComplete and RowDescription may precede the rows.
+                proto::B_ROW_DESCRIPTION => { stream.columns = parse_row_description(&msg) }
+                _ => ()
+            }
+        }
+    }
+
+    // Abandons a stream that is not fully read, leaving the connection
+    // ready. Idempotent.
+    pub fn close_stream(&mut self, stream: &mut RowStream) -> Result<(), errors::Error> {
+        if stream.done {
+            return Ok(())
+        }
+        stream.done = true
+        if self.closed {
+            return Ok(())
+        }
+        self.portal_open = false
+        self.drain_to_ready()
+    }
+
+    // --- portals --------------------------------------------------
+
+    // Opens a portal that yields rows in batches of `batch_size`, for a
+    // result set too large to hold at once. The portal lives until the
+    // statement's transaction ends, so this is only useful inside one.
+    pub fn open_portal(
+        &mut self
+        statement: &Statement
+        params: &Vec<value::Value>
+        result_format: i64
+    ) -> Result<Portal, errors::Error> {
+        self.ensure_ready()?
+        let name = self.next_name(&"c")
+        let bind_message = self.bind(statement, &name, params, result_format)?
+        let mut out: Vec<u8> = #[]
+        out.extend(bind_message)
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+        self.drain_to_ready()?
+        let columns = relabel_formats(&statement.columns, result_format)
+        Ok(Portal { name: name, columns: columns, exhausted: false })
+    }
+
+    // Fetches up to `batch_size` more rows from a portal. An answer shorter
+    // than `batch_size` means the portal is exhausted.
+    pub fn fetch_portal(
+        &mut self
+        portal: &mut Portal
+        batch_size: i64
+    ) -> Result<Vec<Row>, errors::Error> {
+        if portal.exhausted || batch_size <= 0 {
+            return Ok(#[])
+        }
+        self.ensure_ready()?
+        let mut out: Vec<u8> = #[]
+        out.extend(PgConn::execute_message(&portal.name, batch_size))
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+
+        let mut rows: Vec<Row> = #[]
+        let mut failure: Option<dberror::DbError> = None
+        loop {
+            let (tag, msg) = self.recv()?
+            match tag {
+                proto::B_DATA_ROW => rows.push(Row {
+                    columns: portal.columns.clone()
+                    values: decode_data_row(&msg, &portal.columns)
+                })
+                proto::B_COMMAND_COMPLETE | proto::B_EMPTY_QUERY_RESPONSE => {
+                    portal.exhausted = true
+                }
+                proto::B_ERROR_RESPONSE => {
+                    portal.exhausted = true
+                    if failure.is_none() {
+                        failure = Some(dberror::parse(&msg))
+                    }
+                }
+                proto::B_READY_FOR_QUERY => {
+                    self.mark_ready(&msg)
+                    break
+                }
+                _ => ()
+            }
+        }
+        match failure {
+            Some(e) => Err(e.as_error())
+            None => Ok(rows)
+        }
+    }
+
+    // Closes a portal before it is exhausted.
+    pub fn close_portal(&mut self, portal: &mut Portal) -> Result<(), errors::Error> {
+        portal.exhausted = true
+        if self.closed {
+            return Ok(())
+        }
+        self.ensure_ready()?
+        let mut body: Vec<u8> = #[]
+        buf::put_u8(&mut body, proto::TARGET_PORTAL)
+        buf::put_cstr(&mut body, &portal.name)
+        let mut out: Vec<u8> = #[]
+        out.extend(proto::frame(proto::F_CLOSE, &body))
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+        self.drain_to_ready()
+    }
+
+    // --- pipelining -----------------------------------------------
+
+    // Runs several parameterized statements in one round trip: every Bind
+    // and Execute is sent before any reply is read, then the replies are
+    // collected in order. The whole batch shares one implicit transaction,
+    // so a failure part-way leaves the earlier statements rolled back
+    // unless the caller opened a transaction of its own.
+    pub fn pipeline(
+        &mut self
+        statements: &Vec<Statement>
+        params: &Vec<Vec<value::Value>>
+    ) -> Result<Vec<i64>, errors::Error> {
+        if statements.len() != params.len() {
+            return Err(errors::newf(
+                "pipeline has {} statement(s) but {} parameter set(s)"
+                statements.len()
+                params.len()
+            ))
+        }
+        self.ensure_ready()?
+        let mut out: Vec<u8> = #[]
+        // The statement and its parameter set are bound to locals first: each
+        // is an aggregate held inside another, and the Bind message reads them
+        // several times.
+        for (statement, row) in statements.iter().zip(params.iter()) {
+            let bind_message = self.bind(&statement, &"", &row, value::FORMAT_TEXT)?
+            out.extend(bind_message)
+            out.extend(PgConn::execute_message(&"", 0))
+        }
+        out.extend(proto::frame(proto::F_SYNC, &#[]))
+        self.send(&out)?
+        self.collect_counts()
+    }
+
+    // --- COPY -----------------------------------------------------
+
+    // Streams `data` into the server with `COPY ... FROM STDIN`, reporting
+    // the rows the server accepted. The payload is whatever the COPY
+    // statement's format declares: text lines, CSV, or the binary format.
+    pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
+        self.ensure_ready()?
+        let mut query_body: Vec<u8> = #[]
+        buf::put_cstr(&mut query_body, sql)
+        let message = proto::frame(proto::F_QUERY, &query_body)
+        self.send(&message)?
+
+        let (tag, msg) = self.recv()?
+        if tag == proto::B_ERROR_RESPONSE {
+            let failure = dberror::parse(&msg)
+            self.drain_to_ready()?
+            return Err(failure.as_error())
+        }
+        if tag != proto::B_COPY_IN_RESPONSE {
+            self.drain_to_ready()?
+            return Err(errors::newf(
+                "COPY FROM STDIN expected, but the server answered message `{}`"
+                tag as char
+            ))
+        }
+        let mut out: Vec<u8> = #[]
+        out.extend(proto::frame(proto::F_COPY_DATA, data))
+        out.extend(proto::frame(proto::F_COPY_DONE, &#[]))
+        self.send(&out)?
+        Ok(self.collect_counts()?.last().unwrap_or(0))
+    }
+
+    // Abandons an in-progress COPY FROM STDIN with a reason the server
+    // reports back as an error. Used when the data source fails part-way,
+    // so the server does not commit a partial copy.
+    pub fn copy_fail(&mut self, reason: &String) -> Result<(), errors::Error> {
+        let mut body: Vec<u8> = #[]
+        buf::put_cstr(&mut body, reason)
+        let message = proto::frame(proto::F_COPY_FAIL, &body)
+        self.send(&message)?
+        // The server answers with the error the failure caused, which is
+        // the expected outcome rather than a problem to report.
+        let _ = self.drain_to_ready()
+        Ok(())
+    }
+
+    // Reads a `COPY ... TO STDOUT` in full.
+    pub fn copy_out(&mut self, sql: &String) -> Result<Vec<u8>, errors::Error> {
+        self.ensure_ready()?
+        let mut query_body: Vec<u8> = #[]
+        buf::put_cstr(&mut query_body, sql)
+        let message = proto::frame(proto::F_QUERY, &query_body)
+        self.send(&message)?
+
+        let mut out: Vec<u8> = #[]
+        let mut failure: Option<dberror::DbError> = None
+        loop {
+            let (tag, msg) = self.recv()?
+            match tag {
+                proto::B_COPY_DATA => out.extend(msg)
+                proto::B_ERROR_RESPONSE => {
+                    if failure.is_none() {
+                        failure = Some(dberror::parse(&msg))
+                    }
+                }
+                proto::B_READY_FOR_QUERY => {
+                    self.mark_ready(&msg)
+                    break
+                }
+                // CopyOutResponse, CopyDone, and CommandComplete frame the
+                // stream without carrying data.
+                _ => ()
+            }
+        }
+        match failure {
+            Some(e) => Err(e.as_error())
+            None => Ok(out)
+        }
+    }
+
+    // --- LISTEN / NOTIFY ------------------------------------------
+
+    // The next queued notification, without touching the socket. Deliveries
+    // come back in the order the server sent them.
+    pub fn take_notification(&mut self) -> Option<Notification> {
+        self.pending.remove(0).ok()
+    }
+
+    // Waits up to `timeout_ms` for a notification, answering `None` if none
+    // arrives. A zero timeout polls what is already buffered.
+    //
+    // The socket read deadline bounds the wait, so a quiet channel does not
+    // park the caller indefinitely. On a Unix socket, where no deadline can
+    // be set, a zero timeout still polls and a positive one blocks for the
+    // next message.
+    pub fn poll_notification(
+        &mut self
+        timeout_ms: i64
+    ) -> Result<Option<Notification>, errors::Error> {
+        if let Some(n) = self.take_notification() {
+            return Ok(Some(n))
+        }
+        // Anything already read from the socket is framed first.
+        while self.has_buffered_message() {
+            let (tag, body) = self.recv_raw()?
+            self.absorb_async(tag, &body)
+            if let Some(n) = self.take_notification() {
+                return Ok(Some(n))
+            }
+        }
+        if timeout_ms <= 0 {
+            return Ok(None)
+        }
+        let deadline = time::now_ms() + timeout_ms
+        match self.sock {
+            Socket::Tcp(stream) => stream.set_read_timeout_ms(timeout_ms)
+            Socket::Unix(_) => ()
+        }
+        let outcome = self.wait_for_notification(deadline)
+        match self.sock {
+            Socket::Tcp(stream) => stream.clear_read_timeout()
+            Socket::Unix(_) => ()
+        }
+        outcome
+    }
+
+    fn wait_for_notification(&mut self, deadline: i64) -> Result<Option<Notification>, errors::Error> {
+        loop {
+            if time::now_ms() >= deadline {
+                return Ok(None)
+            }
+            match self.recv_raw() {
+                Ok((tag, body)) => {
+                    self.absorb_async(tag, &body)
+                    if let Some(n) = self.take_notification() {
+                        return Ok(Some(n))
+                    }
+                }
+                Err(e) => {
+                    // A read deadline reached with nothing to show is the
+                    // answer "no notification", not a broken connection.
+                    if self.closed && format!("{}", e).contains("closed") {
+                        return Err(e)
+                    }
+                    self.closed = false
+                    return Ok(None)
+                }
+            }
+        }
+    }
+
+    // Files an out-of-band message where it belongs.
+    fn absorb_async(&mut self, tag: i64, body: &Vec<u8>) {
+        match tag {
+            proto::B_NOTIFICATION_RESPONSE => self.pending.push(parse_notification(body))
+            proto::B_NOTICE_RESPONSE => self.notices.push(dberror::parse(body))
+            proto::B_PARAMETER_STATUS => {
+                let (name, setting) = parse_parameter_status(body)
+                let _ = self.params.insert(name, setting)
+            }
+            proto::B_READY_FOR_QUERY => { self.tx_status = buf::u8_at(body, 0) }
+            _ => ()
+        }
+    }
+
+    // --- cancellation and shutdown --------------------------------
+
+    // Asks the server to cancel whatever this connection is running.
+    //
+    // The request goes on a new connection, because the one being cancelled
+    // is busy. The server does not answer it: cancellation is a request, and
+    // a query that has already finished is unaffected.
+    pub fn cancel(&self) -> Result<(), errors::Error> {
+        if self.backend_pid == 0 {
+            return Err(errors::new("no backend key: the server sent no BackendKeyData"))
+        }
+        send_cancel(&self.host, self.backend_pid, self.backend_secret)
+    }
+
+    // Sends Terminate and closes the socket. Idempotent.
+    pub fn close(&mut self) {
+        if !self.closed {
+            let message = proto::frame(proto::F_TERMINATE, &#[])
+            let _ = socket_write(&self.sock, &message)
+        }
+        socket_close(&self.sock)
+        self.closed = true
+    }
+}
+
+// One result set from a simple query.
+pub struct SimpleResult {
+    // The CommandComplete tag (`SELECT 3`, `INSERT 0 1`).
+    pub tag: String
+    pub rows_affected: i64
+    pub columns: Vec<Column>
+    pub rows: Vec<Vec<value::Value>>
+}
+
+// An open row stream from the extended query protocol.
+pub struct RowStream {
+    pub (package) portal: String
+    pub columns: Vec<Column>
+    pub (package) done: bool
+    // Filled once the stream reaches its CommandComplete.
+    pub rows_affected: i64
+    pub tag: String
+}
+
+impl RowStream {
+    // True once the stream has been read to the end or closed.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+// A server-side portal fetched in batches.
+pub struct Portal {
+    pub (package) name: String
+    pub columns: Vec<Column>
+    pub (package) exhausted: bool
+}
+
+impl Portal {
+    // True once the portal has answered every row it holds.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
+// One row of a result set, with the shape needed to read it by name.
+pub struct Row {
+    pub columns: Vec<Column>
+    pub values: Vec<value::Value>
+}
+
+impl Row {
+    // Number of columns.
+    pub fn width(&self) -> i64 {
+        self.values.len()
+    }
+
+    // The value at `index`, or NULL past the end.
+    pub fn at(&self, index: i64) -> value::Value {
+        if index < 0 || index >= self.values.len() {
+            return value::Value::Null
+        }
+        self.values[index]
+    }
+
+    // Index of the column named `name`, or -1 when there is none. A
+    // duplicated name resolves to its first occurrence, which is what the
+    // server's own `SELECT` semantics imply.
+    pub fn index_of(&self, name: String) -> i64 {
+        self.columns.iter().position(|column| column.name == name).unwrap_or(-1)
+    }
+
+    // The value of the column named `name`.
+    pub fn get(&self, name: String) -> Result<value::Value, errors::Error> {
+        let index = self.index_of(name.clone())
+        if index < 0 {
+            return Err(errors::newf("no column named `{}` in this row", name))
+        }
+        Ok(self.values[index])
+    }
+
+    // The type OID of the column at `index`, or 0 past the end.
+    pub fn type_at(&self, index: i64) -> i64 {
+        if index < 0 || index >= self.columns.len() {
+            return 0
+        }
+        self.columns[index].type_oid
+    }
+}
+
+// --- typed row access ---------------------------------------------
+
+impl Row {
+    // The column at `index` as an `i64`.
+    pub fn i64_at(&self, index: i64) -> Result<i64, errors::Error> {
+        self.at(index).as_int().ok_or(self.conversion_error(index, &"an integer"))
+    }
+
+    // The column at `index` as an `f64`.
+    pub fn f64_at(&self, index: i64) -> Result<f64, errors::Error> {
+        self.at(index).as_float().ok_or(self.conversion_error(index, &"a float"))
+    }
+
+    // The column at `index` as a `bool`.
+    pub fn bool_at(&self, index: i64) -> Result<bool, errors::Error> {
+        self.at(index).as_bool().ok_or(self.conversion_error(index, &"a boolean"))
+    }
+
+    // The column at `index` as text. Every non-NULL value has a text form.
+    pub fn text_at(&self, index: i64) -> Result<String, errors::Error> {
+        self.at(index).as_text().ok_or(self.conversion_error(index, &"text"))
+    }
+
+    // The column at `index` as bytes.
+    pub fn bytes_at(&self, index: i64) -> Result<Vec<u8>, errors::Error> {
+        self.at(index).as_bytes().ok_or(self.conversion_error(index, &"bytes"))
+    }
+
+    // The column at `index` as an array's elements, each decoded under the
+    // column's own element type.
+    pub fn array_at(&self, index: i64) -> Result<Vec<value::Value>, errors::Error> {
+        let type_oid = self.type_at(index)
+        let element = oid::element_of(type_oid)
+        if element == 0 {
+            return Err(errors::newf(
+                "column {} is {}, which is not an array type"
+                index
+                oid::name_of(type_oid)
+            ))
+        }
+        match self.at(index).as_text() {
+            Some(text) => value::parse_array_literal(&text, element)
+            None => Err(self.conversion_error(index, &"an array"))
+        }
+    }
+
+    // The column at `index` as a composite's fields, each read as the text
+    // the server wrote: a record carries no field types on the wire.
+    pub fn record_at(&self, index: i64) -> Result<Vec<value::Value>, errors::Error> {
+        match self.at(index).as_text() {
+            Some(text) => value::parse_record_literal(&text)
+            None => Err(self.conversion_error(index, &"a composite"))
+        }
+    }
+
+    // The column at `index` as a range.
+    pub fn range_at(&self, index: i64) -> Result<value::Range, errors::Error> {
+        let type_oid = self.type_at(index)
+        let element = oid::range_element_of(type_oid)
+        if element == 0 {
+            return Err(errors::newf(
+                "column {} is {}, which is not a range type"
+                index
+                oid::name_of(type_oid)
+            ))
+        }
+        match self.at(index).as_text() {
+            Some(text) => value::parse_range_literal(&text, element)
+            None => Err(self.conversion_error(index, &"a range"))
+        }
+    }
+
+    // The column at `index` as an RFC 3339 instant, for a `timestamptz`.
+    //
+    // PostgreSQL writes `2026-08-16 12:34:56.789+00`, which differs from RFC
+    // 3339 in the date/time separator and the offset's missing minutes;
+    // both are normalized before parsing.
+    pub fn timestamp_at(&self, index: i64) -> Result<time::Instant, errors::Error> {
+        let text = self.text_at(index)?
+        let type_oid = self.type_at(index)
+        if !oid::is_temporal(type_oid) {
+            return Err(errors::newf(
+                "column {} is {}, which carries no date or time"
+                index
+                oid::name_of(type_oid)
+            ))
+        }
+        time::parse_rfc3339(client::rfc3339_of(&text))
+    }
+
+    // True when the column at `index` is NULL.
+    pub fn is_null_at(&self, index: i64) -> bool {
+        self.at(index).is_null()
+    }
+
+    // The column at `index` as an `i64`, or `None` when it is NULL.
+    pub fn opt_i64_at(&self, index: i64) -> Result<Option<i64>, errors::Error> {
+        if self.is_null_at(index) {
+            return Ok(None)
+        }
+        Ok(Some(self.i64_at(index)?))
+    }
+
+    // The column at `index` as text, or `None` when it is NULL.
+    pub fn opt_text_at(&self, index: i64) -> Result<Option<String>, errors::Error> {
+        if self.is_null_at(index) {
+            return Ok(None)
+        }
+        Ok(Some(self.text_at(index)?))
+    }
+
+    // The column at `index` as an `f64`, or `None` when it is NULL.
+    pub fn opt_f64_at(&self, index: i64) -> Result<Option<f64>, errors::Error> {
+        if self.is_null_at(index) {
+            return Ok(None)
+        }
+        Ok(Some(self.f64_at(index)?))
+    }
+
+    // The column named `name` as an `i64`.
+    pub fn i64_of(&self, name: String) -> Result<i64, errors::Error> {
+        self.i64_at(self.require(name)?)
+    }
+
+    // The column named `name` as an `f64`.
+    pub fn f64_of(&self, name: String) -> Result<f64, errors::Error> {
+        self.f64_at(self.require(name)?)
+    }
+
+    // The column named `name` as a `bool`.
+    pub fn bool_of(&self, name: String) -> Result<bool, errors::Error> {
+        self.bool_at(self.require(name)?)
+    }
+
+    // The column named `name` as text.
+    pub fn text_of(&self, name: String) -> Result<String, errors::Error> {
+        self.text_at(self.require(name)?)
+    }
+
+    // The column named `name` as bytes.
+    pub fn bytes_of(&self, name: String) -> Result<Vec<u8>, errors::Error> {
+        self.bytes_at(self.require(name)?)
+    }
+
+    // The column named `name` as an array's elements.
+    pub fn array_of(&self, name: String) -> Result<Vec<value::Value>, errors::Error> {
+        self.array_at(self.require(name)?)
+    }
+
+    // The column named `name` as a composite's fields.
+    pub fn record_of(&self, name: String) -> Result<Vec<value::Value>, errors::Error> {
+        self.record_at(self.require(name)?)
+    }
+
+    // The column named `name` as a range.
+    pub fn range_of(&self, name: String) -> Result<value::Range, errors::Error> {
+        self.range_at(self.require(name)?)
+    }
+
+    // The column named `name` as an instant.
+    pub fn timestamp_of(&self, name: String) -> Result<time::Instant, errors::Error> {
+        self.timestamp_at(self.require(name)?)
+    }
+
+    // The column named `name` as an `f64`, or `None` when it is NULL.
+    pub fn opt_f64_of(&self, name: String) -> Result<Option<f64>, errors::Error> {
+        self.opt_f64_at(self.require(name)?)
+    }
+
+    // The column named `name` as an `i64`, or `None` when it is NULL.
+    pub fn opt_i64_of(&self, name: String) -> Result<Option<i64>, errors::Error> {
+        self.opt_i64_at(self.require(name)?)
+    }
+
+    // The column named `name` as text, or `None` when it is NULL.
+    pub fn opt_text_of(&self, name: String) -> Result<Option<String>, errors::Error> {
+        self.opt_text_at(self.require(name)?)
+    }
+
+    // True when the column named `name` is NULL. A name the row does not
+    // carry answers `true`, matching `at` past the end.
+    pub fn is_null_of(&self, name: String) -> bool {
+        self.index_of(name) < 0 || self.at(self.index_of(name)).is_null()
+    }
+
+    // The index of `name`, reporting a name the row does not carry.
+    fn require(&self, name: String) -> Result<i64, errors::Error> {
+        let index = self.index_of(name.clone())
+        if index < 0 {
+            return Err(errors::newf("no column named `{}` in this row", name))
+        }
+        Ok(index)
+    }
+
+    fn conversion_error(&self, index: i64, wanted: &String) -> errors::Error {
+        let name = if index >= 0 && index < self.columns.len() {
+            self.columns[index].name.clone()
+        } else {
+            format!("{}", index)
+        }
+        errors::newf(
+            "column `{}` is {} and does not read as {}"
+            name
+            oid::name_of(self.type_at(index))
+            wanted
+        )
+    }
+}
+
+// --- decoding helpers ---------------------------------------------
+
+// The same columns, labelled with the wire format the results were asked
+// for. A fresh list rather than a mutated copy: the description belongs to
+// the prepared statement, which may be shared with another portal.
+fn relabel_formats(columns: &Vec<Column>, format: i64) -> Vec<Column> {
+    columns.map(|column| Column {
+        name: column.name.clone()
+        table_oid: column.table_oid
+        column_id: column.column_id
+        type_oid: column.type_oid
+        type_modifier: column.type_modifier
+        type_size: column.type_size
+        format: format
+    })
+}
+
+// Parses a RowDescription into its columns.
+pub fn parse_row_description(body: &Vec<u8>) -> Vec<Column> {
+    let count = buf::i16_at(body, 0)
+    let mut columns: Vec<Column> = #[]
+    let mut offset = 2
+    let mut i = 0
+    while i < count {
+        let (name, next) = buf::cstr_at(body, offset)
+        columns.push(Column {
+            name: name
+            table_oid: buf::u32_at(body, next)
+            column_id: buf::i16_at(body, next + 4)
+            type_oid: buf::u32_at(body, next + 6)
+            type_size: buf::i16_at(body, next + 10)
+            type_modifier: buf::i32_at(body, next + 12)
+            format: buf::i16_at(body, next + 16)
+        })
+        offset = next + 18
+        i += 1
+    }
+    columns
+}
+
+// Decodes a DataRow under the columns' types and formats.
+pub fn decode_data_row(body: &Vec<u8>, columns: &Vec<Column>) -> Vec<value::Value> {
+    let count = buf::i16_at(body, 0)
+    let mut out: Vec<value::Value> = #[]
+    let mut offset = 2
+    let mut i = 0
+    while i < count {
+        let length = buf::i32_at(body, offset)
+        offset += 4
+        if length < 0 {
+            out.push(value::Value::Null)
+        } else {
+            let raw = buf::slice(body, offset, offset + length)
+            let type_oid = if i < columns.len() { columns[i].type_oid } else { 0 }
+            let format = if i < columns.len() { columns[i].format } else { value::FORMAT_TEXT }
+            out.push(if format == value::FORMAT_BINARY {
+                value::decode_binary(type_oid, &raw)
+            } else {
+                value::decode_text(type_oid, &raw)
+            })
+            offset += length
+        }
+        i += 1
+    }
+    out
+}
+
+// The name and setting a ParameterStatus reports.
+fn parse_parameter_status(body: &Vec<u8>) -> (String, String) {
+    let (name, next) = buf::cstr_at(body, 0)
+    let (setting, _) = buf::cstr_at(body, next)
+    (name, setting)
+}
+
+fn parse_notification(body: &Vec<u8>) -> Notification {
+    let pid = buf::i32_at(body, 0)
+    let (channel, next) = buf::cstr_at(body, 4)
+    let (payload, _) = buf::cstr_at(body, next)
+    Notification { channel: channel, payload: payload, pid: pid }
+}
+
+// --- connecting ---------------------------------------------------
+
+// Opens a socket to one host, applying `timeout_ms` as the read and write
+// deadline while the connection is being established.
+fn open_socket(host: &config::HostAddr, timeout_ms: i64) -> Result<Socket, errors::Error> {
+    if host.is_unix() {
+        let path = host.socket_path()
+        return match net::UnixStream::connect(path) {
+            Ok(stream) => Ok(Socket::Unix(stream))
+            Err(e) => Err(errors::wrap(e, format!("connecting to {}", host.socket_path())))
+        }
+    }
+    match net::TcpStream::connect(host.tcp_addr()) {
+        Ok(stream) => {
+            if timeout_ms > 0 {
+                stream.set_read_timeout_ms(timeout_ms)
+                stream.set_write_timeout_ms(timeout_ms)
+            }
+            Ok(Socket::Tcp(stream))
+        }
+        Err(e) => Err(errors::wrap(e, format!("connecting to {}", host.tcp_addr())))
+    }
+}
+
+// Sends a CancelRequest for a backend on a connection of its own.
+//
+// The server never answers it: cancellation is a request, and a query that
+// has already finished is simply unaffected.
+pub fn send_cancel(host: &config::HostAddr, pid: i64, secret: i64) -> Result<(), errors::Error> {
+    let sock = open_socket(host, 0)?
+    let message = proto::cancel_request(pid, secret)
+    let sent = socket_write(&sock, &message)
+    socket_close(&sock)
+    sent
+}
+
+// Connects to the first host in `cfg` that accepts the session, and returns
+// it authenticated and ready for a query.
+//
+// Every host is tried in order; the last failure is reported when none
+// works, so a multi-host list names the reason it gave up rather than only
+// that it did.
+pub fn connect(cfg: &config::Config) -> Result<PgConn, errors::Error> {
+    if cfg.hosts.len() == 0 {
+        return Err(errors::new("no host to connect to"))
+    }
+    let mut last: Option<errors::Error> = None
+    for host in cfg.hosts {
+        match connect_host(cfg, &host) {
+            Ok(conn) => return Ok(conn)
+            Err(e) => { last = Some(e) }
+        }
+    }
+    match last {
+        Some(e) => Err(e)
+        None => Err(errors::new("no host to connect to"))
+    }
+}
+
+// Connects to one specific host.
+pub fn connect_host(
+    cfg: &config::Config
+    host: &config::HostAddr
+) -> Result<PgConn, errors::Error> {
+    let sock = open_socket(host, cfg.connect_timeout_ms)?
+    let mut conn = PgConn {
+        sock: sock
+        inbox: #[]
+        inbox_pos: 0
+        params: Map::new()
+        backend_pid: 0
+        backend_secret: 0
+        tx_status: proto::TX_IDLE
+        notices: #[]
+        pending: #[]
+        closed: false
+        portal_open: false
+        name_counter: 0
+        host: host.clone()
+        tls: false
+    }
+    match negotiate(&mut conn, cfg, host) {
+        Ok(_) => ()
+        Err(e) => {
+            conn.close()
+            return Err(e)
+        }
+    }
+    match finish_session(&mut conn, cfg) {
+        Ok(_) => Ok(conn)
+        Err(e) => {
+            conn.close()
+            Err(e)
+        }
+    }
+}
+
+// TLS negotiation, startup, and authentication.
+fn negotiate(
+    conn: &mut PgConn
+    cfg: &config::Config
+    host: &config::HostAddr
+) -> Result<(), errors::Error> {
+    negotiate_tls(conn, cfg, host)?
+    send_startup(conn, cfg)?
+    authenticate(conn, cfg)
+}
+
+// Sends an SSLRequest and upgrades the socket when the server agrees.
+//
+// A Unix socket is not upgraded: the connection never leaves the machine,
+// which is the same judgement libpq makes.
+fn negotiate_tls(
+    conn: &mut PgConn
+    cfg: &config::Config
+    host: &config::HostAddr
+) -> Result<(), errors::Error> {
+    if !cfg.wants_tls() || host.is_unix() {
+        if cfg.requires_tls() && host.is_unix() {
+            return Err(errors::new(
+                "sslmode requires TLS, but a Unix-socket connection is local and is not upgraded; connect over TCP"
+            ))
+        }
+        return Ok(())
+    }
+    let request = proto::ssl_request()
+    conn.send(&request)?
+    let answer = match socket_read(&conn.sock, 1) {
+        Ok(byte) => byte
+        Err(e) => {
+            conn.closed = true
+            return Err(errors::wrap(e, "reading the TLS negotiation answer"))
+        }
+    }
+    // `S` accepts, `N` declines. An ErrorResponse means the server is too
+    // old to know the request at all.
+    let accepted = answer.len() == 1 && (answer[0] as i64) == 83
+    if !accepted {
+        if cfg.requires_tls() {
+            return Err(errors::newf(
+                "server declined TLS but sslmode is {}"
+                sslmode_name(&cfg.sslmode)
+            ))
+        }
+        return Ok(())
+    }
+    let upgraded = match conn.sock {
+        Socket::Tcp(stream) => upgrade_tls(stream, cfg, host)?
+        // Unreachable: a Unix socket returns above.
+        Socket::Unix(_) => return Err(errors::new("a Unix socket is not upgraded to TLS"))
+    }
+    conn.sock = Socket::Tcp(upgraded)
+    conn.tls = true
+    Ok(())
+}
+
+// Performs the TLS handshake at the strictness `sslmode` asks for.
+fn upgrade_tls(
+    stream: net::TcpStream
+    cfg: &config::Config
+    host: &config::HostAddr
+) -> Result<net::TcpStream, errors::Error> {
+    let result = if cfg.verifies_certificate() {
+        match cfg.sslrootcert {
+            Some(pem) => stream.start_tls_ca(host.host.clone(), pem)
+            None => stream.start_tls(host.host.clone())
+        }
+    } else {
+        // `require` encrypts without vouching for the certificate, which is
+        // exactly what libpq documents it to mean.
+        stream.start_tls_insecure(host.host.clone())
+    }
+    match result {
+        Ok(tls) => Ok(tls)
+        Err(e) => Err(errors::wrap(e, "TLS handshake"))
+    }
+}
+
+fn sslmode_name(mode: &config::SslMode) -> String {
+    match mode {
+        config::SslMode::Disable => "disable"
+        config::SslMode::Prefer => "prefer"
+        config::SslMode::Require => "require"
+        config::SslMode::VerifyCa => "verify-ca"
+        config::SslMode::VerifyFull => "verify-full"
+    }
+}
+
+// Sends the startup message: the protocol version, then the session
+// parameters as NUL-terminated name/value pairs, ended by an empty name.
+fn send_startup(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
+    let mut body: Vec<u8> = #[]
+    buf::put_i32(&mut body, proto::PROTOCOL_VERSION)
+    buf::put_cstr(&mut body, &"user")
+    buf::put_cstr(&mut body, &cfg.user)
+    buf::put_cstr(&mut body, &"database")
+    buf::put_cstr(&mut body, &cfg.dbname)
+    // UTF-8 throughout, so every text value decodes the same way.
+    buf::put_cstr(&mut body, &"client_encoding")
+    buf::put_cstr(&mut body, &"UTF8")
+    buf::put_cstr(&mut body, &"application_name")
+    buf::put_cstr(&mut body, &cfg.app_name())
+    if let Some(options) = cfg.options {
+        buf::put_cstr(&mut body, &"options")
+        buf::put_cstr(&mut body, &options)
+    }
+    for (name, setting) in cfg.runtime_params.iter() {
+        buf::put_cstr(&mut body, &name)
+        buf::put_cstr(&mut body, &setting)
+    }
+    buf::put_u8(&mut body, 0)
+    let message = proto::untagged(&body)
+    conn.send(&message)
+}
+
+// Runs the authentication exchange the server asks for, then reads to the
+// first ReadyForQuery.
+fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
+    let mut scram: Option<sasl::Scram> = None
+    // The signature the client-final step derived, checked against the
+    // server's final message.
+    let mut server_signature: Vec<u8> = #[]
+    loop {
+        let (tag, body) = conn.recv()?
+        if tag == proto::B_ERROR_RESPONSE {
+            return Err(dberror::parse(&body).as_error())
+        }
+        if tag == proto::B_NEGOTIATE_PROTOCOL_VERSION {
+            // The server speaks an older minor version and lists the
+            // options it did not recognize; the 3.0 surface this driver
+            // uses is unaffected.
+            continue
+        }
+        if tag != proto::B_AUTHENTICATION {
+            return Err(errors::newf(
+                "expected an authentication message, got `{}`"
+                tag as char
+            ))
+        }
+        let kind = buf::i32_at(&body, 0)
+        match kind {
+            proto::AUTH_OK => break
+            proto::AUTH_CLEARTEXT_PASSWORD => {
+                let password = require_password(cfg)?
+                send_password_message(conn, &password.as_bytes())?
+            }
+            proto::AUTH_MD5_PASSWORD => {
+                let password = require_password(cfg)?
+                let salt = buf::slice(&body, 4, 8)
+                let token = sasl::md5_response(&password, &cfg.user, &salt)
+                send_password_message(conn, &token.as_bytes())?
+            }
+            proto::AUTH_SASL => {
+                // The password is only needed at the continue step; asking
+                // for it now reports its absence before the extra round trip.
+                let _ = require_password(cfg)?
+                let mechanisms = parse_sasl_mechanisms(&body)
+                let chosen = sasl::choose_mechanism(
+                    &mechanisms
+                    cfg.channel_binding == config::CHANNEL_BINDING_REQUIRE
+                )?
+                let exchange = sasl::Scram::start()?
+                let first = exchange.client_first()
+                let mut payload: Vec<u8> = #[]
+                buf::put_cstr(&mut payload, &chosen)
+                buf::put_i32(&mut payload, first.byte_len())
+                buf::put_str(&mut payload, &first)
+                let message = proto::frame(proto::F_PASSWORD, &payload)
+                conn.send(&message)?
+                scram = Some(exchange)
+            }
+            proto::AUTH_SASL_CONTINUE => {
+                let password = require_password(cfg)?
+                let server_first = buf::utf8_lossy(&buf::slice(&body, 4, body.len()))
+                match scram {
+                    Some(exchange) => {
+                        let step = exchange.client_final(&password, &server_first)?
+                        send_sasl_response(conn, &step.message)?
+                        server_signature = step.server_signature
+                        scram = Some(exchange)
+                    }
+                    None => return Err(errors::new("server sent a SASL continue before the challenge"))
+                }
+            }
+            proto::AUTH_SASL_FINAL => {
+                let server_final = buf::utf8_lossy(&buf::slice(&body, 4, body.len()))
+                // The signature is only set once the client-final step ran, so
+                // its absence means the server skipped the challenge.
+                if server_signature.len() == 0 {
+                    return Err(errors::new("server sent a SASL final before the challenge"))
+                }
+                sasl::verify_server(&server_signature, &server_final)?
+            }
+            proto::AUTH_KERBEROS_V5 | proto::AUTH_GSS | proto::AUTH_GSS_CONTINUE
+            | proto::AUTH_SSPI => {
+                return Err(errors::newf(
+                    "the server asked for GSSAPI/SSPI authentication ({}), which this driver does not implement; configure md5, scram-sha-256, trust, or peer"
+                    kind
+                ))
+            }
+            proto::AUTH_SCM_CREDENTIAL => {
+                return Err(errors::new(
+                    "the server asked for SCM credential authentication, which is not supported by protocol 3.0 clients"
+                ))
+            }
+            _ => return Err(errors::newf("unknown authentication request type {}", kind))
+        }
+    }
+    // Read to the ready point, keeping the backend key on the way.
+    loop {
+        let (tag, body) = conn.recv()?
+        match tag {
+            proto::B_BACKEND_KEY_DATA => {
+                conn.backend_pid = buf::i32_at(&body, 0)
+                conn.backend_secret = buf::i32_at(&body, 4)
+            }
+            proto::B_READY_FOR_QUERY => {
+                conn.tx_status = buf::u8_at(&body, 0)
+                return Ok(())
+            }
+            proto::B_ERROR_RESPONSE => return Err(dberror::parse(&body).as_error())
+            _ => ()
+        }
+    }
+}
+
+// Applies the settings that need a query, and checks the session is the
+// kind of server the caller asked for.
+fn finish_session(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
+    if cfg.statement_timeout_ms > 0 {
+        let sql = format!("SET statement_timeout = {}", cfg.statement_timeout_ms)
+        let _ = conn.simple_query(&sql)?
+    }
+    check_session_attrs(conn, &cfg.target_session_attrs)
+}
+
+// Rejects a server that does not match `target_session_attrs`.
+//
+// `transaction_read_only` is the setting that decides: a standby, and a
+// primary with `default_transaction_read_only`, both report `on`.
+fn check_session_attrs(
+    conn: &mut PgConn
+    want: &config::TargetSessionAttrs
+) -> Result<(), errors::Error> {
+    // Any server is acceptable, so neither question needs to be asked.
+    if matches!(want, config::TargetSessionAttrs::Any) {
+        return Ok(())
+    }
+    let read_only = read_session_read_only(conn)?
+    let in_recovery = read_in_recovery(conn)?
+    let acceptable = match want {
+        // `prefer-standby` accepts any server: preferring one is about the
+        // order hosts are tried, not about rejecting the one that answered.
+        config::TargetSessionAttrs::Any | config::TargetSessionAttrs::PreferStandby => true
+        config::TargetSessionAttrs::ReadWrite => !read_only
+        config::TargetSessionAttrs::ReadOnly => read_only
+        config::TargetSessionAttrs::Standby => in_recovery
+        config::TargetSessionAttrs::Primary => !in_recovery
+    }
+    if acceptable {
+        return Ok(())
+    }
+    Err(errors::newf(
+        "server at {} does not satisfy target_session_attrs={} (read only: {}, in recovery: {})"
+        conn.host.tcp_addr()
+        session_attrs_name(want)
+        read_only
+        in_recovery
+    ))
+}
+
+fn session_attrs_name(want: &config::TargetSessionAttrs) -> String {
+    match want {
+        config::TargetSessionAttrs::Any => "any"
+        config::TargetSessionAttrs::ReadWrite => "read-write"
+        config::TargetSessionAttrs::ReadOnly => "read-only"
+        config::TargetSessionAttrs::Standby => "standby"
+        config::TargetSessionAttrs::PreferStandby => "prefer-standby"
+        config::TargetSessionAttrs::Primary => "primary"
+    }
+}
+
+fn read_session_read_only(conn: &mut PgConn) -> Result<bool, errors::Error> {
+    let results = conn.simple_query(&"SHOW transaction_read_only")?
+    Ok(first_cell(&results) == "on")
+}
+
+fn read_in_recovery(conn: &mut PgConn) -> Result<bool, errors::Error> {
+    let results = conn.simple_query(&"SELECT pg_catalog.pg_is_in_recovery()")?
+    let cell = first_cell(&results)
+    Ok(cell == "t" || cell == "true" || cell == "on")
+}
+
+// The first column of the first row of the first result set, as text.
+fn first_cell(results: &Vec<SimpleResult>) -> String {
+    let Some(result) = results.first() else { return "" }
+    let Some(row) = result.rows.first() else { return "" }
+    let Some(cell) = row.first() else { return "" }
+    cell.as_text().unwrap_or("")
+}
+
+// The mechanism names an AuthenticationSASL message lists.
+fn parse_sasl_mechanisms(body: &Vec<u8>) -> Vec<String> {
+    let mut out: Vec<String> = #[]
+    let mut offset = 4
+    while offset < body.len() {
+        let (name, next) = buf::cstr_at(body, offset)
+        if name == "" {
+            break
+        }
+        out.push(name)
+        offset = next
+    }
+    out
+}
+
+fn require_password(cfg: &config::Config) -> Result<String, errors::Error> {
+    match cfg.password {
+        Some(password) => Ok(password)
+        None => Err(errors::newf(
+            "server asked user `{}` for a password but none was supplied; set `password=` or PGPASSWORD"
+            cfg.user
+        ))
+    }
+}
+
+// A PasswordMessage carrying a cleartext password or an md5 token, which
+// the protocol sends as a NUL-terminated string.
+fn send_password_message(conn: &mut PgConn, payload: &Vec<u8>) -> Result<(), errors::Error> {
+    let mut body: Vec<u8> = #[]
+    buf::put_bytes(&mut body, payload)
+    buf::put_u8(&mut body, 0)
+    let message = proto::frame(proto::F_PASSWORD, &body)
+    conn.send(&message)
+}
+
+// A SASLResponse: the mechanism's own bytes and nothing else. The message
+// length delimits it, so a NUL terminator would be one byte of payload the
+// mechanism never wrote.
+fn send_sasl_response(conn: &mut PgConn, response: &String) -> Result<(), errors::Error> {
+    let mut body: Vec<u8> = #[]
+    buf::put_str(&mut body, response)
+    let message = proto::frame(proto::F_PASSWORD, &body)
+    conn.send(&message)
+}
+
+#[cfg(test)]
+mod conn_tests {
+    use std::testing
+
+    fn column(name: String, type_oid: i64) -> super::Column {
+        super::Column {
+            name: name
+            table_oid: 0
+            column_id: 0
+            type_oid: type_oid
+            type_modifier: -1
+            type_size: -1
+            format: value::FORMAT_TEXT
+        }
+    }
+
+    #[test]
+    fn row_description_parses_every_field() {
+        let mut body: Vec<u8> = #[]
+        buf::put_i16(&mut body, 2)
+        buf::put_cstr(&mut body, &"id")
+        buf::put_i32(&mut body, 16_384)
+        buf::put_i16(&mut body, 1)
+        buf::put_i32(&mut body, oid::INT4)
+        buf::put_i16(&mut body, 4)
+        buf::put_i32(&mut body, -1)
+        buf::put_i16(&mut body, 0)
+        buf::put_cstr(&mut body, &"label")
+        buf::put_i32(&mut body, 16_384)
+        buf::put_i16(&mut body, 2)
+        buf::put_i32(&mut body, oid::TEXT)
+        buf::put_i16(&mut body, -1)
+        buf::put_i32(&mut body, -1)
+        buf::put_i16(&mut body, 0)
+
+        let columns = super::parse_row_description(&body)
+        let _ = testing::check_eq(&columns.len(), &2, "two columns")
+        let _ = testing::check_eq(&columns[0].name, &"id", "first name")
+        let _ = testing::check_eq(&columns[0].type_oid, &oid::INT4, "first type")
+        let _ = testing::check_eq(&columns[0].table_oid, &16_384, "table oid")
+        let _ = testing::check_eq(&columns[0].column_id, &1, "attribute number")
+        let _ = testing::check_eq(&columns[1].name, &"label", "second name")
+        let _ = testing::check_eq(&columns[1].type_size, &-1, "variable length")
+    }
+
+    #[test]
+    fn data_row_decodes_values_and_nulls_under_their_columns() {
+        let columns = #[column("id", oid::INT4), column("label", oid::TEXT)]
+        let mut body: Vec<u8> = #[]
+        buf::put_i16(&mut body, 2)
+        buf::put_i32(&mut body, 2)
+        buf::put_str(&mut body, &"42")
+        buf::put_i32(&mut body, -1)
+
+        let values = super::decode_data_row(&body, &columns)
+        let _ = testing::check_eq(&values.len(), &2, "two values")
+        let _ = testing::check_eq(&values[0].as_int().unwrap_or(0), &42, "int column")
+        let _ = testing::check(values[1].is_null(), "null column")
+    }
+
+    #[test]
+    fn a_row_reads_columns_by_name_and_reports_an_unknown_one() {
+        let row = super::Row {
+            columns: #[column("id", oid::INT4)]
+            values: #[value::Value::Int(7)]
+        }
+        let _ = testing::check_eq(&row.width(), &1, "one column")
+        let _ = testing::check_eq(&row.index_of("id"), &0, "index of id")
+        let _ = testing::check_eq(&row.index_of("missing"), &-1, "index of a missing column")
+        match row.get("id") {
+            Ok(v) => { let _ = testing::check_eq(&v.as_int().unwrap_or(0), &7, "value by name") }
+            Err(e) => { let _ = testing::check(false, &format!("get: {}", e)) }
+        }
+        let _ = testing::check(row.get("missing").is_err(), "unknown column reported")
+        let _ = testing::check(row.at(5).is_null(), "past the end is NULL")
+    }
+
+    #[test]
+    fn sasl_mechanism_list_parses_to_its_names() {
+        let mut body: Vec<u8> = #[]
+        buf::put_i32(&mut body, proto::AUTH_SASL)
+        buf::put_cstr(&mut body, &"SCRAM-SHA-256-PLUS")
+        buf::put_cstr(&mut body, &"SCRAM-SHA-256")
+        buf::put_u8(&mut body, 0)
+        let names = super::parse_sasl_mechanisms(&body)
+        let _ = testing::check_eq(&names.len(), &2, "two mechanisms")
+        let _ = testing::check_eq(&names[1], &"SCRAM-SHA-256", "second mechanism")
+    }
+
+    #[test]
+    fn notification_parses_pid_channel_and_payload() {
+        let mut body: Vec<u8> = #[]
+        buf::put_i32(&mut body, 4_242)
+        buf::put_cstr(&mut body, &"events")
+        buf::put_cstr(&mut body, &"row 7 changed")
+        let n = super::parse_notification(&body)
+        let _ = testing::check_eq(&n.pid, &4_242, "pid")
+        let _ = testing::check_eq(&n.channel, &"events", "channel")
+        let _ = testing::check_eq(&n.payload, &"row 7 changed", "payload")
+    }
+}

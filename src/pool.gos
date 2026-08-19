@@ -1,0 +1,196 @@
+// A connection pool.
+//
+// The pool owns its connections and lends them out: `acquire` hands one over
+// and `release` takes it back, so a program pays the handshake once per
+// connection rather than once per unit of work, and never holds more open
+// than its cap.
+//
+// A pool belongs to one goroutine. That is not a simplification: a
+// connection is an aggregate with nested growable storage, and the compiled
+// concurrency ABI cannot move one between goroutines (`GT0055`), so no pool
+// can hand a connection to a different goroutine than the one that opened
+// it. For concurrent work, give each goroutine its own pool - or its own
+// connection - and cap the total with a channel of tokens, which is the
+// shape the runtime does support:
+//
+//     let (tokens, permits) = Channel::new(8)
+//     cohort {
+//         for shard in shards {
+//             spawn(|| {
+//                 let _ = permits.recv()
+//                 let mut db = pgsql::connect(&url)?
+//                 defer db.close()
+//                 defer tokens.send(1)
+//                 work(&mut db, shard)
+//             })
+//         }
+//     }
+
+use std::errors
+
+use crate::{client, config}
+
+// A set of connections to one database, reused across units of work.
+pub struct Pool {
+    pub (package) cfg: config::Config
+    // Connections opened and not currently lent out.
+    pub (package) idle: Vec<client::Client>
+    // How many connections exist, lent out or idle.
+    pub (package) live: i64
+    pub (package) max_size: i64
+    // Whether a connection is checked with a round trip before being lent,
+    // so a server restart surfaces as a reconnect rather than a failed query.
+    pub (package) test_on_acquire: bool
+}
+
+// Opens a pool of at most `max_size` connections, with none opened yet.
+pub fn open(url: &String, max_size: i64) -> Result<Pool, errors::Error> {
+    let cfg = config::parse(url)?
+    open_with(&cfg, max_size)
+}
+
+// Opens a pool from already-parsed parameters.
+pub fn open_with(cfg: &config::Config, max_size: i64) -> Result<Pool, errors::Error> {
+    if max_size < 1 {
+        return Err(errors::newf("pool size must be at least 1, got {}", max_size))
+    }
+    Ok(Pool {
+        cfg: cfg.clone()
+        idle: #[]
+        live: 0
+        max_size: max_size
+        test_on_acquire: false
+    })
+}
+
+impl Pool {
+    // The pool's cap.
+    pub fn size(&self) -> i64 {
+        self.max_size
+    }
+
+    // How many connections are open, lent out or idle.
+    pub fn live_count(&self) -> i64 {
+        self.live
+    }
+
+    // How many are idle and ready to lend.
+    pub fn idle_count(&self) -> i64 {
+        self.idle.len()
+    }
+
+    // Turns on a round-trip check before a connection is lent. Costs one
+    // query per checkout, and turns a server restart into a reconnect
+    // instead of a failed query on the caller's first statement.
+    pub fn set_test_on_acquire(&mut self, enabled: bool) {
+        self.test_on_acquire = enabled
+    }
+
+    // Opens connections until `count` are idle, so the first callers do not
+    // pay for the handshake.
+    pub fn warm(&mut self, count: i64) -> Result<(), errors::Error> {
+        let target = min(count, self.max_size)
+        while self.idle.len() < target && self.live < self.max_size {
+            let opened = client::connect_with(&self.cfg)?
+            self.live += 1
+            self.idle.push(opened)
+        }
+        Ok(())
+    }
+
+    // Lends a connection, reusing an idle one or opening a new one.
+    //
+    // Reports rather than blocks when every connection is lent out: a
+    // single-goroutine pool has nobody to wait for, so blocking would
+    // deadlock. Raise the cap or release a connection first.
+    pub fn acquire(&mut self) -> Result<client::Client, errors::Error> {
+        while let Some(mut pooled) = self.idle.pop() {
+            if pooled.is_closed() {
+                self.live -= 1
+                continue
+            }
+            if !self.test_on_acquire {
+                return Ok(pooled)
+            }
+            match pooled.ping() {
+                Ok(_) => return Ok(pooled)
+                Err(_) => {
+                    pooled.close()
+                    self.live -= 1
+                }
+            }
+        }
+        if self.live >= self.max_size {
+            return Err(errors::newf(
+                "every one of the pool's {} connection(s) is checked out; release one first"
+                self.max_size
+            ))
+        }
+        let opened = client::connect_with(&self.cfg)?
+        self.live += 1
+        Ok(opened)
+    }
+
+    // Takes a connection back.
+    //
+    // A closed connection is dropped rather than kept, and one left inside a
+    // transaction is rolled back first, so the next caller starts from a
+    // clean session rather than inheriting this one's.
+    pub fn release(&mut self, mut pooled: client::Client) {
+        if pooled.is_closed() {
+            self.live -= 1
+            return
+        }
+        if pooled.in_transaction() {
+            match pooled.batch_execute(&"ROLLBACK") {
+                Ok(_) => ()
+                Err(_) => {
+                    pooled.close()
+                    self.live -= 1
+                    return
+                }
+            }
+        }
+        self.idle.push(pooled)
+    }
+
+    // Closes every idle connection, leaving any that are lent out alone.
+    pub fn close_idle(&mut self) {
+        while let Some(mut pooled) = self.idle.pop() {
+            pooled.close()
+            self.live -= 1
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use std::testing
+
+    #[test]
+    fn a_pool_needs_at_least_one_connection() {
+        match super::open(&"user=nobody", 0) {
+            Ok(_) => { let _ = testing::check(false, "size 0 must be rejected") }
+            Err(e) => {
+                let _ = testing::check(
+                    format!("{}", e).contains("at least 1")
+                    &format!("reported: {}", e)
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_pool_holds_no_connections() {
+        match super::open(&"user=nobody dbname=nothing", 4) {
+            Ok(mut p) => {
+                let _ = testing::check_eq(&p.size(), &4, "cap")
+                let _ = testing::check_eq(&p.live_count(), &0, "nothing open yet")
+                let _ = testing::check_eq(&p.idle_count(), &0, "nothing idle yet")
+                p.set_test_on_acquire(true)
+                let _ = testing::check(p.test_on_acquire, "test on acquire")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("open: {}", e)) }
+        }
+    }
+}
