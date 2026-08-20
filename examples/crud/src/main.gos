@@ -2,7 +2,7 @@
 // back with typed accessors, and finish inside a transaction.
 
 use std::{env, errors}
-use "github.com/danpozmanter/pgsql-gos" as pgsql
+use pgsql_gos as pgsql
 
 fn main() -> Result<(), errors::Error> {
     let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
