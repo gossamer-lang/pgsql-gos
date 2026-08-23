@@ -1,0 +1,158 @@
+// Concurrent work against one database, two ways.
+//
+// A connection is a request/response stream that cannot cross a goroutine
+// boundary, so concurrency comes from more connections rather than from
+// sharing one. This shows both shapes the driver offers:
+//
+//   - a `Limiter`, for work spread across goroutines: each opens and owns
+//     its own connection, and what crosses the boundary is a permit;
+//   - a `Pool`, for one goroutine that wants to stop paying the handshake.
+//
+//     GOS_PGSQL_URL='host=/var/run/postgresql dbname=gos_pgsql_test' gos run .
+
+use std::sync::channel_unbounded
+use std::{env, errors, time}
+use pgsql_gos as pgsql
+
+const SHARDS: i64 = 12
+const MAX_CONNECTIONS: i64 = 4
+
+// Every connection this program opens names itself, so it can count its own
+// sessions on the server and see the limiter holding the line.
+const APP_NAME: String = "pgsql-gos-concurrent"
+
+fn main() -> Result<(), errors::Error> {
+    let base = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
+    let url = format!("{} application_name={}", base, APP_NAME)
+
+    setup(&url)?
+    let across = across_goroutines(&url)?
+    let within = within_one_goroutine(&url)?
+
+    println!("both routes agree: {}", across == within)
+    teardown(&url)?
+    Ok(())
+}
+
+// --- a limiter, for work spread across goroutines ------------------
+
+// Each goroutine opens its own connection under a permit, so at most
+// `MAX_CONNECTIONS` exist at any moment however many shards there are.
+fn across_goroutines(url: &String) -> Result<i64, errors::Error> {
+    println!("== {} shards across goroutines, at most {} connections", SHARDS, MAX_CONNECTIONS)
+    let limiter = pgsql::limit_open(url, MAX_CONNECTIONS)?
+    let (totals, collected) = channel_unbounded()
+    let (peaks, observed) = channel_unbounded()
+
+    let started = time::now_ms()
+    cohort {
+        for shard in 0..SHARDS {
+            spawn(|| {
+                match shard_total(&limiter, shard) {
+                    Ok((sum, live)) => {
+                        totals.send(sum)
+                        peaks.send(live)
+                    }
+                    Err(e) => {
+                        eprintln!("shard {} failed: {}", shard, e)
+                        totals.send(0)
+                        peaks.send(0)
+                    }
+                }
+            })
+        }
+    }?
+    totals.close()
+    peaks.close()
+
+    let mut total = 0
+    while let Some(sum) = collected.recv() {
+        total += sum
+    }
+    let mut peak = 0
+    while let Some(live) = observed.recv() {
+        peak = max(peak, live)
+    }
+    println!("  total={} in {} ms", total, time::now_ms() - started)
+    println!("  most connections this program held at once: {}", peak)
+    if peak > MAX_CONNECTIONS {
+        return Err(errors::newf("the limiter allowed {} connections, cap is {}", peak, MAX_CONNECTIONS))
+    }
+    Ok(total)
+}
+
+// One shard's work: take a permit, open a connection, use it, give both back.
+//
+// The count of this program's own sessions is read while the connection is
+// held, so it observes the limiter actually holding the line.
+fn shard_total(limiter: &pgsql::pool::Limiter, shard: i64) -> Result<(i64, i64), errors::Error> {
+    let mut db = limiter.acquire()?
+    let outcome = shard_work(&mut db, shard)
+    limiter.release(db)
+    outcome
+}
+
+fn shard_work(db: &mut pgsql::client::Client, shard: i64) -> Result<(i64, i64), errors::Error> {
+    let sum = db.query_value(
+        &"SELECT coalesce(sum(amount), 0)::int8 FROM ledger WHERE shard = $1"
+        &#[pgsql::int(shard)]
+    )?
+    let live = db.query_value(
+        &"SELECT count(*) FROM pg_stat_activity WHERE application_name = $1"
+        &#[pgsql::text(APP_NAME)]
+    )?
+    Ok((sum.as_int().unwrap_or(0), live.as_int().unwrap_or(0)))
+}
+
+// --- a pool, for one goroutine -------------------------------------
+
+// The same work in one goroutine, reusing connections rather than opening
+// one per unit of work.
+fn within_one_goroutine(url: &String) -> Result<i64, errors::Error> {
+    println!("== the same {} shards in one goroutine, from a pool", SHARDS)
+    let mut pool = pgsql::pool_open(url, 2)?
+    // A borrower that leaves the session alone still pays for the reset, so
+    // a pool whose work is all read-only can skip it.
+    pool.set_test_on_acquire(true)
+    pool.set_max_lifetime(5 * 60_000)
+    pool.warm(2)?
+
+    let started = time::now_ms()
+    let mut total = 0
+    for shard in 0..SHARDS {
+        let mut db = pool.acquire()?
+        let outcome = shard_work(&mut db, shard)
+        pool.release(db)
+        let (sum, _) = outcome?
+        total += sum
+    }
+    println!("  total={} in {} ms", total, time::now_ms() - started)
+    println!("  the pool opened {} connection(s) for {} units of work", pool.live_count(), SHARDS)
+    pool.close_idle()
+    Ok(total)
+}
+
+// --- fixture --------------------------------------------------------
+
+fn setup(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS ledger")?
+    db.batch_execute(&"CREATE TABLE ledger (shard int4 NOT NULL, amount int8 NOT NULL)")?
+    let mut copy = db.copy_in_begin(&"COPY ledger (shard, amount) FROM STDIN")?
+    for shard in 0..SHARDS {
+        let mut batch: Vec<Vec<pgsql::value::Value>> = #[]
+        for n in 0..100 {
+            batch.push(#[pgsql::int(shard), pgsql::int(n)])
+        }
+        db.copy_in_write_rows(&mut copy, &batch)?
+    }
+    println!("loaded {} ledger rows", db.copy_in_end(&mut copy)?)
+    Ok(())
+}
+
+fn teardown(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS ledger")
+}

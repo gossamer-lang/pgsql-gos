@@ -1,8 +1,19 @@
 // A walk through the driver: connect, create, insert with parameters, read
-// back with typed accessors, and finish inside a transaction.
+// back with typed accessors, stream a bulk load, map a row onto a struct,
+// and finish inside a transaction.
 
+use std::encoding::json
 use std::{env, errors}
 use pgsql_gos as pgsql
+
+// A row reaches a struct through the JSON the driver renders it as: the
+// decode has to live here, in the program that names the type, because
+// reflection does not cross a module boundary.
+struct Person {
+    id: i64
+    name: String
+    score: String
+}
 
 fn main() -> Result<(), errors::Error> {
     let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
@@ -45,6 +56,32 @@ fn main() -> Result<(), errors::Error> {
             tags
         )
     }
+
+    // A timestamptz reads at the resolution the server keeps it.
+    let row = db.query_one(
+        &"SELECT id, name, score, joined FROM people ORDER BY id LIMIT 1"
+        &#[]
+    )?
+    let joined = row.timestamp_of("joined")?
+    println!("first row joined at {} ({} microseconds past the epoch)", joined, joined.to_unix_micros())
+
+    // And the whole row maps onto a struct of this program's own.
+    match json::decode::<Person>(&pgsql::row_json(&row)) {
+        Ok(person) => println!("mapped: #{} {} scored {}", person.id, person.name, person.score)
+        Err(e) => println!("mapping failed: {}", e)
+    }
+
+    // A bulk load streams a batch at a time, so nothing holds the payload.
+    let mut copy = db.copy_in_begin(&"COPY people (name, score) FROM STDIN")?
+    for batch_start in (0..1_000).step_by(250) {
+        let mut batch: Vec<Vec<pgsql::value::Value>> = #[]
+        for offset in 0..250 {
+            let n = batch_start + offset
+            batch.push(#[pgsql::text(format!("person{}", n)), pgsql::numeric(format!("{}.00", n))])
+        }
+        db.copy_in_write_rows(&mut copy, &batch)?
+    }
+    println!("copied {} row(s) in", db.copy_in_end(&mut copy)?)
 
     // A transaction that rolls back leaves nothing behind.
     let mut tx = db.transaction()?

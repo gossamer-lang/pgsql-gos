@@ -8,9 +8,9 @@
 // LISTEN payload. Everything else is returned to the exchange that asked
 // for it.
 
-use std::{errors, net, time}
+use std::{crypto::sha256, errors, fs, net, sync::channel_unbounded, time}
 
-use crate::{buf, client, config, dberror, oid, proto, sasl, value}
+use crate::{buf, config, dberror, oid, proto, sasl, temporal, value}
 
 // A socket, whichever family it was opened on. TLS upgrade replaces a TCP
 // socket in place; a Unix socket is already local and is never upgraded.
@@ -86,6 +86,13 @@ pub struct PgConn {
     pub (package) host: config::HostAddr
     // Whether the session is running over TLS.
     pub (package) tls: bool
+    // Deadline on a single socket read once the session is up, in
+    // milliseconds; 0 for none. Held here so a call that narrows the
+    // deadline for its own wait puts this one back afterwards.
+    pub (package) socket_timeout_ms: i64
+    // When the socket was opened, as `time::now_ms` reads it, so a pool can
+    // retire a connection that has been alive long enough.
+    pub (package) opened_at_ms: i64
 }
 
 // --- socket plumbing ----------------------------------------------
@@ -153,6 +160,17 @@ impl PgConn {
             }
             Err(e) => {
                 self.closed = true
+                if self.socket_timeout_ms > 0 {
+                    // A deadline the caller set is the likeliest reason a
+                    // read stopped, and naming it says what to change.
+                    return Err(errors::wrap(
+                        e
+                        format!(
+                            "reading from server (socket_timeout is {} ms)"
+                            self.socket_timeout_ms
+                        )
+                    ))
+                }
                 Err(errors::wrap(e, "reading from server"))
             }
         }
@@ -202,6 +220,26 @@ impl PgConn {
                 proto::B_NOTIFICATION_RESPONSE => self.pending.push(parse_notification(&body))
                 _ => return Ok((tag, body))
             }
+        }
+    }
+
+    // Puts the session's own read and write deadline on the socket, or
+    // takes any deadline off when the session has none.
+    pub (package) fn apply_socket_timeout(&mut self) {
+        match self.sock {
+            Socket::Tcp(stream) => {
+                if self.socket_timeout_ms > 0 {
+                    stream.set_read_timeout_ms(self.socket_timeout_ms)
+                    stream.set_write_timeout_ms(self.socket_timeout_ms)
+                } else {
+                    stream.clear_read_timeout()
+                    stream.clear_write_timeout()
+                }
+            }
+            // A Unix socket carries no deadline setters, and a local peer
+            // that stops answering closes the socket rather than going
+            // silent, which surfaces as a read of zero bytes.
+            Socket::Unix(_) => ()
         }
     }
 
@@ -261,6 +299,11 @@ impl PgConn {
     // The host this connection reached.
     pub fn host_addr(&self) -> config::HostAddr {
         self.host
+    }
+
+    // How long the connection has been open, in milliseconds.
+    pub fn age_ms(&self) -> i64 {
+        max(time::now_ms() - self.opened_at_ms, 0)
     }
 
     // Notices the server reported since the last call, and clears them.
@@ -621,9 +664,11 @@ impl PgConn {
         // Result columns come from the Describe done at prepare time; a
         // binary-format request re-labels them so decoding matches the wire.
         let columns = relabel_formats(&statement.columns, result_format)
+        let index = column_index(&columns)
         Ok(RowStream {
             portal: portal
             columns: columns
+            index: index
             done: false
             rows_affected: 0
             tag: ""
@@ -645,6 +690,7 @@ impl PgConn {
                     return Ok(Some(Row {
                         columns: stream.columns.clone()
                         values: decode_data_row(&msg, &stream.columns)
+                        index: stream.index
                     }))
                 }
                 proto::B_COMMAND_COMPLETE => {
@@ -678,7 +724,10 @@ impl PgConn {
                     return Err(failure.as_error())
                 }
                 // BindComplete and RowDescription may precede the rows.
-                proto::B_ROW_DESCRIPTION => { stream.columns = parse_row_description(&msg) }
+                proto::B_ROW_DESCRIPTION => {
+                    stream.columns = parse_row_description(&msg)
+                    stream.index = column_index(&stream.columns)
+                }
                 _ => ()
             }
         }
@@ -718,7 +767,8 @@ impl PgConn {
         self.send(&out)?
         self.drain_to_ready()?
         let columns = relabel_formats(&statement.columns, result_format)
-        Ok(Portal { name: name, columns: columns, exhausted: false })
+        let index = column_index(&columns)
+        Ok(Portal { name: name, columns: columns, index: index, exhausted: false })
     }
 
     // Fetches up to `batch_size` more rows from a portal. An answer shorter
@@ -745,6 +795,7 @@ impl PgConn {
                 proto::B_DATA_ROW => rows.push(Row {
                     columns: portal.columns.clone()
                     values: decode_data_row(&msg, &portal.columns)
+                    index: portal.index
                 })
                 proto::B_COMMAND_COMPLETE | proto::B_EMPTY_QUERY_RESPONSE => {
                     portal.exhausted = true
@@ -821,10 +872,14 @@ impl PgConn {
 
     // --- COPY -----------------------------------------------------
 
-    // Streams `data` into the server with `COPY ... FROM STDIN`, reporting
-    // the rows the server accepted. The payload is whatever the COPY
-    // statement's format declares: text lines, CSV, or the binary format.
-    pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
+    // Starts a `COPY ... FROM STDIN`, answering the handle chunks are
+    // written to.
+    //
+    // The payload is whatever the COPY statement's format declares: text
+    // lines, CSV, or the binary format. A chunk needs no relation to a row
+    // boundary - the server reassembles the stream - so a bulk load never
+    // has to be held in memory at once.
+    pub fn copy_in_begin(&mut self, sql: &String) -> Result<CopyIn, errors::Error> {
         self.ensure_ready()?
         let mut query_body: Vec<u8> = #[]
         buf::put_cstr(&mut query_body, sql)
@@ -844,11 +899,41 @@ impl PgConn {
                 tag as char
             ))
         }
-        let mut out: Vec<u8> = #[]
-        out.extend(proto::frame(proto::F_COPY_DATA, data))
-        out.extend(proto::frame(proto::F_COPY_DONE, &#[]))
-        self.send(&out)?
+        Ok(CopyIn { done: false, sent: 0 })
+    }
+
+    // Writes one chunk of a COPY FROM STDIN.
+    pub fn copy_in_write(
+        &mut self
+        copy: &mut CopyIn
+        data: &Vec<u8>
+    ) -> Result<(), errors::Error> {
+        if copy.done {
+            return Err(errors::new("this COPY FROM STDIN has already finished"))
+        }
+        if data.is_empty() {
+            return Ok(())
+        }
+        copy.sent += data.len()
+        self.send(&proto::frame(proto::F_COPY_DATA, data))
+    }
+
+    // Ends a COPY FROM STDIN, reporting the rows the server accepted.
+    pub fn copy_in_end(&mut self, copy: &mut CopyIn) -> Result<i64, errors::Error> {
+        if copy.done {
+            return Err(errors::new("this COPY FROM STDIN has already finished"))
+        }
+        copy.done = true
+        self.send(&proto::frame(proto::F_COPY_DONE, &#[]))?
         Ok(self.collect_counts()?.last().unwrap_or(0))
+    }
+
+    // Streams `data` into the server with `COPY ... FROM STDIN` in one
+    // call, reporting the rows the server accepted.
+    pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
+        let mut copy = self.copy_in_begin(sql)?
+        self.copy_in_write(&mut copy, data)?
+        self.copy_in_end(&mut copy)
     }
 
     // Abandons an in-progress COPY FROM STDIN with a reason the server
@@ -865,38 +950,132 @@ impl PgConn {
         Ok(())
     }
 
-    // Reads a `COPY ... TO STDOUT` in full.
-    pub fn copy_out(&mut self, sql: &String) -> Result<Vec<u8>, errors::Error> {
+    // Abandons an in-progress COPY FROM STDIN held as a handle.
+    pub fn copy_in_abort(
+        &mut self
+        copy: &mut CopyIn
+        reason: &String
+    ) -> Result<(), errors::Error> {
+        if copy.done {
+            return Ok(())
+        }
+        copy.done = true
+        self.copy_fail(reason)
+    }
+
+    // Starts a `COPY ... TO STDOUT`, answering the handle chunks are pulled
+    // from.
+    pub fn copy_out_begin(&mut self, sql: &String) -> Result<CopyOut, errors::Error> {
         self.ensure_ready()?
         let mut query_body: Vec<u8> = #[]
         buf::put_cstr(&mut query_body, sql)
         let message = proto::frame(proto::F_QUERY, &query_body)
         self.send(&message)?
+        Ok(CopyOut { done: false, failure: None, received: 0, residue: #[], residue_pos: 0 })
+    }
 
-        let mut out: Vec<u8> = #[]
-        let mut failure: Option<dberror::DbError> = None
+    // The next chunk of a COPY TO STDOUT, or `None` at the end of it.
+    //
+    // A chunk is one CopyData message, which the server fills a row at a
+    // time, so a caller consuming chunks never holds the whole result.
+    // Reaching the end leaves the connection ready.
+    pub fn copy_out_next(&mut self, copy: &mut CopyOut) -> Result<Option<Vec<u8>>, errors::Error> {
+        if copy.done {
+            return match copy.failure {
+                Some(e) => Err(e.as_error())
+                None => Ok(None)
+            }
+        }
         loop {
             let (tag, msg) = self.recv()?
             match tag {
-                proto::B_COPY_DATA => out.extend(msg)
+                proto::B_COPY_DATA => {
+                    // The framed message leaves the loop as the caller's
+                    // own payload buffer.
+                    let payload = msg
+                    copy.received += payload.len()
+                    return Ok(Some(payload))
+                }
                 proto::B_ERROR_RESPONSE => {
-                    if failure.is_none() {
-                        failure = Some(dberror::parse(&msg))
+                    if copy.failure.is_none() {
+                        copy.failure = Some(dberror::parse(&msg))
                     }
                 }
                 proto::B_READY_FOR_QUERY => {
                     self.mark_ready(&msg)
-                    break
+                    copy.done = true
+                    return match copy.failure {
+                        Some(e) => Err(e.as_error())
+                        None => Ok(None)
+                    }
                 }
                 // CopyOutResponse, CopyDone, and CommandComplete frame the
                 // stream without carrying data.
                 _ => ()
             }
         }
-        match failure {
-            Some(e) => Err(e.as_error())
-            None => Ok(out)
+    }
+
+    // The next line of a COPY TO STDOUT, or `None` at the end of it.
+    //
+    // A chunk boundary need not fall on a line boundary, so the remainder
+    // of a partial line is held until the chunk carrying its end arrives.
+    // The trailing newline is not part of the line.
+    pub fn copy_out_line(&mut self, copy: &mut CopyOut) -> Result<Option<String>, errors::Error> {
+        loop {
+            let newline = index_of_byte(&copy.residue, copy.residue_pos, 10)
+            if newline >= 0 {
+                let line = buf::utf8_lossy(&buf::slice(&copy.residue, copy.residue_pos, newline))
+                copy.residue_pos = newline + 1
+                if copy.residue_pos >= copy.residue.len() {
+                    copy.residue = #[]
+                    copy.residue_pos = 0
+                }
+                return Ok(Some(line))
+            }
+            // What has been handed out is dropped before asking for more,
+            // so the buffer holds only the partial line.
+            if copy.residue_pos > 0 {
+                copy.residue = buf::slice(&copy.residue, copy.residue_pos, copy.residue.len())
+                copy.residue_pos = 0
+            }
+            match self.copy_out_next(copy)? {
+                Some(chunk) => copy.residue.extend(chunk)
+                None => {
+                    if copy.residue.is_empty() {
+                        return Ok(None)
+                    }
+                    // A final line the server did not terminate.
+                    let line = buf::utf8_lossy(&copy.residue)
+                    copy.residue = #[]
+                    copy.residue_pos = 0
+                    return Ok(Some(line))
+                }
+            }
         }
+    }
+
+    // Abandons a COPY TO STDOUT that is not read to the end, draining
+    // whatever the server was still sending. Idempotent.
+    pub fn copy_out_end(&mut self, copy: &mut CopyOut) -> Result<(), errors::Error> {
+        if copy.done {
+            return Ok(())
+        }
+        copy.done = true
+        if self.closed {
+            return Ok(())
+        }
+        self.drain_to_ready()
+    }
+
+    // Reads a `COPY ... TO STDOUT` in full.
+    pub fn copy_out(&mut self, sql: &String) -> Result<Vec<u8>, errors::Error> {
+        let mut copy = self.copy_out_begin(sql)?
+        let mut out: Vec<u8> = #[]
+        while let Some(chunk) = self.copy_out_next(&mut copy)? {
+            out.extend(chunk)
+        }
+        Ok(out)
     }
 
     // --- LISTEN / NOTIFY ------------------------------------------
@@ -938,10 +1117,7 @@ impl PgConn {
             Socket::Unix(_) => ()
         }
         let outcome = self.wait_for_notification(deadline)
-        match self.sock {
-            Socket::Tcp(stream) => stream.clear_read_timeout()
-            Socket::Unix(_) => ()
-        }
+        self.apply_socket_timeout()
         outcome
     }
 
@@ -1009,6 +1185,63 @@ impl PgConn {
     }
 }
 
+// An open `COPY ... FROM STDIN`, written a chunk at a time.
+pub struct CopyIn {
+    pub (package) done: bool
+    // Payload bytes handed to the server so far.
+    pub (package) sent: i64
+}
+
+impl CopyIn {
+    // True once the copy has been ended or abandoned.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    // Payload bytes written so far.
+    pub fn bytes_sent(&self) -> i64 {
+        self.sent
+    }
+}
+
+// An open `COPY ... TO STDOUT`, pulled a chunk at a time.
+pub struct CopyOut {
+    pub (package) done: bool
+    pub (package) failure: Option<dberror::DbError>
+    // Payload bytes read from the server so far.
+    pub (package) received: i64
+    // Payload read from the server and not yet handed out as a line, and
+    // how far into it the line walk has consumed. Compacted rather than
+    // re-sliced per line.
+    pub (package) residue: Vec<u8>
+    pub (package) residue_pos: i64
+}
+
+impl CopyOut {
+    // True once the copy has been read to the end or abandoned.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    // Payload bytes read so far.
+    pub fn bytes_received(&self) -> i64 {
+        self.received
+    }
+}
+
+// The offset of `wanted` in `data` at or after `start`, or -1.
+fn index_of_byte(data: &Vec<u8>, start: i64, wanted: i64) -> i64 {
+    let n = data.len()
+    let mut i = start
+    while i < n {
+        if data[i] as i64 == wanted {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
 // One result set from a simple query.
 pub struct SimpleResult {
     // The CommandComplete tag (`SELECT 3`, `INSERT 0 1`).
@@ -1022,6 +1255,8 @@ pub struct SimpleResult {
 pub struct RowStream {
     pub (package) portal: String
     pub columns: Vec<Column>
+    // Name index for `columns`, shared by every row the stream answers.
+    pub (package) index: Map<String, i64>
     pub (package) done: bool
     // Filled once the stream reaches its CommandComplete.
     pub rows_affected: i64
@@ -1039,6 +1274,8 @@ impl RowStream {
 pub struct Portal {
     pub (package) name: String
     pub columns: Vec<Column>
+    // Name index for `columns`, shared by every row the portal answers.
+    pub (package) index: Map<String, i64>
     pub (package) exhausted: bool
 }
 
@@ -1053,9 +1290,30 @@ impl Portal {
 pub struct Row {
     pub columns: Vec<Column>
     pub values: Vec<value::Value>
+    // Column name to position, built once for the result set the row came
+    // from, so reading by name costs one lookup rather than a scan.
+    pub (package) index: Map<String, i64>
+}
+
+// Column name to position for a result set. A duplicated name keeps its
+// first position, which is what the server's own `SELECT` semantics imply.
+pub fn column_index(columns: &Vec<Column>) -> Map<String, i64> {
+    let mut index: Map<String, i64> = Map::new()
+    for (position, column) in columns.iter().enumerate() {
+        if index.get(&column.name).is_none() {
+            let _ = index.insert(column.name.clone(), position)
+        }
+    }
+    index
 }
 
 impl Row {
+    // A row over `columns`, building the name index the accessors read.
+    pub fn new(columns: Vec<Column>, values: Vec<value::Value>) -> Row {
+        let index = column_index(&columns)
+        Row { columns: columns, values: values, index: index }
+    }
+
     // Number of columns.
     pub fn width(&self) -> i64 {
         self.values.len()
@@ -1073,7 +1331,7 @@ impl Row {
     // duplicated name resolves to its first occurrence, which is what the
     // server's own `SELECT` semantics imply.
     pub fn index_of(&self, name: String) -> i64 {
-        self.columns.iter().position(|column| column.name == name).unwrap_or(-1)
+        self.index.get_or(&name, -1)
     }
 
     // The value of the column named `name`.
@@ -1166,22 +1424,61 @@ impl Row {
         }
     }
 
-    // The column at `index` as an RFC 3339 instant, for a `timestamptz`.
-    //
-    // PostgreSQL writes `2026-08-16 12:34:56.789+00`, which differs from RFC
-    // 3339 in the date/time separator and the offset's missing minutes;
-    // both are normalized before parsing.
-    pub fn timestamp_at(&self, index: i64) -> Result<time::Instant, errors::Error> {
-        let text = self.text_at(index)?
+    // The column at `index` as a multirange's ranges, each bound decoded
+    // under the column's own element type.
+    pub fn multirange_at(&self, index: i64) -> Result<Vec<value::Range>, errors::Error> {
         let type_oid = self.type_at(index)
-        if !oid::is_temporal(type_oid) {
+        if !oid::is_multirange(type_oid) {
             return Err(errors::newf(
-                "column {} is {}, which carries no date or time"
+                "column {} is {}, which is not a multirange type"
                 index
                 oid::name_of(type_oid)
             ))
         }
-        time::parse_rfc3339(client::rfc3339_of(&text))
+        let element = oid::range_element_of(type_oid)
+        match self.at(index).as_text() {
+            Some(text) => value::parse_multirange_literal(&text, element)
+            None => Err(self.conversion_error(index, &"a multirange"))
+        }
+    }
+
+    // The column at `index` as a timestamp, at the microsecond resolution
+    // the server keeps. A `date` reads as midnight on that date.
+    pub fn timestamp_at(&self, index: i64) -> Result<temporal::Timestamp, errors::Error> {
+        self.at(index).as_timestamp().ok_or(self.conversion_error(index, &"a timestamp"))
+    }
+
+    // The column at `index` as a date.
+    pub fn date_at(&self, index: i64) -> Result<temporal::Date, errors::Error> {
+        self.at(index).as_date().ok_or(self.conversion_error(index, &"a date"))
+    }
+
+    // The column at `index` as a time of day.
+    pub fn time_at(&self, index: i64) -> Result<temporal::Time, errors::Error> {
+        self.at(index).as_time().ok_or(self.conversion_error(index, &"a time"))
+    }
+
+    // The column at `index` as an interval.
+    pub fn interval_at(&self, index: i64) -> Result<temporal::Interval, errors::Error> {
+        self.at(index).as_interval().ok_or(self.conversion_error(index, &"an interval"))
+    }
+
+    // The column at `index` as a UUID.
+    pub fn uuid_at(&self, index: i64) -> Result<temporal::Uuid, errors::Error> {
+        self.at(index).as_uuid().ok_or(self.conversion_error(index, &"a uuid"))
+    }
+
+    // The column at `index` as JSON document text.
+    pub fn json_at(&self, index: i64) -> Result<String, errors::Error> {
+        self.at(index).as_json_text().ok_or(self.conversion_error(index, &"json"))
+    }
+
+    // The column at `index` as `std::time`'s wall-clock reading, for a
+    // caller working in that type. It counts milliseconds, so the
+    // microsecond digits a timestamp carries are dropped; `timestamp_at`
+    // keeps them.
+    pub fn system_time_at(&self, index: i64) -> Result<time::SystemTime, errors::Error> {
+        Ok(self.timestamp_at(index)?.to_unix_millis())
     }
 
     // True when the column at `index` is NULL.
@@ -1253,9 +1550,44 @@ impl Row {
         self.range_at(self.require(name)?)
     }
 
-    // The column named `name` as an instant.
-    pub fn timestamp_of(&self, name: String) -> Result<time::Instant, errors::Error> {
+    // The column named `name` as a multirange's ranges.
+    pub fn multirange_of(&self, name: String) -> Result<Vec<value::Range>, errors::Error> {
+        self.multirange_at(self.require(name)?)
+    }
+
+    // The column named `name` as a timestamp.
+    pub fn timestamp_of(&self, name: String) -> Result<temporal::Timestamp, errors::Error> {
         self.timestamp_at(self.require(name)?)
+    }
+
+    // The column named `name` as a date.
+    pub fn date_of(&self, name: String) -> Result<temporal::Date, errors::Error> {
+        self.date_at(self.require(name)?)
+    }
+
+    // The column named `name` as a time of day.
+    pub fn time_of(&self, name: String) -> Result<temporal::Time, errors::Error> {
+        self.time_at(self.require(name)?)
+    }
+
+    // The column named `name` as an interval.
+    pub fn interval_of(&self, name: String) -> Result<temporal::Interval, errors::Error> {
+        self.interval_at(self.require(name)?)
+    }
+
+    // The column named `name` as a UUID.
+    pub fn uuid_of(&self, name: String) -> Result<temporal::Uuid, errors::Error> {
+        self.uuid_at(self.require(name)?)
+    }
+
+    // The column named `name` as JSON document text.
+    pub fn json_of(&self, name: String) -> Result<String, errors::Error> {
+        self.json_at(self.require(name)?)
+    }
+
+    // The column named `name` as `std::time`'s wall-clock reading.
+    pub fn system_time_of(&self, name: String) -> Result<time::SystemTime, errors::Error> {
+        self.system_time_at(self.require(name)?)
     }
 
     // The column named `name` as an `f64`, or `None` when it is NULL.
@@ -1396,7 +1728,8 @@ fn open_socket(host: &config::HostAddr, timeout_ms: i64) -> Result<Socket, error
             Err(e) => Err(errors::wrap(e, format!("connecting to {}", host.socket_path())))
         }
     }
-    match net::TcpStream::connect(host.tcp_addr()) {
+    let addr = host.tcp_addr()
+    match dial_tcp(&addr, timeout_ms) {
         Ok(stream) => {
             if timeout_ms > 0 {
                 stream.set_read_timeout_ms(timeout_ms)
@@ -1404,8 +1737,63 @@ fn open_socket(host: &config::HostAddr, timeout_ms: i64) -> Result<Socket, error
             }
             Ok(Socket::Tcp(stream))
         }
-        Err(e) => Err(errors::wrap(e, format!("connecting to {}", host.tcp_addr())))
+        Err(e) => Err(errors::wrap(e, format!("connecting to {}", addr)))
     }
+}
+
+// Opens a TCP socket, giving up after `timeout_ms`; zero waits as long as
+// the OS does, which is what a caller that named no `connect_timeout` asked
+// for.
+//
+// `TcpStream::connect` blocks until the address answers or the OS gives up on
+// it, which for a host that is routed but silent is minutes. A list of hosts
+// to fail over between is only worth writing if reaching a dead one costs the
+// deadline the caller named, so the dial runs on a goroutine and the wait is
+// raced against a timer.
+//
+// Two channels carry the outcome: the socket on one, and on the other a
+// report that is empty when the dial succeeded and carries the failure text
+// when it did not. The select waits on the report rather than the socket,
+// because a channel of sockets is not a shape it can race against a timer.
+//
+// A dial that loses the race stays in its syscall until the OS gives up on
+// the address, and the runtime joins it before the program exits, so a
+// program that hit the deadline can wait for that at exit. This is why the
+// race is run only for a caller that named a deadline: the alternative is
+// paying the same wait at the call itself, where it also blocks the failover
+// to the next host.
+fn dial_tcp(addr: &String, timeout_ms: i64) -> Result<net::TcpStream, errors::Error> {
+    if timeout_ms <= 0 {
+        return net::TcpStream::connect(addr.clone())
+    }
+    let (opened, arrivals) = channel_unbounded()
+    let (reported, reports) = channel_unbounded()
+    let target = addr.clone()
+    let dial = || {
+        match net::TcpStream::connect(target) {
+            Ok(stream) => {
+                opened.send(stream)
+                reported.send("")
+            }
+            Err(e) => reported.send(format!("{}", e))
+        }
+    }
+    go dial()
+
+    select {
+        settled = reports.recv() => {
+            if settled != "" {
+                return Err(errors::new(settled))
+            }
+        }
+        _ = time::after(time::Duration::from_millis(timeout_ms)).recv() => {
+            return Err(errors::newf("no answer within {} ms", timeout_ms))
+        }
+    }
+    let Some(stream) = arrivals.recv() else {
+        return Err(errors::new("the dial reported success without a socket"))
+    }
+    Ok(stream)
 }
 
 // Sends a CancelRequest for a backend on a connection of its own.
@@ -1464,6 +1852,8 @@ pub fn connect_host(
         name_counter: 0
         host: host.clone()
         tls: false
+        socket_timeout_ms: cfg.socket_timeout_ms
+        opened_at_ms: time::now_ms()
     }
     match negotiate(&mut conn, cfg, host) {
         Ok(_) => ()
@@ -1473,7 +1863,13 @@ pub fn connect_host(
         }
     }
     match finish_session(&mut conn, cfg) {
-        Ok(_) => Ok(conn)
+        Ok(_) => {
+            // `connect_timeout` bounded establishing the session and stops
+            // there, so the deadline it put on the socket is replaced by
+            // the session's own, which is usually none at all.
+            conn.apply_socket_timeout()
+            Ok(conn)
+        }
         Err(e) => {
             conn.close()
             Err(e)
@@ -1537,6 +1933,17 @@ fn negotiate_tls(
     }
     conn.sock = Socket::Tcp(upgraded)
     conn.tls = true
+    // The upgrade hands back a different socket, so the deadline that was
+    // bounding the handshake goes back on before authentication runs over it.
+    if cfg.connect_timeout_ms > 0 {
+        match conn.sock {
+            Socket::Tcp(stream) => {
+                stream.set_read_timeout_ms(cfg.connect_timeout_ms)
+                stream.set_write_timeout_ms(cfg.connect_timeout_ms)
+            }
+            Socket::Unix(_) => ()
+        }
+    }
     Ok(())
 }
 
@@ -1548,7 +1955,7 @@ fn upgrade_tls(
 ) -> Result<net::TcpStream, errors::Error> {
     let result = if cfg.verifies_certificate() {
         match cfg.sslrootcert {
-            Some(pem) => stream.start_tls_ca(host.host.clone(), pem)
+            Some(source) => stream.start_tls_ca(host.host.clone(), read_root_cert(source)?)
             None => stream.start_tls(host.host.clone())
         }
     } else {
@@ -1559,6 +1966,21 @@ fn upgrade_tls(
     match result {
         Ok(tls) => Ok(tls)
         Err(e) => Err(errors::wrap(e, "TLS handshake"))
+    }
+}
+
+// The PEM behind `sslrootcert`.
+//
+// libpq reads the parameter as the path to a certificate file, which is what
+// a connection string carries. A caller holding the certificate text already
+// may pass it inline, so a value that opens a PEM block is taken as written.
+fn read_root_cert(source: String) -> Result<String, errors::Error> {
+    if source.starts_with("-----BEGIN") {
+        return Ok(source)
+    }
+    match fs::read_to_string(source.clone()) {
+        Ok(pem) => Ok(pem)
+        Err(e) => Err(errors::newf("sslrootcert `{}`: {}", source, e))
     }
 }
 
@@ -1589,6 +2011,13 @@ fn send_startup(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
     if let Some(options) = cfg.options {
         buf::put_cstr(&mut body, &"options")
         buf::put_cstr(&mut body, &options)
+    }
+    // Carried here rather than set afterwards so it is the session's own
+    // default: `RESET ALL` puts a parameter back to what startup gave it,
+    // and a pooled connection is reset between borrowers.
+    if cfg.statement_timeout_ms > 0 {
+        buf::put_cstr(&mut body, &"statement_timeout")
+        buf::put_cstr(&mut body, &format!("{}", cfg.statement_timeout_ms))
     }
     for (name, setting) in cfg.runtime_params.iter() {
         buf::put_cstr(&mut body, &name)
@@ -1641,11 +2070,21 @@ fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
                 // for it now reports its absence before the extra round trip.
                 let _ = require_password(cfg)?
                 let mechanisms = parse_sasl_mechanisms(&body)
+                // The certificate the server presented is what a bound
+                // exchange hashes; a plain connection has none, so the
+                // binding mechanisms are not on the table there.
+                let cert_hash = server_cert_hash(conn)
+                let can_bind = cert_hash.len() > 0
                 let chosen = sasl::choose_mechanism(
                     &mechanisms
                     cfg.channel_binding == config::CHANNEL_BINDING_REQUIRE
+                    can_bind
                 )?
-                let exchange = sasl::Scram::start()?
+                let exchange = if chosen == sasl::MECHANISM_SCRAM_SHA_256_PLUS {
+                    sasl::Scram::start_bound(&cert_hash)?
+                } else {
+                    sasl::Scram::start()?
+                }
                 let first = exchange.client_first()
                 let mut payload: Vec<u8> = #[]
                 buf::put_cstr(&mut payload, &chosen)
@@ -1713,10 +2152,6 @@ fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
 // Applies the settings that need a query, and checks the session is the
 // kind of server the caller asked for.
 fn finish_session(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
-    if cfg.statement_timeout_ms > 0 {
-        let sql = format!("SET statement_timeout = {}", cfg.statement_timeout_ms)
-        let _ = conn.simple_query(&sql)?
-    }
     check_session_attrs(conn, &cfg.target_session_attrs)
 }
 
@@ -1783,6 +2218,24 @@ fn first_cell(results: &Vec<SimpleResult>) -> String {
     let Some(row) = result.rows.first() else { return "" }
     let Some(cell) = row.first() else { return "" }
     cell.as_text().unwrap_or("")
+}
+
+// The `tls-server-end-point` binding for this connection: the SHA-256 of
+// the certificate the server presented, or empty when the connection is not
+// TLS.
+//
+// RFC 5929 hashes the certificate with its own signature algorithm's digest,
+// substituting SHA-256 when that is MD5 or SHA-1. Every certificate a
+// current server presents is signed with SHA-256 or stronger, and PostgreSQL
+// itself uses SHA-256 for those, so that is what this computes.
+fn server_cert_hash(conn: &mut PgConn) -> Vec<u8> {
+    match conn.sock {
+        Socket::Tcp(stream) => {
+            let der = stream.peer_certificate()
+            if der.is_empty() { #[] } else { sha256::digest(der) }
+        }
+        Socket::Unix(_) => #[]
+    }
 }
 
 // The mechanism names an AuthenticationSASL message lists.
@@ -1892,10 +2345,7 @@ mod conn_tests {
 
     #[test]
     fn a_row_reads_columns_by_name_and_reports_an_unknown_one() {
-        let row = super::Row {
-            columns: #[column("id", oid::INT4)]
-            values: #[value::Value::Int(7)]
-        }
+        let row = super::Row::new(#[column("id", oid::INT4)], #[value::Value::Int(7)])
         let _ = testing::check_eq(&row.width(), &1, "one column")
         let _ = testing::check_eq(&row.index_of("id"), &0, "index of id")
         let _ = testing::check_eq(&row.index_of("missing"), &-1, "index of a missing column")

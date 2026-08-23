@@ -15,7 +15,7 @@
 
 use std::{errors, math}
 
-use crate::{buf, oid}
+use crate::{buf, oid, temporal}
 
 // Wire format codes, as the Bind message spells them. Text is the default
 // because every type has a text representation; binary is per statement.
@@ -39,6 +39,19 @@ pub enum Value {
     Text(String)
     // `bytea`.
     Bytes(Vec<u8>)
+    // `timestamp` and `timestamptz`, at the microsecond resolution the
+    // server keeps.
+    Timestamp(temporal::Timestamp)
+    // `date`.
+    Date(temporal::Date)
+    // `time` and `timetz`.
+    Time(temporal::Time)
+    // `interval`, as its three independent components.
+    Interval(temporal::Interval)
+    // `uuid`, as its sixteen bytes.
+    Uuid(temporal::Uuid)
+    // `json` and `jsonb`, as the document text the server holds.
+    Json(String)
 }
 
 impl Value {
@@ -54,7 +67,13 @@ impl Value {
             Value::Int(v) => Some(v)
             Value::Bool(b) => Some(if b { 1 } else { 0 })
             Value::Float(f) => Some(f as i64)
-            Value::Numeric(text) | Value::Text(text) => text.to_i64()
+            Value::Numeric(text) | Value::Text(text) | Value::Json(text) => text.to_i64()
+            // A timestamp's integer reading is its microsecond count from
+            // the Unix epoch, which is the number arithmetic on it uses.
+            Value::Timestamp(ts) => Some(ts.to_unix_micros())
+            Value::Date(date) => Some(date.to_unix_days())
+            Value::Time(t) => Some(t.to_day_micros())
+            Value::Interval(interval) => Some(interval.to_approximate_micros())
             _ => None
         }
     }
@@ -64,7 +83,7 @@ impl Value {
         match self {
             Value::Float(f) => Some(f)
             Value::Int(v) => Some(v as f64)
-            Value::Numeric(text) | Value::Text(text) => text.to_f64()
+            Value::Numeric(text) | Value::Text(text) | Value::Json(text) => text.to_f64()
             _ => None
         }
     }
@@ -74,7 +93,7 @@ impl Value {
         match self {
             Value::Bool(b) => Some(b)
             Value::Int(v) => Some(v != 0)
-            Value::Text(text) => match text {
+            Value::Text(text) | Value::Json(text) => match text {
                 "t" | "true" | "TRUE" | "y" | "yes" | "on" | "1" => Some(true)
                 "f" | "false" | "FALSE" | "n" | "no" | "off" | "0" => Some(false)
                 _ => None
@@ -118,6 +137,66 @@ impl Value {
         parse_record_literal(&text).ok()
     }
 
+    // The value as a timestamp, parsing a text form when the column was
+    // read as text; `None` for NULL or a value that carries no date.
+    pub fn as_timestamp(&self) -> Option<temporal::Timestamp> {
+        match self {
+            Value::Timestamp(ts) => Some(ts.clone())
+            Value::Date(date) => Some(date.at_midnight())
+            Value::Text(text) => temporal::parse_timestamp(text).ok()
+            _ => None
+        }
+    }
+
+    // The value as a date; `None` for NULL or a value that carries none.
+    pub fn as_date(&self) -> Option<temporal::Date> {
+        match self {
+            Value::Date(date) => Some(date.clone())
+            Value::Timestamp(ts) => Some(ts.date())
+            Value::Text(text) => temporal::parse_date(text).ok()
+            _ => None
+        }
+    }
+
+    // The value as a time of day; `None` for NULL or a value that carries
+    // none.
+    pub fn as_time(&self) -> Option<temporal::Time> {
+        match self {
+            Value::Time(t) => Some(t.clone())
+            Value::Timestamp(ts) => Some(ts.time())
+            Value::Text(text) => temporal::parse_time(text).ok()
+            _ => None
+        }
+    }
+
+    // The value as an interval; `None` for NULL or a value that is not one.
+    pub fn as_interval(&self) -> Option<temporal::Interval> {
+        match self {
+            Value::Interval(interval) => Some(interval.clone())
+            Value::Text(text) => temporal::parse_interval(text).ok()
+            _ => None
+        }
+    }
+
+    // The value as a UUID; `None` for NULL or a value that is not one.
+    pub fn as_uuid(&self) -> Option<temporal::Uuid> {
+        match self {
+            Value::Uuid(id) => Some(id.clone())
+            Value::Text(text) => temporal::parse_uuid(text).ok()
+            _ => None
+        }
+    }
+
+    // The value's JSON document text; `None` for NULL. A column of any
+    // other type answers its own text, which is what a caller building a
+    // document from it wants.
+    pub fn as_json_text(&self) -> Option<String> {
+        match self {
+            Value::Null => None
+            _ => Some(self.render())
+        }
+    }
+
     // The value rendered the way PostgreSQL writes it in text format. This
     // is what a text-format parameter sends and what `as_text` answers.
     pub fn render(&self) -> String {
@@ -126,8 +205,13 @@ impl Value {
             Value::Bool(b) => if b { "t" } else { "f" }
             Value::Int(v) => v.to_string()
             Value::Float(f) => render_float(f)
-            Value::Numeric(text) | Value::Text(text) => text.clone()
+            Value::Numeric(text) | Value::Text(text) | Value::Json(text) => text.clone()
             Value::Bytes(data) => "\\x" + &buf::to_hex(data)
+            Value::Timestamp(ts) => ts.to_string()
+            Value::Date(date) => date.to_string()
+            Value::Time(t) => t.to_string()
+            Value::Interval(interval) => interval.to_string()
+            Value::Uuid(id) => id.to_string()
         }
     }
 }
@@ -235,6 +319,27 @@ pub fn decode_text(type_oid: i64, raw: &Vec<u8>) -> Value {
             None => Value::Text(text)
         }
         oid::NUMERIC | oid::MONEY => Value::Numeric(text)
+        oid::JSON | oid::JSONB => Value::Json(text)
+        oid::UUID => match temporal::parse_uuid(&text) {
+            Ok(id) => Value::Uuid(id)
+            Err(_) => Value::Text(text)
+        }
+        oid::DATE => match temporal::parse_date(&text) {
+            Ok(date) => Value::Date(date)
+            Err(_) => Value::Text(text)
+        }
+        oid::TIME | oid::TIMETZ => match temporal::parse_time(&text) {
+            Ok(t) => Value::Time(t)
+            Err(_) => Value::Text(text)
+        }
+        oid::TIMESTAMP | oid::TIMESTAMPTZ => match temporal::parse_timestamp(&text) {
+            Ok(ts) => Value::Timestamp(ts)
+            Err(_) => Value::Text(text)
+        }
+        oid::INTERVAL => match temporal::parse_interval(&text) {
+            Ok(interval) => Value::Interval(interval)
+            Err(_) => Value::Text(text)
+        }
         _ => {
             if oid::is_integer(type_oid) {
                 match text.to_i64() {
@@ -523,6 +628,66 @@ pub fn parse_range_literal(text: &String, elem_oid: i64) -> Result<Range, errors
     })
 }
 
+// Parses a multirange literal into its ranges, decoding each bound under
+// `elem_oid`.
+//
+// A multirange is a brace-wrapped, comma-separated list of range literals
+// (`{[1,3),[5,7)}`), and `{}` is the empty multirange. The ranges never
+// overlap and are already in ascending order, which is what the server
+// normalizes them to.
+pub fn parse_multirange_literal(
+    text: &String
+    elem_oid: i64
+) -> Result<Vec<Range>, errors::Error> {
+    let trimmed = text.trim()
+    if !trimmed.starts_with("{") || !trimmed.ends_with("}") {
+        return Err(errors::newf("multirange literal must be braced: {}", trimmed))
+    }
+    let inner = trimmed.substring(1, trimmed.byte_len() - 1).trim()
+    if inner == "" {
+        return Ok(#[])
+    }
+    let mut ranges: Vec<Range> = #[]
+    let n = inner.byte_len()
+    let mut i = 0
+    while i < n {
+        let c = inner.byte_at(i)
+        if c == 44 || is_space_byte(c) {
+            i += 1
+            continue
+        }
+        if c != 91 && c != 40 {
+            return Err(errors::newf("multirange element must be bracketed: {}", inner))
+        }
+        let end = closing_bracket(&inner, i)?
+        ranges.push(parse_range_literal(&inner.substring(i, end + 1), elem_oid)?)
+        i = end + 1
+    }
+    Ok(ranges)
+}
+
+// The index of the bracket closing the range that opens at `open`, skipping
+// one inside a quoted bound.
+fn closing_bracket(text: &String, open: i64) -> Result<i64, errors::Error> {
+    let n = text.byte_len()
+    let mut i = open + 1
+    let mut quoted = false
+    while i < n {
+        let c = text.byte_at(i)
+        if quoted && c == 92 {
+            i += 2
+            continue
+        }
+        if c == 34 {
+            quoted = !quoted
+        } else if !quoted && (c == 93 || c == 41) {
+            return Ok(i)
+        }
+        i += 1
+    }
+    Err(errors::newf("multirange element is unterminated: {}", text.substring(open, n)))
+}
+
 fn decode_bound(raw: &String, elem_oid: i64) -> Value {
     if raw == "" {
         return Value::Null
@@ -637,26 +802,64 @@ pub fn decode_binary(type_oid: i64, raw: &Vec<u8>) -> Value {
             Err(_) => Value::Bytes(raw.clone())
         }
     }
+    // A range and a multirange decode to the literal the text format
+    // writes, so a caller reads either wire format through one parser and
+    // the bounds keep the column's own element type.
+    if oid::is_range(type_oid) {
+        return match decode_binary_range(raw, oid::range_element_of(type_oid)) {
+            Ok(literal) => Value::Text(literal)
+            Err(_) => Value::Bytes(raw.clone())
+        }
+    }
+    if oid::is_multirange(type_oid) {
+        return match decode_binary_multirange(raw, oid::range_element_of(type_oid)) {
+            Ok(literal) => Value::Text(literal)
+            Err(_) => Value::Bytes(raw.clone())
+        }
+    }
     match type_oid {
         oid::BOOL => Value::Bool(buf::u8_at(raw, 0) != 0)
-        oid::CHAR => Value::Int(buf::u8_at(raw, 0))
         oid::INT2 => Value::Int(buf::i16_at(raw, 0))
         oid::INT4 | oid::OID | oid::XID | oid::CID | oid::REGPROC => Value::Int(buf::i32_at(raw, 0))
         oid::INT8 => Value::Int(buf::i64_at(raw, 0))
         oid::FLOAT4 => Value::Float(f32_from_bits(buf::u32_at(raw, 0)))
         oid::FLOAT8 => Value::Float(f64_from_bits(buf::i64_at(raw, 0)))
-        oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::JSON | oid::XML
-        | oid::CSTRING => Value::Text(buf::utf8_lossy(raw))
+        // `"char"` is one byte, and what the server writes for it in text
+        // format is the character itself, so it reads as its text alike.
+        oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::XML
+        | oid::CSTRING | oid::CHAR => Value::Text(buf::utf8_lossy(raw))
+        oid::JSON => Value::Json(buf::utf8_lossy(raw))
         oid::JSONB => {
             // A jsonb binary payload is a one-byte version prefix then the
             // document as text.
             if buf::u8_at(raw, 0) == 1 {
-                Value::Text(buf::utf8_lossy(&buf::slice(raw, 1, raw.len())))
+                Value::Json(buf::utf8_lossy(&buf::slice(raw, 1, raw.len())))
             } else {
-                Value::Text(buf::utf8_lossy(raw))
+                Value::Json(buf::utf8_lossy(raw))
             }
         }
-        oid::UUID => Value::Text(render_uuid(raw))
+        oid::UUID => match temporal::Uuid::from_bytes(raw.clone()) {
+            Ok(id) => Value::Uuid(id)
+            Err(_) => Value::Bytes(raw.clone())
+        }
+        oid::DATE => match temporal::date_from_binary(raw) {
+            Ok(date) => Value::Date(date)
+            Err(_) => Value::Bytes(raw.clone())
+        }
+        oid::TIME | oid::TIMETZ => match temporal::time_from_binary(raw) {
+            Ok(t) => Value::Time(t)
+            Err(_) => Value::Bytes(raw.clone())
+        }
+        oid::TIMESTAMP | oid::TIMESTAMPTZ => {
+            match temporal::timestamp_from_binary(raw, type_oid == oid::TIMESTAMPTZ) {
+                Ok(ts) => Value::Timestamp(ts)
+                Err(_) => Value::Bytes(raw.clone())
+            }
+        }
+        oid::INTERVAL => match temporal::interval_from_binary(raw) {
+            Ok(interval) => Value::Interval(interval)
+            Err(_) => Value::Bytes(raw.clone())
+        }
         oid::NUMERIC => match decode_binary_numeric(raw) {
             Ok(text) => Value::Numeric(text)
             Err(_) => Value::Bytes(raw.clone())
@@ -675,6 +878,35 @@ pub fn encode_binary(v: &Value, type_oid: i64) -> Option<Vec<u8>> {
         Value::Int(n) => encode_binary_int(n, type_oid)
         Value::Text(text) => encode_binary_text(text, type_oid)
         Value::Bytes(data) => encode_binary_bytes(data, type_oid)
+        Value::Json(text) => encode_binary_json(text, type_oid)
+        Value::Uuid(id) => if type_oid == oid::UUID { Some(id.bytes.clone()) } else { None }
+        Value::Timestamp(ts) => match type_oid {
+            oid::TIMESTAMP | oid::TIMESTAMPTZ => Some(temporal::timestamp_to_binary(ts))
+            _ => None
+        }
+        Value::Date(date) => match type_oid {
+            oid::DATE => Some(temporal::date_to_binary(date))
+            _ => None
+        }
+        Value::Time(t) => match type_oid {
+            // The binary `timetz` carries an offset the value must have,
+            // and the binary `time` must not carry one.
+            oid::TIME => if t.offset_minutes.is_none() {
+                Some(temporal::time_to_binary(t))
+            } else {
+                None
+            }
+            oid::TIMETZ => if t.offset_minutes.is_some() {
+                Some(temporal::time_to_binary(t))
+            } else {
+                None
+            }
+            _ => None
+        }
+        Value::Interval(interval) => match type_oid {
+            oid::INTERVAL => Some(temporal::interval_to_binary(interval))
+            _ => None
+        }
         // A float goes as text: its shortest round-tripping decimal form
         // names exactly one binary64, so nothing is lost. An array, a
         // composite, and a numeric go as their literal for the same reason.
@@ -710,6 +942,20 @@ fn encode_binary_text(text: &String, type_oid: i64) -> Option<Vec<u8>> {
     }
 }
 
+// A JSON document in binary: `json` is its bytes, and `jsonb` prefixes them
+// with the one-byte format version the server expects.
+fn encode_binary_json(text: &String, type_oid: i64) -> Option<Vec<u8>> {
+    match type_oid {
+        oid::JSON => Some(text.as_bytes())
+        oid::JSONB => {
+            let mut out: Vec<u8> = #[1]
+            out.extend(text.as_bytes())
+            Some(out)
+        }
+        _ => None
+    }
+}
+
 fn encode_binary_bytes(data: &Vec<u8>, type_oid: i64) -> Option<Vec<u8>> {
     if type_oid != oid::BYTEA {
         return None
@@ -717,14 +963,123 @@ fn encode_binary_bytes(data: &Vec<u8>, type_oid: i64) -> Option<Vec<u8>> {
     Some(data.clone())
 }
 
-// A `uuid`'s 16 binary bytes in the canonical hyphenated form.
-fn render_uuid(raw: &Vec<u8>) -> String {
-    let hex = buf::to_hex(raw)
-    if hex.byte_len() != 32 {
-        return hex
+// Range flag bits, as `rangetypes.h` defines them.
+const RANGE_EMPTY: i64 = 1
+const RANGE_LB_INC: i64 = 2
+const RANGE_UB_INC: i64 = 4
+const RANGE_LB_INF: i64 = 8
+const RANGE_UB_INF: i64 = 16
+const RANGE_LB_NULL: i64 = 32
+const RANGE_UB_NULL: i64 = 64
+
+// Decodes the binary range representation into the literal the text format
+// writes: a flags byte, then each bound the flags say is present as a
+// length and its own binary value.
+fn decode_binary_range(raw: &Vec<u8>, elem_oid: i64) -> Result<String, errors::Error> {
+    let (literal, _) = read_binary_range(raw, 0, raw.len(), elem_oid)?
+    Ok(literal)
+}
+
+// Decodes the binary multirange representation: a count, then each range as
+// a length and its own binary payload.
+fn decode_binary_multirange(raw: &Vec<u8>, elem_oid: i64) -> Result<String, errors::Error> {
+    if raw.len() < 4 {
+        return Err(errors::new("multirange binary payload too short"))
     }
-    hex.substring(0, 8) + "-" + &hex.substring(8, 12) + "-" + &hex.substring(12, 16) + "-"
-    + &hex.substring(16, 20) + "-" + &hex.substring(20, 32)
+    let count = buf::i32_at(raw, 0)
+    if count < 0 {
+        return Err(errors::new("multirange binary payload has a negative range count"))
+    }
+    let mut parts: Vec<String> = #[]
+    let mut offset = 4
+    for _range in 0..count {
+        if offset + 4 > raw.len() {
+            return Err(errors::new("multirange binary payload ends inside a range"))
+        }
+        let length = buf::i32_at(raw, offset)
+        offset += 4
+        if length < 0 || offset + length > raw.len() {
+            return Err(errors::new("multirange binary payload has a bad range length"))
+        }
+        let (literal, _) = read_binary_range(raw, offset, offset + length, elem_oid)?
+        parts.push(literal)
+        offset += length
+    }
+    Ok("{" + &parts.join(",") + "}")
+}
+
+// One binary range between `start` and `end`, as its literal and the offset
+// just past it.
+fn read_binary_range(
+    raw: &Vec<u8>
+    start: i64
+    end: i64
+    elem_oid: i64
+) -> Result<(String, i64), errors::Error> {
+    if start >= end {
+        return Err(errors::new("range binary payload is empty"))
+    }
+    let flags = buf::u8_at(raw, start)
+    if flags & RANGE_EMPTY != 0 {
+        return Ok(("empty", start + 1))
+    }
+    let mut offset = start + 1
+    let has_lower = flags & (RANGE_LB_INF | RANGE_LB_NULL) == 0
+    let has_upper = flags & (RANGE_UB_INF | RANGE_UB_NULL) == 0
+    let mut lower = ""
+    let mut upper = ""
+    if has_lower {
+        let (bound, next) = read_binary_bound(raw, offset, end, elem_oid)?
+        lower = bound
+        offset = next
+    }
+    if has_upper {
+        let (bound, next) = read_binary_bound(raw, offset, end, elem_oid)?
+        upper = bound
+        offset = next
+    }
+    let open = if flags & RANGE_LB_INC != 0 { "[" } else { "(" }
+    let close = if flags & RANGE_UB_INC != 0 { "]" } else { ")" }
+    Ok((open + &lower + "," + &upper + &close, offset))
+}
+
+fn read_binary_bound(
+    raw: &Vec<u8>
+    offset: i64
+    end: i64
+    elem_oid: i64
+) -> Result<(String, i64), errors::Error> {
+    if offset + 4 > end {
+        return Err(errors::new("range binary payload ends inside a bound"))
+    }
+    let length = buf::i32_at(raw, offset)
+    if length < 0 || offset + 4 + length > end {
+        return Err(errors::new("range binary payload has a bad bound length"))
+    }
+    let bound = decode_binary(elem_oid, &buf::slice(raw, offset + 4, offset + 4 + length))
+    Ok((quote_range_bound(&bound.render()), offset + 4 + length))
+}
+
+// Quotes a range bound when it holds a byte the range grammar would
+// otherwise read as structure, or when it is empty.
+//
+// Byte offsets: every character the grammar reserves is ASCII, so a
+// multi-byte character copies through untouched.
+fn quote_range_bound(text: &String) -> String {
+    let needs = text.is_empty()
+    || text.bytes().any(|byte| is_reserved_byte(byte as i64) || byte == 91 || byte == 93)
+    if !needs {
+        return text.clone()
+    }
+    let mut out: Vec<u8> = #[34]
+    for byte in text.bytes() {
+        if byte == 34 || byte == 92 {
+            out.push(92)
+        }
+        out.push(byte)
+    }
+    out.push(34)
+    buf::utf8_lossy(&out)
 }
 
 // Decodes the binary `numeric` representation into its exact decimal text.
@@ -773,7 +1128,15 @@ fn decode_binary_numeric(raw: &Vec<u8>) -> Result<String, errors::Error> {
 
     // Fractional digits: the groups past the integer part, cut to the
     // declared display scale.
+    //
+    // A weight below -1 puts the first stored group that many whole groups
+    // past the point, and the groups in between are not on the wire: the
+    // encoding stores significant digits and says where they sit, so the
+    // zeros leading up to them are written back here.
     let mut frac = ""
+    for _leading in 0..max(-weight - 1, 0) {
+        frac += "0000"
+    }
     for fg in max(weight + 1, 0)..groups.len() {
         frac += format!("{:04}", groups[fg])
     }
@@ -838,11 +1201,8 @@ fn nest_literal(flat: &Vec<Value>, dims: &Vec<i64>, depth: i64) -> String {
         inner_len *= d
     }
     let mut rows: Vec<String> = #[]
-    let mut start = 0
-    while start < flat.len() {
-        let chunk: Vec<Value> = flat.iter().skip(start).take(inner_len).collect()
+    for chunk in flat.chunks(inner_len) {
         rows.push(nest_literal(&chunk, dims, depth + 1))
-        start += inner_len
     }
     render_nested_array_literal(&rows)
 }
@@ -1001,10 +1361,10 @@ mod value_tests {
     #[test]
     fn arrays_round_trip_through_render_and_parse() {
         let text = super::render_array_literal(&#[
-            super::Value::Text("plain"),
-            super::Value::Text("has,comma"),
-            super::Value::Null,
-            super::Value::Text(""),
+            super::Value::Text("plain")
+            super::Value::Text("has,comma")
+            super::Value::Null
+            super::Value::Text("")
         ])
         match super::parse_array_literal(&text, oid::TEXT) {
             Ok(items) => {
@@ -1076,10 +1436,278 @@ mod value_tests {
         )
     }
 
+    // A binary numeric, built as the server writes it: ndigits, weight,
+    // sign, dscale, then base-10000 digit groups.
+    fn numeric_wire(weight: i64, negative: bool, dscale: i64, groups: Vec<i64>) -> Vec<u8> {
+        let mut raw: Vec<u8> = #[]
+        super::buf::put_i16(&mut raw, groups.len())
+        super::buf::put_i16(&mut raw, weight)
+        super::buf::put_i16(&mut raw, if negative { 16_384 } else { 0 })
+        super::buf::put_i16(&mut raw, dscale)
+        for group in groups {
+            super::buf::put_i16(&mut raw, group)
+        }
+        raw
+    }
+
+    #[test]
+    fn a_binary_numeric_writes_the_zeros_its_weight_stands_for() {
+        // The encoding stores significant digits and says where they sit, so
+        // a value smaller than one whole base-10000 group has leading zeros
+        // that are not on the wire.
+        let cases: Vec<(i64, bool, i64, Vec<i64>, String)> = #[
+            (0, false, 0, #[1], "1")
+            (0, true, 0, #[1], "-1")
+            (-1, false, 1, #[1_000], "0.1")
+            (-1, true, 1, #[1_000], "-0.1")
+            (-2, false, 8, #[1], "0.00000001")
+            (-2, true, 8, #[1], "-0.00000001")
+            (-3, false, 12, #[1], "0.000000000001")
+            (-5, false, 20, #[1], "0.00000000000000000001")
+            (1, false, 4, #[1, 2_345, 6_789], "12345.6789")
+            (0, false, 4, #[0, 5_000], "0.5000")
+            (-1, false, 4, #[1], "0.0001")
+            (-1, false, 8, #[1], "0.00010000")
+        ]
+        for (weight, negative, dscale, groups, expected) in cases {
+            let raw = numeric_wire(weight, negative, dscale, groups)
+            let _ = testing::check_eq(
+                &super::decode_binary(oid::NUMERIC, &raw).render()
+                &expected
+                &format!("weight {} dscale {}", weight, dscale)
+            )
+        }
+    }
+
+    #[test]
+    fn a_binary_char_reads_as_the_character_its_text_form_writes() {
+        let _ = testing::check_eq(
+            &super::decode_binary(oid::CHAR, &#[120]).render()
+            &"x"
+            "the byte is the character"
+        )
+        let _ = testing::check_eq(
+            &super::decode_text(oid::CHAR, &"x".as_bytes()).render()
+            &super::decode_binary(oid::CHAR, &#[120]).render()
+            "both wire formats agree"
+        )
+    }
+
+    #[test]
+    fn a_typed_accessor_answers_only_for_what_it_can_read() {
+        // Reading a column as a type it cannot carry is a `None` a caller
+        // branches on rather than a wrong value. Text is the exception by
+        // design: it is what the server wrote, so a typed reading of it is a
+        // parse that either succeeds or does not.
+        let word = super::Value::Text("hello")
+        let _ = testing::check_eq(&word.as_text().unwrap_or(""), &"hello", "text reads as text")
+        let _ = testing::check(word.as_int().is_none(), "a word is no integer")
+        let _ = testing::check(word.as_float().is_none(), "nor a float")
+        let _ = testing::check(word.as_bool().is_none(), "nor a bool")
+        let _ = testing::check(word.as_uuid().is_none(), "nor a uuid")
+        let _ = testing::check(word.as_timestamp().is_none(), "nor a timestamp")
+        let _ = testing::check(word.as_date().is_none(), "nor a date")
+        let _ = testing::check(word.as_time().is_none(), "nor a time")
+        let _ = testing::check(word.as_interval().is_none(), "nor an interval")
+
+        let number = super::Value::Int(7)
+        let _ = testing::check_eq(&number.as_int().unwrap_or(0), &7, "an integer reads")
+        let _ = testing::check_eq(&number.as_text().unwrap_or(""), &"7", "and has a text form")
+        let _ = testing::check(number.as_bool().unwrap_or(false), "a non-zero integer is true")
+        let _ = testing::check(!super::Value::Int(0).as_bool().unwrap_or(true), "and zero is false")
+        let _ = testing::check(number.as_uuid().is_none(), "but names no uuid")
+    }
+
+    #[test]
+    fn null_answers_no_accessor_at_all() {
+        let null = super::Value::Null
+        let _ = testing::check(null.is_null(), "NULL knows itself")
+        let _ = testing::check(null.as_text().is_none(), "no text")
+        let _ = testing::check(null.as_int().is_none(), "no integer")
+        let _ = testing::check(null.as_float().is_none(), "no float")
+        let _ = testing::check(null.as_bool().is_none(), "no bool")
+        let _ = testing::check(null.as_bytes().is_none(), "no bytes")
+        let _ = testing::check(null.as_array().is_none(), "no array")
+        let _ = testing::check(null.as_record().is_none(), "no record")
+        let _ = testing::check(null.as_json_text().is_none(), "no document")
+        let _ = testing::check(null.as_uuid().is_none(), "no uuid")
+        let _ = testing::check(null.as_timestamp().is_none(), "no timestamp")
+        let _ = testing::check_eq(&null.render(), &"", "and renders as nothing")
+    }
+
+    #[test]
+    fn the_bool_spellings_postgres_accepts_all_read() {
+        for spelling in #["t", "true", "TRUE", "y", "yes", "on", "1"] {
+            let _ = testing::check(
+                super::Value::Text(spelling).as_bool().unwrap_or(false)
+                &format!("{} is true", spelling)
+            )
+        }
+        for spelling in #["f", "false", "FALSE", "n", "no", "off", "0"] {
+            let _ = testing::check(
+                !super::Value::Text(spelling).as_bool().unwrap_or(true)
+                &format!("{} is false", spelling)
+            )
+        }
+        let _ = testing::check(super::Value::Text("maybe").as_bool().is_none(), "and nothing else does")
+    }
+
+    #[test]
+    fn the_typed_temporal_arms_read_back_through_their_own_accessors() {
+        match super::temporal::parse_timestamp(&"2026-08-23 12:34:56.789012+00") {
+            Ok(at) => {
+                let v = super::Value::Timestamp(at)
+                let _ = testing::check(v.as_timestamp().is_some(), "a timestamp arm reads")
+                let _ = testing::check(
+                    v.render().starts_with("2026-08-23 12:34:56.789012")
+                    &format!("rendering keeps the microseconds: {}", v.render())
+                )
+                // A timestamp carries a date and a time, so both project.
+                let _ = testing::check(v.as_date().is_some(), "and projects to its date")
+                let _ = testing::check(v.as_time().is_some(), "and to its time of day")
+                let _ = testing::check(v.as_interval().is_none(), "but names no span")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("timestamp: {}", e)) }
+        }
+        match super::temporal::parse_interval(&"1 mon 2 days 03:04:05") {
+            Ok(span) => {
+                let v = super::Value::Interval(span)
+                let _ = testing::check(v.as_interval().is_some(), "an interval arm reads")
+                let _ = testing::check(v.as_timestamp().is_none(), "and names no instant")
+                let _ = testing::check(v.as_date().is_none(), "nor a date")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("interval: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn a_json_document_keeps_its_own_arm_and_its_text() {
+        let doc = super::Value::Json("{\"a\":1}")
+        let _ = testing::check_eq(&doc.as_json_text().unwrap_or(""), &"{\"a\":1}", "the document")
+        let _ = testing::check_eq(&doc.render(), &"{\"a\":1}", "rendered as written")
+        // A column of any other type answers its own text here, which is what
+        // a caller assembling a document out of one wants.
+        let _ = testing::check_eq(
+            &super::Value::Int(7).as_json_text().unwrap_or("")
+            &"7"
+            "a scalar answers its own text"
+        )
+    }
+
+    #[test]
+    fn an_array_and_a_record_read_out_of_the_literal_they_are_carried_as() {
+        // Both arrive as the literal the server wrote, so the accessors parse.
+        let arr = super::Value::Text("{1,2,3}")
+        match arr.as_array() {
+            Some(items) => {
+                let _ = testing::check_eq(&items.len(), &3, "three elements")
+                let _ = testing::check_eq(&items[2].render(), &"3", "the last one")
+            }
+            None => { let _ = testing::check(false, "an array literal reads as an array") }
+        }
+        let record = super::Value::Text("(1,ada,)")
+        match record.as_record() {
+            Some(fields) => {
+                let _ = testing::check_eq(&fields.len(), &3, "three fields")
+                let _ = testing::check_eq(&fields[1].render(), &"ada", "the second")
+                let _ = testing::check(fields[2].is_null(), "an empty field is NULL")
+            }
+            None => { let _ = testing::check(false, "a composite literal reads as a record") }
+        }
+        let _ = testing::check(super::Value::Text("not a literal").as_array().is_none(), "and nothing else does")
+    }
+
+    #[test]
+    fn a_float_renders_in_the_spelling_postgres_reads_back() {
+        let _ = testing::check_eq(&super::render_float(1.5), &"1.5", "a plain decimal")
+        let _ = testing::check_eq(&super::render_float(-0.25), &"-0.25", "a negative one")
+        let _ = testing::check_eq(&super::render_float(super::nan()), &"NaN", "not a number")
+        let _ = testing::check_eq(&super::render_float(super::infinity()), &"Infinity", "infinity")
+        // Whatever the spelling, it has to parse back to the same value, or a
+        // float bound as a parameter is not the float that was read.
+        for text in #["1.5", "-0.25", "NaN", "Infinity", "-Infinity"] {
+            match super::parse_float_text(&text) {
+                Some(f) => {
+                    let _ = testing::check_eq(
+                        &super::render_float(f)
+                        &text
+                        &format!("round trip {}", text)
+                    )
+                }
+                None => { let _ = testing::check(false, &format!("{} must parse", text)) }
+            }
+        }
+        let _ = testing::check(super::parse_float_text(&"not a number").is_none(), "a word is rejected")
+    }
+
+    #[test]
+    fn a_multirange_literal_parses_to_the_ranges_it_holds() {
+        match super::parse_multirange_literal(&"{[1,3),[5,7)}", oid::INT4) {
+            Ok(ranges) => {
+                let _ = testing::check_eq(&ranges.len(), &2, "two ranges")
+                let _ = testing::check_eq(&ranges[0].lower.render(), &"1", "the first lower bound")
+                let _ = testing::check_eq(&ranges[1].upper.render(), &"7", "the second upper bound")
+                let _ = testing::check(ranges[0].lower_inclusive, "a square bracket includes")
+                let _ = testing::check(!ranges[0].upper_inclusive, "a round one does not")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("parse failed: {}", e)) }
+        }
+        let _ = testing::check_eq(
+            &super::parse_multirange_literal(&"{}", oid::INT4).unwrap_or(#[]).len()
+            &0
+            "an empty multirange holds nothing"
+        )
+        let _ = testing::check(
+            super::parse_multirange_literal(&"[1,3)", oid::INT4).is_err()
+            "an unbraced literal is not a multirange"
+        )
+    }
+
+    #[test]
+    fn a_record_literal_survives_being_rendered_and_read_again() {
+        // A field carrying a comma or a quote has to come back the same, or a
+        // composite parameter changes shape on the way to the server.
+        for literal in #["(1,ada,)", "(\"a,b\",c)", "(,)"] {
+            match super::parse_record_literal(&literal) {
+                Ok(fields) => {
+                    let again = super::render_record_literal(&fields)
+                    match super::parse_record_literal(&again) {
+                        Ok(reparsed) => {
+                            let _ = testing::check_eq(
+                                &reparsed.len()
+                                &fields.len()
+                                &format!("{} keeps its field count through {}", literal, again)
+                            )
+                            let _ = testing::check_eq(
+                                &reparsed.map(|f| f.render())
+                                &fields.map(|f| f.render())
+                                &format!("{} keeps its fields through {}", literal, again)
+                            )
+                        }
+                        Err(e) => { let _ = testing::check(false, &format!("reparse {}: {}", again, e)) }
+                    }
+                }
+                Err(e) => { let _ = testing::check(false, &format!("{}: {}", literal, e)) }
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_array_literal_renders_with_its_shape_intact() {
+        let rows: Vec<String> = #["{1,2}", "{3,4}"]
+        let _ = testing::check_eq(
+            &super::render_nested_array_literal(&rows)
+            &"{{1,2},{3,4}}"
+            "two rows of two"
+        )
+        let empty: Vec<String> = #[]
+        let _ = testing::check_eq(&super::render_nested_array_literal(&empty), &"{}", "no rows")
+    }
+
     #[test]
     fn binary_uuid_renders_hyphenated() {
         let raw: Vec<u8> = #[
-            0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255,
+            0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255
         ]
         let _ = testing::check_eq(
             &super::decode_binary(oid::UUID, &raw).as_text().unwrap_or("")

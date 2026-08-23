@@ -1,0 +1,299 @@
+// Surviving the things a correct program still has to handle.
+//
+// Four of them, each with the SQLSTATE that names it:
+//
+//   - a serialization failure (40001) between two SERIALIZABLE transactions,
+//     which is not anyone's mistake and is answered by retrying;
+//   - a unique violation (23505), which is the caller's to decide about;
+//   - a statement that fails inside a transaction (25P02), which poisons the
+//     block until a rollback, and the savepoint that contains it;
+//   - a schema change under a cached statement, which the driver answers by
+//     preparing it again rather than reporting it.
+//
+//     GOS_PGSQL_URL='host=/var/run/postgresql dbname=gos_pgsql_test' gos run .
+
+use std::sync::channel_unbounded
+use std::{env, errors, time}
+use pgsql_gos as pgsql
+
+const MAX_ATTEMPTS: i64 = 5
+
+fn main() -> Result<(), errors::Error> {
+    let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
+    setup(&url)?
+
+    retrying_a_serialization_failure(&url)?
+    classifying_a_constraint_violation(&url)?
+    containing_a_failure_with_a_savepoint(&url)?
+    a_migration_under_a_cached_statement(&url)?
+
+    teardown(&url)?
+    println!("")
+    println!("every failure was handled by its SQLSTATE rather than its message")
+    Ok(())
+}
+
+// --- 40001: retry ---------------------------------------------------
+
+// Two SERIALIZABLE transactions that read what the other writes cannot both
+// commit. The loser reports 40001, which means "nothing was wrong with this
+// transaction, run it again".
+fn retrying_a_serialization_failure(url: &String) -> Result<(), errors::Error> {
+    println!("== a serialization failure is retried, not reported")
+    let (results, collected) = channel_unbounded()
+    // A gate each worker waits on, so both have read before either writes.
+    let (ready, waiting) = channel_unbounded()
+    // A closure captures owned values, so the connection string is bound
+    // here rather than borrowed from the caller.
+    let target = url.clone()
+
+    cohort {
+        for worker in 0..2 {
+            spawn(|| {
+                match transfer(target.clone(), worker, ready, waiting) {
+                    Ok(attempts) => results.send(attempts)
+                    Err(e) => {
+                        eprintln!("worker {} gave up: {}", worker, e)
+                        results.send(-1)
+                    }
+                }
+            })
+        }
+    }?
+    results.close()
+
+    let mut attempts = 0
+    let mut failed = false
+    while let Some(n) = collected.recv() {
+        if n < 0 {
+            failed = true
+        }
+        attempts += n
+    }
+    if failed {
+        return Err(errors::new("a worker gave up rather than retrying"))
+    }
+    println!("  both committed, {} attempt(s) between them", attempts)
+
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    let total = db.query_value(&"SELECT sum(balance)::int8 FROM accounts", &#[])?
+    println!("  the invariant held: total balance {}", total.as_int().unwrap_or(-1))
+    Ok(())
+}
+
+// One transfer, retried while the server says the conflict was not our
+// fault. Every retry opens a fresh transaction: the old one is dead.
+fn transfer(
+    url: String
+    worker: i64
+    ready: Sender<i64>
+    waiting: Receiver<i64>
+) -> Result<i64, errors::Error> {
+    let mut db = pgsql::connect(&url)?
+    defer db.close()
+    let mut options = pgsql::client::TxOptions::defaults()
+    options.isolation = pgsql::client::Isolation::Serializable
+    let mut attempt = 0
+    loop {
+        attempt += 1
+        match attempt_transfer(&mut db, &options, worker, attempt, ready, waiting) {
+            Ok(_) => return Ok(attempt)
+            Err(e) => {
+                // The failed statement left the block in its aborted state,
+                // where the server accepts only a rollback. A retry that
+                // skips this reports 25P02 rather than doing the work.
+                if db.in_transaction() {
+                    let _ = db.batch_execute(&"ROLLBACK")
+                }
+                if !pgsql::retryable(&e) || attempt >= MAX_ATTEMPTS {
+                    return Err(e)
+                }
+                println!("  worker {} hit {}, retrying", worker, pgsql::sqlstate_of(&e))
+                // A short pause so the retry does not simply collide again.
+                time::sleep(time::Duration::from_millis(20 * attempt))
+            }
+        }
+    }
+}
+
+fn attempt_transfer(
+    db: &mut pgsql::client::Client
+    options: &pgsql::client::TxOptions
+    worker: i64
+    attempt: i64
+    ready: Sender<i64>
+    waiting: Receiver<i64>
+) -> Result<(), errors::Error> {
+    let mut tx = db.begin_with(options)?
+    // Each worker reads the whole table, which is what makes the two
+    // transactions conflict rather than merely interleave.
+    let total = db.query_value(&"SELECT sum(balance)::int8 FROM accounts", &#[])?
+    if attempt == 1 {
+        // Both read before either writes, so the conflict is certain the
+        // first time round and the retry is what the example is showing.
+        ready.send(worker)
+        let _ = waiting.recv()
+    }
+    let _ = total
+    // Both accounts are touched, in the order this worker chose, which is
+    // what makes the two transactions conflict rather than merely interleave.
+    let debit = db.execute(
+        &"UPDATE accounts SET balance = balance - 10 WHERE id = $1"
+        &#[pgsql::int(worker + 1)]
+    )
+    if let Err(e) = debit {
+        return Err(e)
+    }
+    let credit = db.execute(
+        &"UPDATE accounts SET balance = balance + 10 WHERE id = $1"
+        &#[pgsql::int(((worker + 1) % 2) + 1)]
+    )
+    if let Err(e) = credit {
+        return Err(e)
+    }
+    db.commit(&mut tx)
+}
+
+// --- 23505: the caller's decision ------------------------------------
+
+fn classifying_a_constraint_violation(url: &String) -> Result<(), errors::Error> {
+    println!("== a constraint violation is classified, not guessed at")
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+
+    let first = insert_account(&mut db, 10, &"treasury")?
+    println!("  inserted account {}", first)
+
+    // The same name again. The message is localized; the SQLSTATE is not.
+    match db.execute(
+        &"INSERT INTO accounts (id, name, balance) VALUES ($1, $2, 0)"
+        &#[pgsql::int(11), pgsql::text("treasury")]
+    ) {
+        Ok(_) => return Err(errors::new("the duplicate name should have been rejected"))
+        Err(e) => {
+            println!("  rejected with {}", pgsql::sqlstate_of(&e))
+            if !pgsql::unique_violation(&e) {
+                return Err(errors::newf("expected a unique violation, got {}", e))
+            }
+            // Wrapping it in the program's own context keeps the code.
+            let wrapped = errors::wrap(e, "opening the treasury account")
+            println!("  still classified after wrapping: {}", pgsql::unique_violation(&wrapped))
+        }
+    }
+
+    // A foreign key and a not-null are told apart the same way.
+    match db.execute(&"INSERT INTO entries (account_id, amount) VALUES (9999, 1)", &#[]) {
+        Ok(_) => return Err(errors::new("the missing account should have been rejected"))
+        Err(e) => println!("  a missing account is {}", pgsql::sqlstate_of(&e))
+    }
+    match db.execute(&"INSERT INTO accounts (id, name, balance) VALUES (12, NULL, 0)", &#[]) {
+        Ok(_) => return Err(errors::new("the missing name should have been rejected"))
+        Err(e) => println!("  a missing name is {}", pgsql::sqlstate_of(&e))
+    }
+    Ok(())
+}
+
+fn insert_account(
+    db: &mut pgsql::client::Client
+    id: i64
+    name: &String
+) -> Result<i64, errors::Error> {
+    let inserted = db.query_value(
+        &"INSERT INTO accounts (id, name, balance) VALUES ($1, $2, 0) RETURNING id"
+        &#[pgsql::int(id), pgsql::text(name.clone())]
+    )?
+    Ok(inserted.as_int().unwrap_or(-1))
+}
+
+// --- 25P02: contain it with a savepoint ------------------------------
+
+// A statement that fails inside a transaction poisons the block: the server
+// accepts only a rollback after it. A savepoint is what lets the rest of the
+// transaction survive a step that was allowed to fail.
+fn containing_a_failure_with_a_savepoint(url: &String) -> Result<(), errors::Error> {
+    println!("== a savepoint contains a step that was allowed to fail")
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+
+    let mut tx = db.transaction()?
+    let _ = db.execute(&"INSERT INTO entries (account_id, amount) VALUES (1, 5)", &#[])?
+
+    let point = db.savepoint(&mut tx)?
+    match db.execute(&"INSERT INTO entries (account_id, amount) VALUES (9999, 7)", &#[]) {
+        Ok(_) => return Err(errors::new("the bad entry should have been rejected"))
+        Err(e) => println!("  the optional step failed with {}", pgsql::sqlstate_of(&e))
+    }
+    println!("  the block is poisoned: {}", db.in_failed_transaction())
+    db.rollback_to(point)?
+    println!("  and the savepoint revives it: {}", !db.in_failed_transaction())
+
+    let _ = db.execute(&"INSERT INTO entries (account_id, amount) VALUES (2, 9)", &#[])?
+    db.commit(&mut tx)?
+
+    let kept = db.query_value(&"SELECT count(*) FROM entries", &#[])?
+    println!("  {} entries committed, the failed one among none of them", kept.as_int().unwrap_or(-1))
+    Ok(())
+}
+
+// --- a migration under a cached statement -----------------------------
+
+// The driver caches a prepared statement by its SQL text. A migration
+// invalidates the plan the server built for it, which the server reports as
+// 0A000; the driver prepares it again and runs the call, so a deployment
+// does not cost one failed query per connection per statement.
+fn a_migration_under_a_cached_statement(url: &String) -> Result<(), errors::Error> {
+    println!("== a migration under a cached statement is absorbed")
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+
+    let sql = "SELECT * FROM accounts WHERE id = $1"
+    let before = db.query(&sql, &#[pgsql::int(1)])?
+    println!("  before the migration: {} column(s)", before[0].width())
+
+    // Another session runs the migration, as a deployment would.
+    let mut migrator = pgsql::connect(url)?
+    defer migrator.close()
+    migrator.batch_execute(&"ALTER TABLE accounts ADD COLUMN opened_on date DEFAULT current_date")?
+    println!("  a column was added by another session")
+
+    let after = db.query(&sql, &#[pgsql::int(1)])?
+    println!("  after the migration: {} column(s), no error reported", after[0].width())
+    if after[0].width() <= before[0].width() {
+        return Err(errors::new("the widened row should have come back"))
+    }
+    Ok(())
+}
+
+// --- fixture ----------------------------------------------------------
+
+fn setup(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS entries")?
+    db.batch_execute(&"DROP TABLE IF EXISTS accounts")?
+    db.batch_execute(&"""
+    CREATE TABLE accounts (
+        id      bigint PRIMARY KEY,
+        name    text NOT NULL UNIQUE,
+        balance bigint NOT NULL
+    )
+    """)?
+    db.batch_execute(&"""
+    CREATE TABLE entries (
+        id         bigserial PRIMARY KEY,
+        account_id bigint NOT NULL REFERENCES accounts (id),
+        amount     bigint NOT NULL
+    )
+    """)?
+    db.batch_execute(&"""
+    INSERT INTO accounts (id, name, balance) VALUES (1, 'left', 100), (2, 'right', 100)
+    """)
+}
+
+fn teardown(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS entries")?
+    db.batch_execute(&"DROP TABLE IF EXISTS accounts")
+}

@@ -62,3 +62,9 @@ jobs:
 
       - name: Test
         run: gos test .
+
+      # `gos test` runs on the bytecode VM by design, so tier agreement is
+      # not something the suites above can establish. This runs one program
+      # on all three tiers and compares the transcripts byte for byte.
+      - name: Tier parity
+        run: tests/parity/run.sh

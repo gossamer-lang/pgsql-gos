@@ -1,0 +1,296 @@
+// A JSON HTTP service over PostgreSQL.
+//
+// Every request is served in its own goroutine, and a connection cannot
+// cross a goroutine boundary, so a handler cannot capture a pool. What it
+// captures instead is a `Limiter`: a permit crosses safely, and the handler
+// opens and owns its connection for the length of the request. The limiter
+// is what keeps a burst of requests from opening more connections than the
+// server allows.
+//
+// Run it as a server:
+//
+//     GOS_PGSQL_URL='host=/var/run/postgresql dbname=gos_pgsql_test' gos run . 8080
+//
+// Or have it check itself, which is what CI does: it binds a port, issues
+// every request against itself, prints the answers, and shuts down.
+//
+//     gos run . --selftest
+
+use std::http::router
+use std::{env, errors, http, time}
+use pgsql_gos as pgsql
+
+const MAX_CONNECTIONS: i64 = 8
+
+fn main() -> Result<(), errors::Error> {
+    let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
+    let args = env::args()
+    let first = args.first().unwrap_or("")
+
+    setup(&url)?
+    // Validated here so a bad connection string is reported at startup
+    // rather than on the first request.
+    let limiter = pgsql::limit_open(&url, MAX_CONNECTIONS)?
+    let routes = build_routes(limiter)
+
+    if first == "--selftest" {
+        return selftest(routes, &url)
+    }
+    let port = if first == "" { "8080" } else { first }
+    println!("listening on http://127.0.0.1:{} (at most {} connections)", port, MAX_CONNECTIONS)
+    http::serve(&format!("127.0.0.1:{}", port), routes)
+}
+
+// The routing table, built from closures that capture the limiter. Closure
+// capture is the dependency injection here.
+fn build_routes(limiter: pgsql::pool::Limiter) -> router::Router {
+    router::Router::new()
+        .get("/health", |_r| Ok(health(&limiter)))
+        .get("/widgets", |r| Ok(list_widgets(&limiter, &r)))
+        .get("/widgets/{id}", |r| Ok(get_widget(&limiter, r.path_value("id"))))
+        .post("/widgets", |r| Ok(create_widget(&limiter, &r)))
+        .delete("/widgets/{id}", |r| Ok(delete_widget(&limiter, r.path_value("id"))))
+}
+
+// --- handlers -------------------------------------------------------
+//
+// Each handler acquires its connection, uses it, and releases it in one
+// body. A reference is a non-owning view, so it is kept call-scoped rather
+// than threaded through helpers: the handler that borrows the limiter is the
+// one that finishes with it.
+
+fn health(limiter: &pgsql::pool::Limiter) -> http::Response {
+    let Ok(acquired) = limiter.acquire() else {
+        return problem(503, &"no connection available")
+    }
+    let mut db = acquired
+    let version = db.server_version()
+    let outcome = db.ping()
+    limiter.release(db)
+    match outcome {
+        Ok(_) => http::Response::json(200, &("{\"ok\":true,\"server\":" + &quoted(&version) + "}"))
+        Err(e) => problem(503, &format!("database unreachable: {}", e))
+    }
+}
+
+// The rows go out as the JSON the driver renders them as, typed by each
+// column's own OID, so nothing here has to know the column types.
+fn list_widgets(limiter: &pgsql::pool::Limiter, request: &http::Request) -> http::Response {
+    let limit = clamp(query_param(request, "limit").to_i64().unwrap_or(50), 1, 500)
+    let Ok(acquired) = limiter.acquire() else {
+        return problem(503, &"no connection available")
+    }
+    let mut db = acquired
+    let outcome = db.query_json(
+        &"SELECT id, name, grams, tags, created_at FROM widgets ORDER BY id LIMIT $1"
+        &#[pgsql::int(limit)]
+    )
+    limiter.release(db)
+    match outcome {
+        Ok(body) => http::Response::json(200, &body)
+        Err(e) => reported(&e)
+    }
+}
+
+fn get_widget(limiter: &pgsql::pool::Limiter, id: String) -> http::Response {
+    let Some(widget_id) = id.to_i64() else {
+        return problem(400, &"id must be a number")
+    }
+    let Ok(acquired) = limiter.acquire() else {
+        return problem(503, &"no connection available")
+    }
+    let mut db = acquired
+    let outcome = db.query_opt(
+        &"SELECT id, name, grams, tags, created_at FROM widgets WHERE id = $1"
+        &#[pgsql::int(widget_id)]
+    )
+    limiter.release(db)
+    match outcome {
+        Ok(Some(row)) => http::Response::json(200, &pgsql::row_json(&row))
+        Ok(None) => problem(404, &format!("no widget {}", widget_id))
+        Err(e) => reported(&e)
+    }
+}
+
+fn create_widget(limiter: &pgsql::pool::Limiter, request: &http::Request) -> http::Response {
+    // Two form fields rather than a JSON body, to keep the example about the
+    // database rather than about parsing.
+    let name = query_param(request, "name")
+    if name == "" {
+        return problem(400, &"name is required")
+    }
+    let grams = query_param(request, "grams").to_i64().unwrap_or(0)
+    let Ok(acquired) = limiter.acquire() else {
+        return problem(503, &"no connection available")
+    }
+    let mut db = acquired
+    let outcome = db.query_one_json(
+        &"""
+        INSERT INTO widgets (name, grams) VALUES ($1, $2)
+        RETURNING id, name, grams, tags, created_at
+        """
+        &#[pgsql::text(name), pgsql::int(grams)]
+    )
+    limiter.release(db)
+    match outcome {
+        Ok(body) => http::Response::json(201, &body)
+        Err(e) => reported(&e)
+    }
+}
+
+fn delete_widget(limiter: &pgsql::pool::Limiter, id: String) -> http::Response {
+    let Some(widget_id) = id.to_i64() else {
+        return problem(400, &"id must be a number")
+    }
+    let Ok(acquired) = limiter.acquire() else {
+        return problem(503, &"no connection available")
+    }
+    let mut db = acquired
+    let outcome = db.execute(&"DELETE FROM widgets WHERE id = $1", &#[pgsql::int(widget_id)])
+    limiter.release(db)
+    match outcome {
+        Ok(0) => problem(404, &format!("no widget {}", widget_id))
+        Ok(_) => http::Response::text(204, "")
+        Err(e) => reported(&e)
+    }
+}
+
+// The query string arrives as the pairs it was written as, so a repeated key
+// keeps both values; the first is the one a handler means.
+fn query_param(request: &http::Request, key: String) -> String {
+    for (name, value) in request.query_pairs {
+        if name == key {
+            return value
+        }
+    }
+    ""
+}
+
+// --- turning a database failure into a status ------------------------
+
+// The SQLSTATE is what decides the status, because it is stable across
+// server versions and locales where the message is not.
+fn reported(e: &errors::Error) -> http::Response {
+    if pgsql::unique_violation(e) {
+        return problem(409, &"that name is already taken")
+    }
+    if pgsql::not_null_violation(e) || pgsql::in_error_class(e, "22") {
+        return problem(400, &format!("{}", e))
+    }
+    if pgsql::retryable(e) {
+        return problem(503, &"the transaction conflicted, try again")
+    }
+    eprintln!("request failed: {}", e)
+    problem(500, &"internal error")
+}
+
+fn problem(status: i64, detail: &String) -> http::Response {
+    http::Response::json(status, &format!("{{\"error\":{}}}", quoted(detail)))
+}
+
+fn quoted(text: &String) -> String {
+    let mut out = "\""
+    for ch in text {
+        out += match ch {
+            '"' => "\\\""
+            '\\' => "\\\\"
+            '\n' => "\\n"
+            _ => ch.to_string()
+        }
+    }
+    out + "\""
+}
+
+// --- fixture and self-check -------------------------------------------
+
+fn setup(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS widgets")?
+    db.batch_execute(&"""
+    CREATE TABLE widgets (
+        id         bigserial PRIMARY KEY,
+        name       text NOT NULL UNIQUE,
+        grams      bigint NOT NULL DEFAULT 0,
+        tags       text[] NOT NULL DEFAULT '{}',
+        created_at timestamptz NOT NULL DEFAULT now()
+    )
+    """)?
+    db.batch_execute(&"""
+    INSERT INTO widgets (name, grams, tags)
+    VALUES ('sprocket', 120, '{metal,round}'), ('flange', 340, '{metal}')
+    """)
+}
+
+// Binds a port of the operating system's choosing, drives every route
+// against itself, and shuts down. This is what makes the example a test.
+fn selftest(routes: router::Router, url: &String) -> Result<(), errors::Error> {
+    let server = http::Server::new()
+    server.listen("127.0.0.1:0")?
+    let base = format!("http://{}", server.addr())
+    println!("self-test against {}", base)
+
+    go server.serve(routes)
+    // The listener is already bound, so this only waits for the accept loop.
+    time::sleep(time::Duration::from_millis(200))
+
+    let mut failures = 0
+    failures += expect("GET /widgets", 200, get(&format!("{}/widgets", base)))
+    failures += expect("GET /health", 200, get(&format!("{}/health", base)))
+    failures += expect("GET /widgets/1", 200, get(&format!("{}/widgets/1", base)))
+    failures += expect("GET /widgets/9999", 404, get(&format!("{}/widgets/9999", base)))
+    failures += expect("GET /widgets/abc", 400, get(&format!("{}/widgets/abc", base)))
+    failures += expect("POST /widgets", 201, post(&format!("{}/widgets?name=gasket&grams=55", base)))
+    // The unique constraint is what turns into a 409.
+    failures += expect("POST duplicate", 409, post(&format!("{}/widgets?name=gasket", base)))
+    failures += expect("POST no name", 400, post(&format!("{}/widgets", base)))
+    failures += expect("DELETE /widgets/1", 204, delete(&format!("{}/widgets/1", base)))
+    failures += expect("DELETE again", 404, delete(&format!("{}/widgets/1", base)))
+
+    let _ = server.shutdown(2_000)
+    teardown(url)?
+    if failures > 0 {
+        return Err(errors::newf("{} route(s) answered with the wrong status", failures))
+    }
+    println!("every route answered as expected")
+    Ok(())
+}
+
+fn get(target: &String) -> Result<http::Response, errors::Error> {
+    let no_headers: Vec<(String, String)> = #[]
+    http::get(target, no_headers)
+}
+
+fn post(target: &String) -> Result<http::Response, errors::Error> {
+    http::post(target, "", "application/x-www-form-urlencoded")
+}
+
+fn delete(target: &String) -> Result<http::Response, errors::Error> {
+    let no_headers: Vec<(String, String)> = #[]
+    http::delete(target, "", no_headers)
+}
+
+fn expect(label: String, want: i64, outcome: Result<http::Response, errors::Error>) -> i64 {
+    match outcome {
+        Ok(response) => {
+            let got = response.status
+            let body = if response.body.byte_len() > 96 {
+                response.body.substring(0, 96) + "..."
+            } else {
+                response.body.clone()
+            }
+            println!("  {:20} {} (want {}) {}", label, got, want, body)
+            if got == want { 0 } else { 1 }
+        }
+        Err(e) => {
+            println!("  {:20} request failed: {}", label, e)
+            1
+        }
+    }
+}
+
+fn teardown(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS widgets")
+}

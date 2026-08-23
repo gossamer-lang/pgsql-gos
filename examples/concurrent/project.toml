@@ -1,5 +1,5 @@
 [project]
-id = "example.com/pgsql-gos-crud"
+id = "example.com/pgsql-gos-concurrent"
 version = "0.1.0"
 gossamer-version = "^v0.55.3"
 

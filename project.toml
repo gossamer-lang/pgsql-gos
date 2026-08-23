@@ -1,7 +1,7 @@
 [project]
 id      = "github.com/danpozmanter/pgsql-gos"
 version = "0.1.0"
-gossamer-version = "v0.52.1"
+gossamer-version = "^v0.55.3"
 authors = ["Dan Pozmanter"]
 license = "Apache 2.0"
 

@@ -1,0 +1,151 @@
+// A work queue built on LISTEN / NOTIFY.
+//
+// A worker sleeps on the channel rather than polling the table, and wakes
+// when a producer commits a job and announces it. The producer and the
+// worker each own their own connection, because a connection cannot cross a
+// goroutine boundary.
+//
+// The pattern the example is really about: NOTIFY is a wake-up, not a
+// delivery. The payload says something happened; the worker still reads the
+// table, because a notification can be coalesced, and because a worker that
+// starts late has to find the jobs it missed.
+//
+//     GOS_PGSQL_URL='host=/var/run/postgresql dbname=gos_pgsql_test' gos run .
+
+use std::sync::channel_unbounded
+use std::{env, errors, time}
+use pgsql_gos as pgsql
+
+const CHANNEL: String = "jobs_ready"
+const JOBS: i64 = 20
+const IDLE_TIMEOUT_MS: i64 = 2_000
+
+fn main() -> Result<(), errors::Error> {
+    let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
+    setup(&url)?
+
+    let (done, finished) = channel_unbounded()
+    cohort {
+        spawn(|| {
+            match worker(&url) {
+                Ok(count) => done.send(count)
+                Err(e) => {
+                    eprintln!("worker failed: {}", e)
+                    done.send(-1)
+                }
+            }
+        })
+        spawn(|| {
+            match producer(&url) {
+                Ok(_) => ()
+                Err(e) => eprintln!("producer failed: {}", e)
+            }
+        })
+    }?
+    done.close()
+
+    let handled = finished.recv().unwrap_or(-1)
+    println!("worker handled {} of {} jobs", handled, JOBS)
+    teardown(&url)?
+    if handled != JOBS {
+        return Err(errors::newf("expected {} jobs handled, got {}", JOBS, handled))
+    }
+    Ok(())
+}
+
+// Commits a job, then announces it. The order matters: a worker woken before
+// the commit would look and find nothing.
+fn producer(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    for n in 0..JOBS {
+        let mut tx = db.transaction()?
+        let _ = db.execute(
+            &"INSERT INTO jobs (payload) VALUES ($1)"
+            &#[pgsql::text(format!("job-{}", n))]
+        )?
+        db.commit(&mut tx)?
+        db.notify(CHANNEL, &format!("{}", n))?
+        time::sleep(time::Duration::from_millis(10))
+    }
+    println!("producer queued {} jobs", JOBS)
+    Ok(())
+}
+
+// Waits on the channel and drains the table whenever it wakes. Stops when
+// nothing has arrived for `IDLE_TIMEOUT_MS`, which stands in for whatever
+// shutdown signal a real worker would take.
+fn worker(url: &String) -> Result<i64, errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.listen(CHANNEL)?
+
+    let mut handled = 0
+    let mut wakeups = 0
+    loop {
+        // Whatever the notification said, the table is the source of truth.
+        handled += claim_ready(&mut db)?
+        if handled >= JOBS {
+            break
+        }
+        match db.poll_notification(IDLE_TIMEOUT_MS)? {
+            Some(n) => {
+                wakeups += 1
+                // Everything else already queued is taken in the same pass,
+                // so a burst costs one drain rather than one per job.
+                while db.take_notification().is_some() {
+                    ()
+                }
+                if wakeups <= 3 {
+                    println!("  woken by {} on {} (pid {})", n.payload, n.channel, n.pid)
+                }
+            }
+            None => {
+                println!("  nothing for {} ms, stopping", IDLE_TIMEOUT_MS)
+                break
+            }
+        }
+    }
+    db.unlisten(CHANNEL)?
+    println!("worker woke {} time(s) for {} job(s)", wakeups, handled)
+    Ok(handled)
+}
+
+// Claims whatever is ready in one statement, so two workers on the same
+// queue could not hand the same job to both.
+fn claim_ready(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
+    let claimed = db.query(
+        &"""
+        UPDATE jobs SET state = 'done', done_at = now()
+        WHERE id IN (
+            SELECT id FROM jobs WHERE state = 'ready'
+            ORDER BY id FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, payload
+        """
+        &#[]
+    )?
+    Ok(claimed.len())
+}
+
+fn setup(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    db.batch_execute(&"DROP TABLE IF EXISTS jobs")?
+    db.batch_execute(&"""
+    CREATE TABLE jobs (
+        id      bigserial PRIMARY KEY,
+        payload text NOT NULL,
+        state   text NOT NULL DEFAULT 'ready',
+        done_at timestamptz
+    )
+    """)
+}
+
+fn teardown(url: &String) -> Result<(), errors::Error> {
+    let mut db = pgsql::connect(url)?
+    defer db.close()
+    let left = db.query_value(&"SELECT count(*) FROM jobs WHERE state = 'ready'", &#[])?
+    println!("jobs still ready at the end: {}", left.as_int().unwrap_or(-1))
+    db.batch_execute(&"DROP TABLE IF EXISTS jobs")
+}

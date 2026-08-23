@@ -1,0 +1,146 @@
+// Reading a result too large to hold, three ways.
+//
+// Each of these walks a quarter of a million rows while holding a bounded
+// amount of memory. The point of the example is that none of them ever has
+// the whole result in hand:
+//
+//   - a row stream, pulled one row at a time;
+//   - a server-side portal, fetched in batches inside a transaction;
+//   - COPY out, read a line at a time.
+//
+//     GOS_PGSQL_URL='host=/var/run/postgresql dbname=gos_pgsql_test' gos run .
+
+use std::{env, errors, time}
+use pgsql_gos as pgsql
+
+const ROWS: i64 = 250_000
+const BATCH: i64 = 5_000
+
+fn main() -> Result<(), errors::Error> {
+    let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
+    let mut db = pgsql::connect(&url)?
+    defer db.close()
+
+    setup(&mut db)?
+
+    let by_stream = by_row_stream(&mut db)?
+    let by_batch = by_portal(&mut db)?
+    let by_copy = by_copy_out(&mut db)?
+
+    println!("")
+    println!("all three read the same {} rows: {}", ROWS, by_stream == by_batch && by_batch == by_copy)
+    println!("checksum {}", by_stream)
+
+    abandoning_a_read_leaves_the_connection_usable(&mut db)?
+    db.batch_execute(&"DROP TABLE IF EXISTS readings")?
+    Ok(())
+}
+
+// A row stream hands over one row at a time and holds nothing else. Reaching
+// the end leaves the connection ready with no further call.
+fn by_row_stream(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
+    let started = time::now_ms()
+    let mut stream = db.query_raw(&"SELECT id, celsius FROM readings ORDER BY id", &#[])?
+    let mut checksum = 0
+    let mut seen = 0
+    loop {
+        match db.next_row(&mut stream)? {
+            Some(row) => {
+                checksum += row.i64_at(0)?
+                seen += 1
+            }
+            None => break
+        }
+    }
+    report("row stream ", seen, checksum, started)
+    Ok(checksum)
+}
+
+// A portal lives inside a transaction and hands over a batch per round trip,
+// which is the shape to reach for when the work per row is small enough that
+// a round trip per row would dominate.
+fn by_portal(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
+    let started = time::now_ms()
+    let mut tx = db.transaction()?
+    let mut portal = db.open_portal(&"SELECT id, celsius FROM readings ORDER BY id", &#[])?
+    let mut checksum = 0
+    let mut seen = 0
+    let mut batches = 0
+    loop {
+        let batch = db.fetch(&mut portal, BATCH)?
+        if batch.len() == 0 {
+            break
+        }
+        batches += 1
+        for row in batch {
+            checksum += row.i64_at(0)?
+            seen += 1
+        }
+    }
+    db.commit(&mut tx)?
+    report("portal     ", seen, checksum, started)
+    println!("             {} batches of at most {}", batches, BATCH)
+    Ok(checksum)
+}
+
+// COPY out is the fastest way to get many rows off the server, and reads a
+// line at a time so the payload never has to fit in memory either.
+fn by_copy_out(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
+    let started = time::now_ms()
+    let mut copy = db.copy_out_begin(&"COPY (SELECT id, celsius FROM readings ORDER BY id) TO STDOUT")?
+    let mut checksum = 0
+    let mut seen = 0
+    while let Some(line) = db.copy_out_line(&mut copy)? {
+        // A COPY text line is tab-separated, and this result's first column
+        // is the id.
+        let Some((id, _)) = line.split_once("\t") else { continue }
+        checksum += id.to_i64().unwrap_or(0)
+        seen += 1
+    }
+    report("copy out   ", seen, checksum, started)
+    println!("             {} bytes received", copy.bytes_received())
+    Ok(checksum)
+}
+
+// A read given up part way leaves the connection ready for the next
+// exchange, whichever of the three shapes it was.
+fn abandoning_a_read_leaves_the_connection_usable(
+    db: &mut pgsql::client::Client
+) -> Result<(), errors::Error> {
+    println!("")
+    let mut stream = db.query_raw(&"SELECT id FROM readings ORDER BY id", &#[])?
+    let _ = db.next_row(&mut stream)?
+    db.close_stream(&mut stream)?
+    db.ping()?
+
+    let mut copy = db.copy_out_begin(&"COPY readings TO STDOUT")?
+    let _ = db.copy_out_next(&mut copy)?
+    db.copy_out_end(&mut copy)?
+    db.ping()?
+
+    println!("a stream and a COPY both abandoned part way: the connection still works")
+    Ok(())
+}
+
+fn report(label: String, seen: i64, checksum: i64, started: i64) {
+    let elapsed = max(time::now_ms() - started, 1)
+    println!(
+        "{} {} rows in {} ms ({} rows/s), checksum {}"
+        label
+        seen
+        elapsed
+        seen * 1_000 / elapsed
+        checksum
+    )
+}
+
+fn setup(db: &mut pgsql::client::Client) -> Result<(), errors::Error> {
+    println!("loading {} rows", ROWS)
+    db.batch_execute(&"DROP TABLE IF EXISTS readings")?
+    db.batch_execute(&"CREATE TABLE readings (id bigint PRIMARY KEY, celsius numeric(6,2))")?
+    db.batch_execute(&format!(
+        "INSERT INTO readings SELECT i, (i % 4000) / 100.0 FROM generate_series(1, {}) i"
+        ROWS
+    ))?
+    Ok(())
+}

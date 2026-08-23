@@ -118,22 +118,46 @@ impl DbError {
     }
 
     // The report as an `errors::Error`, so a caller propagates it with `?`.
+    //
+    // The SQLSTATE rides along as a field as well as in the rendered text,
+    // so classifying a failure reads the code the server sent rather than
+    // re-parsing a message that a caller may have wrapped or a locale may
+    // have translated.
     pub fn as_error(&self) -> errors::Error {
-        errors::new(self.render())
+        let reported = errors::new(self.render())
+        if self.code == "" {
+            return reported
+        }
+        reported.with_field(SQLSTATE_FIELD, self.code.clone())
     }
 }
 
+// The field an `errors::Error` carries its SQLSTATE under.
+pub const SQLSTATE_FIELD: String = "sqlstate"
+
 // The SQLSTATE of a driver error, or `""` when the failure did not come from
-// the server. Every server error is reported as `[SQLSTATE] message`, which
-// is what this reads back.
+// the server.
+//
+// A server error carries its code as a field, and wrapping one keeps that
+// link in the chain, so a failure classified several layers above the call
+// still reads the code the server sent. An error built from the rendered
+// `[SQLSTATE] message` text alone is read back from that text.
 pub fn sqlstate_of(e: &errors::Error) -> String {
-    let text = format!("{}", e)
-    if !text.starts_with("[") {
-        return ""
+    for link in e.chain() {
+        if let Some(code) = link.field(SQLSTATE_FIELD) {
+            return code
+        }
+        let text = link.message()
+        if !text.starts_with("[") {
+            continue
+        }
+        let Some(end) = text.find("]") else { continue }
+        let code = text.substring(1, end)
+        if code.byte_len() == 5 {
+            return code
+        }
     }
-    let Some(end) = text.find("]") else { return "" }
-    let code = text.substring(1, end)
-    if code.byte_len() == 5 { code } else { "" }
+    ""
 }
 
 // Parses an ErrorResponse / NoticeResponse body: a sequence of
@@ -204,7 +228,7 @@ fn to_int(text: &String) -> i64 {
 
 #[cfg(test)]
 mod dberror_tests {
-    use std::testing
+    use std::{errors, testing}
 
     fn sample() -> Vec<u8> {
         let mut b: Vec<u8> = #[]
@@ -255,6 +279,79 @@ mod dberror_tests {
         let text = super::parse(&sample()).render()
         let _ = testing::check(text.starts_with("[23505]"), &format!("rendered: {}", text))
         let _ = testing::check(text.contains("already exists"), "detail included")
+    }
+
+    #[test]
+    fn each_classification_answers_for_its_own_sqlstate_alone() {
+        let cases: Vec<(String, bool, bool, bool, bool)> = #[
+            // code, unique, foreign key, not null, retryable
+            ("23505", true, false, false, false)
+            ("23503", false, true, false, false)
+            ("23502", false, false, true, false)
+            ("40001", false, false, false, true)
+            ("40P01", false, false, false, true)
+            ("42601", false, false, false, false)
+            ("", false, false, false, false)
+        ]
+        for (code, unique, foreign, not_null, retryable) in cases {
+            let mut e = super::DbError::blank()
+            e.code = code.clone()
+            let _ = testing::check_eq(&e.is_unique_violation(), &unique, &format!("{} unique", code))
+            let _ = testing::check_eq(&e.is_foreign_key_violation(), &foreign, &format!("{} fk", code))
+            let _ = testing::check_eq(&e.is_not_null_violation(), &not_null, &format!("{} not null", code))
+            let _ = testing::check_eq(&e.is_retryable(), &retryable, &format!("{} retryable", code))
+        }
+    }
+
+    #[test]
+    fn severity_rather_than_the_sqlstate_decides_whether_a_report_is_fatal() {
+        // The server sends severity unlocalized from 9.6 on, and that is the
+        // field that says the session is over rather than the statement.
+        for severity in #["FATAL", "PANIC"] {
+            let mut e = super::DbError::blank()
+            e.severity_unlocalized = severity
+            e.code = "42601"
+            let _ = testing::check(e.is_fatal(), &format!("{} ends the session", severity))
+        }
+        for severity in #["ERROR", "WARNING", "NOTICE", ""] {
+            let mut e = super::DbError::blank()
+            e.severity_unlocalized = severity
+            e.code = "57P01"
+            let _ = testing::check(!e.is_fatal(), &format!("{} does not", severity))
+        }
+    }
+
+    #[test]
+    fn a_class_is_the_first_two_characters_and_nothing_looser() {
+        let mut e = super::DbError::blank()
+        e.code = "23505"
+        let _ = testing::check(e.in_class(&"23"), "its own class")
+        let _ = testing::check(e.in_class(&"235"), "a longer prefix still matches")
+        let _ = testing::check(!e.in_class(&"22"), "a neighbouring class does not")
+        let _ = testing::check(!e.in_class(&"505"), "the class is a prefix, not a substring")
+    }
+
+    #[test]
+    fn as_error_carries_the_sqlstate_where_a_wrap_cannot_lose_it() {
+        let reported = super::parse(&sample()).as_error()
+        let _ = testing::check_eq(&super::sqlstate_of(&reported), &"23505", "read straight back")
+        let wrapped = errors::wrap(errors::wrap(reported, "inner"), "outer")
+        let _ = testing::check_eq(&super::sqlstate_of(&wrapped), &"23505", "through two wraps")
+        let _ = testing::check(
+            format!("{}", wrapped).starts_with("outer: inner: [23505]")
+            &format!("the text still reads as a chain: {}", wrapped)
+        )
+    }
+
+    #[test]
+    fn a_report_with_no_sqlstate_carries_no_field_to_classify_by() {
+        let blank = super::DbError::blank().as_error()
+        let _ = testing::check_eq(&super::sqlstate_of(&blank), &"", "nothing to read")
+        let plain = errors::new("connecting to 127.0.0.1:5432: refused")
+        let _ = testing::check_eq(&super::sqlstate_of(&plain), &"", "a local failure has none")
+        // A bracketed run that is not five characters is not a SQLSTATE.
+        let _ = testing::check_eq(&super::sqlstate_of(&errors::new("[23] short")), &"", "too short")
+        let _ = testing::check_eq(&super::sqlstate_of(&errors::new("[234567] long")), &"", "too long")
     }
 
     #[test]

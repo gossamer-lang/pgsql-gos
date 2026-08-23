@@ -88,10 +88,17 @@ pub fn i64_at(b: &Vec<u8>, off: i64) -> i64 {
 }
 
 // Bytes `[start, end)`, clamped to the slice.
+//
+// The clamp puts the bounds inside `0 <= lo <= hi <= len`, which is exactly
+// the range `Vec::slice` accepts, so it copies the run in one step rather
+// than walking to `lo` first. Framing a message out of the inbox is on the
+// per-message path, so that walk would cost the buffer's length per message.
 pub fn slice(b: &Vec<u8>, start: i64, end: i64) -> Vec<u8> {
-    let lo = max(start, 0)
-    let hi = min(end, b.len())
-    b.iter().skip(lo).take(max(hi - lo, 0)).collect()
+    let lo = min(max(start, 0), b.len())
+    let hi = min(max(end, lo), b.len())
+    // The bounds are clamped to the length and ordered, which is the whole
+    // of `Vec::slice`'s contract.
+    b.slice(lo, hi).unwrap()
 }
 
 // The NUL-terminated string starting at `off`, and the offset just past
@@ -196,6 +203,83 @@ mod buf_tests {
             Ok(back) => { let _ = testing::check_eq(&back.len(), &4, "decoded length") }
             Err(e) => { let _ = testing::check(false, &format!("decode failed: {}", e)) }
         }
+    }
+
+    #[test]
+    fn the_unsigned_readers_widen_rather_than_sign_extend() {
+        let b: Vec<u8> = #[255, 255, 255, 255]
+        let _ = testing::check_eq(&super::u8_at(&b, 0), &255, "a byte is never negative")
+        let _ = testing::check_eq(&super::u16_at(&b, 0), &65_535, "u16 tops out at 65535")
+        let _ = testing::check_eq(&super::u32_at(&b, 0), &4_294_967_295, "u32 tops out at 4294967295")
+        let _ = testing::check_eq(&super::i32_at(&b, 0), &-1, "the signed reading of the same bytes")
+    }
+
+    #[test]
+    fn a_read_past_the_end_answers_zero_rather_than_panicking() {
+        // A truncated message must report as a short value, not end the
+        // program: the length prefix comes from the server.
+        let b: Vec<u8> = #[1, 2]
+        let _ = testing::check_eq(&super::u8_at(&b, 5), &0, "past the end")
+        let _ = testing::check_eq(&super::u8_at(&b, -1), &0, "before the start")
+        let _ = testing::check_eq(&super::i32_at(&b, 0), &16_908_288, "a short int32 zero-fills")
+        let _ = testing::check_eq(&super::i64_at(&b, 0), &72_620_543_991_349_248, "so does a short int64")
+    }
+
+    #[test]
+    fn put_i64_round_trips_through_i64_at_at_the_extremes() {
+        for value in #[0, 1, -1, 9_223_372_036_854_775_807, -9_223_372_036_854_775_808, -4_294_967_296] {
+            let mut b: Vec<u8> = #[]
+            super::put_i64(&mut b, value)
+            let _ = testing::check_eq(&b.len(), &8, "eight bytes")
+            let _ = testing::check_eq(&super::i64_at(&b, 0), &value, &format!("round trip {}", value))
+        }
+    }
+
+    #[test]
+    fn put_bytes_and_put_str_append_without_a_terminator() {
+        let mut b: Vec<u8> = #[]
+        super::put_str(&mut b, &"ab")
+        super::put_bytes(&mut b, &#[0, 1])
+        super::put_str(&mut b, &"cd")
+        let _ = testing::check_eq(&b.len(), &6, "nothing extra is added")
+        let _ = testing::check_eq(&super::u8_at(&b, 2), &0, "an embedded zero survives")
+        let _ = testing::check_eq(&super::u8_at(&b, 4), &99, "the run continues past it")
+    }
+
+    #[test]
+    fn utf8_lossy_keeps_valid_text_and_replaces_what_is_not() {
+        let _ = testing::check_eq(
+            &super::utf8_lossy(&"h\u{e9}llo \u{65e5}\u{672c}".as_bytes())
+            &"h\u{e9}llo \u{65e5}\u{672c}"
+            "valid UTF-8 is unchanged"
+        )
+        // 0xC3 opens a two-byte sequence that never arrives.
+        let broken: Vec<u8> = #[104, 105, 195]
+        let read = super::utf8_lossy(&broken)
+        let _ = testing::check(read.starts_with("hi"), &format!("the ASCII survives: {}", read))
+        let _ = testing::check_eq(&super::utf8_lossy(&#[]), &"", "empty stays empty")
+    }
+
+    #[test]
+    fn from_hex_reports_what_it_cannot_read() {
+        let _ = testing::check(super::from_hex(&"abc").is_err(), "an odd digit count")
+        let _ = testing::check(super::from_hex(&"zz").is_err(), "a non-hex digit")
+        let _ = testing::check_eq(&super::from_hex(&"").unwrap_or(#[1]).len(), &0, "empty is empty")
+        match super::from_hex(&"DEADbeef") {
+            Ok(data) => {
+                let _ = testing::check_eq(&data.len(), &4, "four bytes")
+                let _ = testing::check_eq(&super::to_hex(&data), &"deadbeef", "either case reads")
+            }
+            Err(e) => { let _ = testing::check(false, &format!("decode failed: {}", e)) }
+        }
+    }
+
+    #[test]
+    fn a_cstring_that_never_terminates_stops_at_the_end() {
+        let b: Vec<u8> = #[104, 105]
+        let (text, next) = super::cstr_at(&b, 0)
+        let _ = testing::check_eq(&text, &"hi", "what there was of it")
+        let _ = testing::check_eq(&next, &3, "the offset moves past the missing terminator")
     }
 
     #[test]

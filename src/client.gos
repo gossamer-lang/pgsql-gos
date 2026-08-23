@@ -8,13 +8,28 @@
 
 use std::errors
 
-use crate::{buf, config, conn, dberror, value}
+use crate::{buf, config, conn, dberror, rowmap, value}
+
+// How much COPY payload to gather before handing a chunk to the server.
+// Large enough that the per-message overhead disappears, small enough that
+// a bulk load never has to be held in memory at once.
+const COPY_BATCH_BYTES: i64 = 65_536
+
+// How many prepared statements a client keeps by default. A statement the
+// cache drops is deallocated on the server, so the count also bounds what
+// the session holds there.
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: i64 = 256
 
 // A client and its connection.
 pub struct Client {
     pub (package) pg: conn::PgConn
     // Prepared statements already parsed on the server, keyed by SQL text.
     pub (package) cache: Map<String, conn::Statement>
+    // Cached SQL text in least-recently-used order, so a full cache knows
+    // which statement to drop.
+    pub (package) recency: Vec<String>
+    // How many statements the cache holds before evicting.
+    pub (package) capacity: i64
     // Whether `query` and friends consult the cache.
     pub (package) caching: bool
     // Result format for queries that do not name one.
@@ -33,6 +48,8 @@ pub fn connect_with(cfg: &config::Config) -> Result<Client, errors::Error> {
     Ok(Client {
         pg: pg
         cache: Map::new()
+        recency: #[]
+        capacity: DEFAULT_STATEMENT_CACHE_CAPACITY
         caching: true
         result_format: value::FORMAT_TEXT
     })
@@ -61,6 +78,19 @@ impl Client {
         self.pg.in_transaction()
     }
 
+    // True when a statement has failed inside the open transaction, so the
+    // server will accept only a rollback. This is what a retry loop asks
+    // before deciding whether the block can still be used.
+    pub fn in_failed_transaction(&self) -> bool {
+        self.pg.in_failed_transaction()
+    }
+
+    // The host this connection reached, which for a multi-host configuration
+    // is whichever one answered.
+    pub fn host_addr(&self) -> config::HostAddr {
+        self.pg.host_addr()
+    }
+
     // True when the connection is unusable.
     pub fn is_closed(&self) -> bool {
         self.pg.is_closed()
@@ -69,6 +99,11 @@ impl Client {
     // True when the session is running over TLS.
     pub fn is_tls(&self) -> bool {
         self.pg.is_tls()
+    }
+
+    // How long the connection has been open, in milliseconds.
+    pub fn age_ms(&self) -> i64 {
+        self.pg.age_ms()
     }
 
     // Notices the server reported since the last call.
@@ -82,14 +117,60 @@ impl Client {
         Ok(())
     }
 
+    // Puts the session back to what a freshly opened one is: the run-time
+    // parameters at their startup values, cursors closed, LISTEN
+    // registrations dropped, and temporary tables and sequence state gone.
+    //
+    // This is what a connection handed on to unrelated work needs, and it is
+    // `DISCARD ALL` less the `DEALLOCATE ALL` in it: the prepared statements
+    // this client holds are named by it alone and are what the statement
+    // cache is, so dropping them on the server would leave the cache naming
+    // statements that no longer exist.
+    pub fn reset_session(&mut self) -> Result<(), errors::Error> {
+        self.pg.batch_execute(&"RESET ALL; CLOSE ALL; UNLISTEN *; DISCARD TEMP; DISCARD SEQUENCES")
+    }
+
     // Turns the prepared-statement cache on or off. With it off, every
     // parameterized call prepares and drops its statement, which is what a
     // session behind a statement-rewriting proxy needs.
     pub fn set_statement_cache(&mut self, enabled: bool) {
         self.caching = enabled
         if !enabled {
-            self.cache = Map::new()
+            self.clear_statement_cache()
         }
+    }
+
+    // Sets how many prepared statements the cache holds. Reaching the limit
+    // drops the least recently used statement and deallocates it on the
+    // server, so a program generating unbounded SQL text keeps a bounded
+    // number of plans on both sides.
+    //
+    // A capacity of zero or less holds nothing, which is what turning the
+    // cache off does.
+    pub fn set_statement_cache_capacity(&mut self, capacity: i64) {
+        self.capacity = capacity
+        self.evict_to_capacity()
+    }
+
+    // How many prepared statements the cache holds.
+    pub fn statement_cache_len(&self) -> i64 {
+        self.cache.len()
+    }
+
+    // How many the cache holds before evicting.
+    pub fn statement_cache_capacity(&self) -> i64 {
+        self.capacity
+    }
+
+    // Drops every cached statement, deallocating each on the server.
+    pub fn clear_statement_cache(&mut self) {
+        for sql in self.recency.clone() {
+            if let Some(statement) = self.cache.get(&sql) {
+                let _ = self.pg.close_statement(&statement)
+            }
+        }
+        self.cache = Map::new()
+        self.recency = #[]
     }
 
     // Sets the wire format results arrive in: `value::FORMAT_TEXT` (the
@@ -101,6 +182,7 @@ impl Client {
     // Sends Terminate and closes the socket.
     pub fn close(&mut self) {
         self.cache = Map::new()
+        self.recency = #[]
         self.pg.close()
     }
 
@@ -131,23 +213,59 @@ impl Client {
             }
         }
         for sql in stale {
-            let _ = Map::pop(&mut self.cache, sql)
+            self.forget(&sql)
         }
         self.pg.close_statement(statement)
     }
 
     // The cached statement for `sql`, preparing it on first use.
     fn statement_for(&mut self, sql: &String) -> Result<conn::Statement, errors::Error> {
-        if !self.caching {
+        if !self.caching || self.capacity <= 0 {
             return self.pg.prepare(sql, &#[])
         }
         match self.cache.get(sql) {
-            Some(cached) => Ok(cached)
+            Some(cached) => {
+                self.touch(sql)
+                Ok(cached)
+            }
             None => {
                 let prepared = self.pg.prepare(sql, &#[])?
                 let _ = self.cache.insert(sql.clone(), prepared.clone())
+                self.recency.push(sql.clone())
+                self.evict_to_capacity()
                 Ok(prepared)
             }
+        }
+    }
+
+    // Moves `sql` to the most-recently-used end, so eviction reaches the
+    // statements a caller has stopped running.
+    fn touch(&mut self, sql: &String) {
+        let wanted = sql.clone()
+        if let Some(position) = self.recency.position(|held| held == wanted) {
+            let _ = self.recency.remove(position)
+            self.recency.push(wanted)
+        }
+    }
+
+    // Drops least-recently-used statements until the cache fits, closing
+    // each on the server so its plan is released there too.
+    fn evict_to_capacity(&mut self) {
+        while self.cache.len() > max(self.capacity, 0) && !self.recency.is_empty() {
+            let Ok(sql) = self.recency.remove(0) else { break }
+            if let Some(statement) = Map::pop(&mut self.cache, sql) {
+                let _ = self.pg.close_statement(&statement)
+            }
+        }
+    }
+
+    // Forgets a cached statement without closing it on the server, for one
+    // the server has already dropped or the caller is closing itself.
+    fn forget(&mut self, sql: &String) {
+        let wanted = sql.clone()
+        let _ = Map::pop(&mut self.cache, wanted.clone())
+        if let Some(position) = self.recency.position(|held| held == wanted) {
+            let _ = self.recency.remove(position)
         }
     }
 
@@ -160,9 +278,17 @@ impl Client {
         params: &Vec<value::Value>
     ) -> Result<i64, errors::Error> {
         let statement = self.statement_for(sql)?
-        let outcome = self.pg.execute(&statement, params)
-        self.forget_if_failed(sql, &outcome)
-        outcome
+        match self.pg.execute(&statement, params) {
+            Ok(affected) => Ok(affected)
+            Err(e) => {
+                if !self.can_reprepare(&e) {
+                    return Err(e)
+                }
+                self.forget(sql)
+                let fresh = self.statement_for(sql)?
+                self.pg.execute(&fresh, params)
+            }
+        }
     }
 
     // Runs a prepared statement for its effect.
@@ -211,9 +337,17 @@ impl Client {
     ) -> Result<conn::RowStream, errors::Error> {
         let statement = self.statement_for(sql)?
         let format = self.result_format
-        let outcome = self.pg.query(&statement, params, format)
-        self.forget_if_failed(sql, &outcome)
-        outcome
+        match self.pg.query(&statement, params, format) {
+            Ok(stream) => Ok(stream)
+            Err(e) => {
+                if !self.can_reprepare(&e) {
+                    return Err(e)
+                }
+                self.forget(sql)
+                let fresh = self.statement_for(sql)?
+                self.pg.query(&fresh, params, format)
+            }
+        }
     }
 
     // The next row of an open stream, or `None` at the end.
@@ -278,7 +412,17 @@ impl Client {
     ) -> Result<conn::Portal, errors::Error> {
         let statement = self.statement_for(sql)?
         let format = self.result_format
-        self.pg.open_portal(&statement, params, format)
+        match self.pg.open_portal(&statement, params, format) {
+            Ok(portal) => Ok(portal)
+            Err(e) => {
+                if !self.can_reprepare(&e) {
+                    return Err(e)
+                }
+                self.forget(sql)
+                let fresh = self.statement_for(sql)?
+                self.pg.open_portal(&fresh, params, format)
+            }
+        }
     }
 
     // Fetches up to `batch_size` rows from a portal.
@@ -306,7 +450,45 @@ impl Client {
         for text in sql {
             statements.push(self.statement_for(&text)?)
         }
-        self.pg.pipeline(&statements, params)
+        match self.pg.pipeline(&statements, params) {
+            Ok(counts) => Ok(counts)
+            Err(e) => {
+                if !self.can_reprepare(&e) {
+                    return Err(e)
+                }
+                // The batch carries one Sync, so its failure rolled back
+                // every statement in it; which one went stale is not
+                // reported, so all of them are prepared again.
+                let mut fresh: Vec<conn::Statement> = #[]
+                for text in sql {
+                    self.forget(&text)
+                    fresh.push(self.statement_for(&text)?)
+                }
+                self.pg.pipeline(&fresh, params)
+            }
+        }
+    }
+
+    // --- results as JSON --------------------------------------------
+
+    // Runs `sql` and answers its rows as a JSON array of objects, keyed by
+    // column name and typed by each column's own OID.
+    pub fn query_json(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<String, errors::Error> {
+        Ok(rowmap::rows_json(&self.query(sql, params)?))
+    }
+
+    // Runs `sql` and answers its one row as a JSON object, reporting a
+    // result that does not hold exactly one.
+    pub fn query_one_json(
+        &mut self
+        sql: &String
+        params: &Vec<value::Value>
+    ) -> Result<String, errors::Error> {
+        Ok(rowmap::row_json(&self.query_one(sql, params)?))
     }
 
     // --- transactions -----------------------------------------------
@@ -366,7 +548,58 @@ impl Client {
 
     // --- COPY -------------------------------------------------------
 
-    // Streams `data` into the server with `COPY ... FROM STDIN`.
+    // Starts a `COPY ... FROM STDIN` that takes its payload a chunk at a
+    // time, so a bulk load never has to be held in memory at once.
+    //
+    //     let mut copy = db.copy_in_begin(&"COPY people FROM STDIN")?
+    //     for batch in batches {
+    //         db.copy_in_write(&mut copy, &batch)?
+    //     }
+    //     let rows = db.copy_in_end(&mut copy)?
+    pub fn copy_in_begin(&mut self, sql: &String) -> Result<conn::CopyIn, errors::Error> {
+        self.pg.copy_in_begin(sql)
+    }
+
+    // Writes one chunk of an open COPY FROM STDIN.
+    pub fn copy_in_write(
+        &mut self
+        copy: &mut conn::CopyIn
+        data: &Vec<u8>
+    ) -> Result<(), errors::Error> {
+        self.pg.copy_in_write(copy, data)
+    }
+
+    // Writes rows to an open COPY FROM STDIN in the default text format,
+    // one line per row.
+    pub fn copy_in_write_rows(
+        &mut self
+        copy: &mut conn::CopyIn
+        rows: &Vec<Vec<value::Value>>
+    ) -> Result<(), errors::Error> {
+        let mut data: Vec<u8> = #[]
+        for row in rows {
+            data.extend(copy_text_row(&row).as_bytes())
+            data.push(10)
+        }
+        self.pg.copy_in_write(copy, &data)
+    }
+
+    // Ends an open COPY FROM STDIN, answering the rows the server accepted.
+    pub fn copy_in_end(&mut self, copy: &mut conn::CopyIn) -> Result<i64, errors::Error> {
+        self.pg.copy_in_end(copy)
+    }
+
+    // Abandons an open COPY FROM STDIN, so the server commits none of it.
+    pub fn copy_in_abort(
+        &mut self
+        copy: &mut conn::CopyIn
+        reason: &String
+    ) -> Result<(), errors::Error> {
+        self.pg.copy_in_abort(copy, reason)
+    }
+
+    // Streams `data` into the server with `COPY ... FROM STDIN` in one
+    // call.
     pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
         self.pg.copy_in(sql, data)
     }
@@ -374,17 +607,68 @@ impl Client {
     // Streams text rows into the server, one line per row, in the default
     // COPY text format. Fields are tab-separated and `\N` is NULL, which
     // `copy_text_row` renders.
+    //
+    // Rows go to the server in batches rather than as one payload, so a
+    // list too large to hold as a single buffer still copies.
     pub fn copy_in_rows(
         &mut self
         sql: &String
         rows: &Vec<Vec<value::Value>>
     ) -> Result<i64, errors::Error> {
-        let mut data: Vec<u8> = #[]
+        let mut copy = self.pg.copy_in_begin(sql)?
+        let mut batch: Vec<u8> = #[]
         for row in rows {
-            data.extend(copy_text_row(&row).as_bytes())
-            data.push(10)
+            batch.extend(copy_text_row(&row).as_bytes())
+            batch.push(10)
+            if batch.len() >= COPY_BATCH_BYTES {
+                match self.pg.copy_in_write(&mut copy, &batch) {
+                    Ok(_) => { batch = #[] }
+                    Err(e) => {
+                        let _ = self.pg.copy_in_abort(&mut copy, &format!("{}", e))
+                        return Err(e)
+                    }
+                }
+            }
         }
-        self.pg.copy_in(sql, &data)
+        self.pg.copy_in_write(&mut copy, &batch)?
+        self.pg.copy_in_end(&mut copy)
+    }
+
+    // Starts a `COPY ... TO STDOUT` that answers its payload a chunk at a
+    // time, so a result too large to hold at once still reads.
+    //
+    //     let mut copy = db.copy_out_begin(&"COPY people TO STDOUT")?
+    //     while let Some(chunk) = db.copy_out_next(&mut copy)? {
+    //         sink(chunk)
+    //     }
+    pub fn copy_out_begin(&mut self, sql: &String) -> Result<conn::CopyOut, errors::Error> {
+        self.pg.copy_out_begin(sql)
+    }
+
+    // The next chunk of an open COPY TO STDOUT, or `None` at its end.
+    pub fn copy_out_next(
+        &mut self
+        copy: &mut conn::CopyOut
+    ) -> Result<Option<Vec<u8>>, errors::Error> {
+        self.pg.copy_out_next(copy)
+    }
+
+    // The next line of an open COPY TO STDOUT, or `None` at its end.
+    //
+    // A chunk boundary need not fall on a line boundary, so the remainder
+    // of a partial line is held until the chunk carrying its end arrives.
+    // The trailing newline is not part of the line.
+    pub fn copy_out_line(
+        &mut self
+        copy: &mut conn::CopyOut
+    ) -> Result<Option<String>, errors::Error> {
+        self.pg.copy_out_line(copy)
+    }
+
+    // Abandons an open COPY TO STDOUT, draining what the server was still
+    // sending so the connection stays usable.
+    pub fn copy_out_end(&mut self, copy: &mut conn::CopyOut) -> Result<(), errors::Error> {
+        self.pg.copy_out_end(copy)
     }
 
     // Reads a `COPY ... TO STDOUT` in full.
@@ -395,10 +679,10 @@ impl Client {
     // Reads a `COPY ... TO STDOUT` and splits it into lines, dropping the
     // trailing empty line the final newline leaves.
     pub fn copy_out_lines(&mut self, sql: &String) -> Result<Vec<String>, errors::Error> {
-        let raw = self.pg.copy_out(sql)?
-        let mut lines = buf::utf8_lossy(&raw).split("\n")
-        if lines.last() == Some("") {
-            let _ = lines.pop()
+        let mut copy = self.pg.copy_out_begin(sql)?
+        let mut lines: Vec<String> = #[]
+        while let Some(line) = self.copy_out_line(&mut copy)? {
+            lines.push(line)
         }
         Ok(lines)
     }
@@ -458,17 +742,23 @@ impl Client {
         self.pg.cancel()
     }
 
-    // A statement whose preparation the server has since invalidated must
-    // not stay cached: the next call would bind against a plan the server
-    // has dropped. A failure of any other kind leaves the cache alone.
-    fn forget_if_failed<T>(&mut self, sql: &String, outcome: &Result<T, errors::Error>) {
-        if let Err(e) = outcome {
-            // 26000 is invalid_sql_statement_name and 0A000 is the "cached
-            // plan must not change result type" report.
-            if matches!(dberror::sqlstate_of(e), "26000" | "0A000") {
-                let _ = Map::pop(&mut self.cache, sql)
-            }
-        }
+    // True when a failure says the cached statement is stale rather than the
+    // call wrong, and the session is in a state where preparing it again and
+    // running it once more is sound.
+    //
+    // 26000 is `invalid_sql_statement_name`, which a session reports once the
+    // server has dropped the statement; 0A000 is "cached plan must not change
+    // result type", which a schema change under a cached plan reports. Both
+    // name the cache rather than the caller, and both are answered by parsing
+    // the statement against the schema as it now stands.
+    //
+    // Inside a transaction the failure has already put the block in its
+    // aborted state, where the server accepts only a rollback, so the retry
+    // belongs to the caller's own recovery there rather than here.
+    fn can_reprepare(&self, e: &errors::Error) -> bool {
+        matches!(dberror::sqlstate_of(e), "26000" | "0A000")
+        && !self.pg.is_closed()
+        && !self.pg.in_transaction()
     }
 }
 
@@ -591,33 +881,6 @@ fn escape_copy_field(text: &String) -> String {
     buf::utf8_lossy(&out)
 }
 
-// A PostgreSQL timestamp rendered as RFC 3339: `T` between the date and the
-// time, and a two-part UTC offset.
-pub fn rfc3339_of(text: &String) -> String {
-    let mut out = text.trim().replace(" ", "T")
-    if out.ends_with("Z") {
-        return out
-    }
-    // A trailing `+00` or `-05` needs its minutes; `+00:00` already has them.
-    let n = out.byte_len()
-    if n >= 3 {
-        let sign = out.byte_at(n - 3)
-        if sign == 43 || sign == 45 {
-            return out + ":00"
-        }
-    }
-    // A timestamp without a time zone has no offset at all; UTC is the only
-    // reading available, and it is what the server used to compute it.
-    if !out.contains("+") && !out.contains("Z") && count_colons(&out) <= 2 {
-        return out + "Z"
-    }
-    out
-}
-
-fn count_colons(text: &String) -> i64 {
-    text.bytes().count(|byte| byte == 58)
-}
-
 #[cfg(test)]
 mod client_tests {
     use std::testing
@@ -668,34 +931,15 @@ mod client_tests {
     #[test]
     fn copy_text_rows_escape_the_reserved_characters() {
         let row = #[
-            value::Value::Int(1),
-            value::Value::Text("has\ttab"),
-            value::Value::Null,
-            value::Value::Text("line\nbreak"),
+            value::Value::Int(1)
+            value::Value::Text("has\ttab")
+            value::Value::Null
+            value::Value::Text("line\nbreak")
         ]
         let _ = testing::check_eq(
             &super::copy_text_row(&row)
             &"1\thas\\ttab\t\\N\tline\\nbreak"
             "copy text row"
-        )
-    }
-
-    #[test]
-    fn postgres_timestamps_normalize_to_rfc3339() {
-        let _ = testing::check_eq(
-            &super::rfc3339_of(&"2026-08-16 12:34:56+00")
-            &"2026-08-16T12:34:56+00:00"
-            "offset gains its minutes"
-        )
-        let _ = testing::check_eq(
-            &super::rfc3339_of(&"2026-08-16 12:34:56.789+02:00")
-            &"2026-08-16T12:34:56.789+02:00"
-            "a complete offset is unchanged"
-        )
-        let _ = testing::check_eq(
-            &super::rfc3339_of(&"2026-08-16 12:34:56")
-            &"2026-08-16T12:34:56Z"
-            "a naive timestamp reads as UTC"
         )
     }
 }

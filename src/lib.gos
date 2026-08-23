@@ -12,10 +12,13 @@
 //   - the simple and the extended query protocol: prepared statements with
 //     a cache, parameter binding, row streaming, portals fetched in batches,
 //     and pipelining
-//   - a type codec in both wire formats, including arrays, composites, and
-//     ranges
+//   - a type codec in both wire formats, including arrays, composites,
+//     ranges, and multiranges, with typed readings for timestamps, dates,
+//     times, intervals, UUIDs, and JSON
+//   - rows rendered as JSON, for serving a result or decoding it into a
+//     struct
 //   - transactions with isolation levels and savepoints
-//   - COPY in both directions
+//   - COPY in both directions, streamed a chunk at a time
 //   - LISTEN / NOTIFY, and query cancellation
 //   - a connection pool
 //
@@ -39,7 +42,7 @@
 
 use std::errors
 
-use crate::{client, config, dberror, oid, pool, value}
+use crate::{client, config, conn, dberror, oid, pool, rowmap, temporal, value}
 
 // The driver's version.
 pub const VERSION: String = "0.1.0"
@@ -66,9 +69,16 @@ pub fn parse_config(url: &String) -> Result<config::Config, errors::Error> {
     config::parse(url)
 }
 
-// Opens a pool of at most `max_size` connections.
+// Opens a pool of at most `max_size` connections, for one goroutine.
 pub fn pool_open(url: &String, max_size: i64) -> Result<pool::Pool, errors::Error> {
     pool::open(url, max_size)
+}
+
+// Opens a limiter allowing at most `max_size` connections at once, for work
+// spread across goroutines: each opens its own connection, and the permits
+// are what they share.
+pub fn limit_open(url: &String, max_size: i64) -> Result<pool::Limiter, errors::Error> {
+    pool::limit(url, max_size)
 }
 
 // --- parameter constructors ---------------------------------------
@@ -130,6 +140,62 @@ pub fn text_array(items: Vec<String>) -> value::Value {
     array(items.map(|item| value::Value::Text(item)))
 }
 
+// A `timestamp` or `timestamptz` parameter.
+pub fn timestamp(v: temporal::Timestamp) -> value::Value {
+    value::Value::Timestamp(v)
+}
+
+// A `date` parameter.
+pub fn date(v: temporal::Date) -> value::Value {
+    value::Value::Date(v)
+}
+
+// A `time` or `timetz` parameter.
+pub fn time(v: temporal::Time) -> value::Value {
+    value::Value::Time(v)
+}
+
+// An `interval` parameter.
+pub fn interval(v: temporal::Interval) -> value::Value {
+    value::Value::Interval(v)
+}
+
+// A `uuid` parameter.
+pub fn uuid(v: temporal::Uuid) -> value::Value {
+    value::Value::Uuid(v)
+}
+
+// A `json` or `jsonb` parameter, from the document text.
+pub fn json(document: String) -> value::Value {
+    value::Value::Json(document)
+}
+
+// Parses a timestamp in the form PostgreSQL writes, for building one from
+// text a program already holds.
+pub fn parse_timestamp(text: &String) -> Result<temporal::Timestamp, errors::Error> {
+    temporal::parse_timestamp(text)
+}
+
+// Parses a date in the form PostgreSQL writes.
+pub fn parse_date(text: &String) -> Result<temporal::Date, errors::Error> {
+    temporal::parse_date(text)
+}
+
+// Parses a time in the form PostgreSQL writes.
+pub fn parse_time(text: &String) -> Result<temporal::Time, errors::Error> {
+    temporal::parse_time(text)
+}
+
+// Parses an interval in the `postgres` or ISO 8601 style.
+pub fn parse_interval(text: &String) -> Result<temporal::Interval, errors::Error> {
+    temporal::parse_interval(text)
+}
+
+// Parses a UUID in the canonical, bare, or braced form.
+pub fn parse_uuid(text: &String) -> Result<temporal::Uuid, errors::Error> {
+    temporal::parse_uuid(text)
+}
+
 // A composite parameter, as its literal.
 pub fn record(fields: Vec<value::Value>) -> value::Value {
     value::Value::Text(value::render_record_literal(&fields))
@@ -149,6 +215,42 @@ pub fn opt_text(v: Option<String>) -> value::Value {
         Some(s) => value::Value::Text(s)
         None => value::Value::Null
     }
+}
+
+// --- rows as JSON --------------------------------------------------
+
+// A row as a JSON object, keyed by column name and typed by each column's
+// own OID. This is what a program serves from a handler, and what
+// `std::encoding::json::decode` reads to reach a struct of its own.
+pub fn row_json(row: &conn::Row) -> String {
+    rowmap::row_json(row)
+}
+
+// A result set as a JSON array of objects.
+pub fn rows_json(rows: &Vec<conn::Row>) -> String {
+    rowmap::rows_json(rows)
+}
+
+// `INSERT INTO <table> (<columns>) VALUES ($1, ...)`, with the identifiers
+// quoted and one placeholder per column.
+pub fn insert_sql(table: &String, columns: &Vec<String>) -> String {
+    rowmap::insert_sql(table, columns)
+}
+
+// `SELECT <columns> FROM <table>`, with the identifiers quoted.
+pub fn select_sql(table: &String, columns: &Vec<String>) -> String {
+    rowmap::select_sql(table, columns)
+}
+
+// `UPDATE <table> SET <columns> = ... WHERE <key> = $n`, numbering the key's
+// placeholder last.
+pub fn update_sql(table: &String, columns: &Vec<String>, key: &String) -> String {
+    rowmap::update_sql(table, columns, key)
+}
+
+// `$1, $2, ... $n`.
+pub fn placeholders(count: i64) -> String {
+    rowmap::placeholders(count)
 }
 
 // --- error classification -----------------------------------------

@@ -31,6 +31,10 @@ pub struct Scram {
     pub (package) client_first_bare: String
     // The GS2 header, which the client-final message echoes base64-encoded.
     pub (package) gs2_header: String
+    // The channel-binding data the header commits to: for
+    // `tls-server-end-point`, the hash of the server's certificate. Empty
+    // when the exchange is plain SCRAM.
+    pub (package) binding_data: Vec<u8>
 }
 
 // The client-final message and the server signature one exchange derives.
@@ -66,6 +70,39 @@ impl Scram {
             // Channel binding is not used: `n` says the client does not
             // support it, so the server must offer plain SCRAM-SHA-256.
             gs2_header: "n,,"
+            binding_data: #[]
+        })
+    }
+
+    // Starts a `SCRAM-SHA-256-PLUS` exchange bound to the TLS connection it
+    // runs over.
+    //
+    // `cert_hash` is the `tls-server-end-point` binding: the digest of the
+    // server's certificate, which the client and the server derive
+    // independently. A server that is not the one that presented the
+    // certificate cannot answer, so relaying the exchange to a different
+    // connection fails rather than succeeding elsewhere.
+    pub fn start_bound(cert_hash: &Vec<u8>) -> Result<Scram, errors::Error> {
+        let raw = rand::bytes(18)?
+        Scram::with_nonce_bound(&encoding::base64::encode(&raw).replace("=", ""), cert_hash)
+    }
+
+    // The bound exchange with a caller-supplied nonce, for a pinned test.
+    pub fn with_nonce_bound(nonce: &String, cert_hash: &Vec<u8>) -> Result<Scram, errors::Error> {
+        if nonce == "" {
+            return Err(errors::new("scram: client nonce must not be empty"))
+        }
+        if cert_hash.is_empty() {
+            return Err(errors::new(
+                "scram: channel binding needs the server certificate, and none was presented"
+            ))
+        }
+        Ok(Scram {
+            client_nonce: nonce.clone()
+            client_first_bare: "n=,r=" + nonce
+            // `p=` says the client binds the exchange, and names the type.
+            gs2_header: "p=tls-server-end-point,,"
+            binding_data: cert_hash.clone()
         })
     }
 
@@ -109,7 +146,11 @@ impl Scram {
         let stored_key = sha256::digest(client_key.clone())
         let server_key = hmac::sha256_mac(salted, "Server Key".as_bytes())
 
-        let channel_binding = encoding::base64::encode(&self.gs2_header.as_bytes())
+        // `c=` carries the GS2 header followed by the binding data itself,
+        // so the server checks that both ends saw the same TLS connection.
+        let mut binding_bytes = self.gs2_header.as_bytes()
+        for byte in self.binding_data { binding_bytes.push(byte) }
+        let channel_binding = encoding::base64::encode(&binding_bytes)
         let final_without_proof = "c=" + &channel_binding + ",r=" + &combined_nonce
         let auth_message =
             self.client_first_bare.clone() + "," + server_first + "," + &final_without_proof
@@ -154,17 +195,30 @@ pub fn verify_server(expected: &Vec<u8>, server_final: &String) -> Result<(), er
 
 // Picks the mechanism to use from the list the server advertises.
 //
-// Channel binding needs the TLS server certificate to hash, which no
-// Gossamer socket API exposes, so the client never claims support for it.
-// `require_binding` therefore reports the situation rather than silently
-// authenticating without the protection the caller asked for.
+// `SCRAM-SHA-256-PLUS` binds the exchange to the TLS connection it runs
+// over, so it is preferred whenever both ends can: the server offers it and
+// the connection presented a certificate to bind to. `require_binding`
+// reports why binding is unavailable rather than authenticating without the
+// protection the caller asked for.
 pub fn choose_mechanism(
     offered: &Vec<String>
     require_binding: bool
+    can_bind: bool
 ) -> Result<String, errors::Error> {
+    // Binding is only on the table over TLS, where a certificate exists to
+    // bind to; `can_bind` is false on a plain connection.
+    if can_bind && offered.contains(MECHANISM_SCRAM_SHA_256_PLUS) {
+        return Ok(MECHANISM_SCRAM_SHA_256_PLUS)
+    }
     if require_binding {
-        return Err(errors::new(
-            "channel_binding=require: SCRAM channel binding needs the server certificate, which std::net does not expose; use channel_binding=prefer or sslmode=verify-full"
+        if !can_bind {
+            return Err(errors::new(
+                "channel_binding=require: the connection is not TLS, so there is no certificate to bind to"
+            ))
+        }
+        return Err(errors::newf(
+            "channel_binding=require: the server offers {}, none of them a channel-binding mechanism"
+            offered.join(", ")
         ))
     }
     if offered.contains(MECHANISM_SCRAM_SHA_256) {
@@ -174,9 +228,10 @@ pub fn choose_mechanism(
         return Err(errors::new("scram: server offered no SASL mechanism"))
     }
     Err(errors::newf(
-        "scram: server offers only {}; this driver speaks {}"
+        "scram: server offers only {}; this driver speaks {} and {}"
         offered.join(", ")
         MECHANISM_SCRAM_SHA_256
+        MECHANISM_SCRAM_SHA_256_PLUS
     ))
 }
 
@@ -224,6 +279,45 @@ mod sasl_tests {
     // RFC 7677 section 3 test vector, with PostgreSQL's `n=` (empty
     // username, which the protocol carries in the startup message
     // instead) in place of the RFC's `n=user`.
+    #[test]
+    fn a_bound_exchange_is_preferred_when_a_certificate_is_there() {
+        match super::choose_mechanism(&#["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"], false, true) {
+            Ok(m) => { let _ = testing::check_eq(&m, &"SCRAM-SHA-256-PLUS", "binds when it can") }
+            Err(e) => { let _ = testing::check(false, e.to_string()) }
+        }
+    }
+
+    #[test]
+    fn requiring_binding_without_tls_reports_why() {
+        let _ = testing::check(
+            super::choose_mechanism(&#["SCRAM-SHA-256-PLUS"], true, false).is_err()
+            "no certificate to bind to"
+        )
+    }
+
+    #[test]
+    fn a_bound_exchange_commits_to_the_certificate() {
+        let hash: Vec<u8> = #[1, 2, 3]
+        match super::Scram::with_nonce_bound(&"nonce", &hash) {
+            Ok(exchange) => {
+                let _ = testing::check(
+                    exchange.client_first().starts_with("p=tls-server-end-point,,")
+                    "the header names the binding type"
+                )
+            }
+            Err(e) => { let _ = testing::check(false, e.to_string()) }
+        }
+    }
+
+    #[test]
+    fn a_bound_exchange_needs_a_certificate() {
+        let empty: Vec<u8> = #[]
+        let _ = testing::check(
+            super::Scram::with_nonce_bound(&"nonce", &empty).is_err()
+            "no certificate, no binding"
+        )
+    }
+
     #[test]
     fn scram_computes_the_rfc_proof_shape() {
         match super::Scram::with_nonce(&"rOprNGfwEbeRWgbNEkqO") {
@@ -349,20 +443,20 @@ mod sasl_tests {
 
     #[test]
     fn mechanism_choice_takes_plain_scram_and_reports_anything_else() {
-        match super::choose_mechanism(&#["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"], false) {
+        match super::choose_mechanism(&#["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"], false, false) {
             Ok(name) => { let _ = testing::check_eq(&name, &"SCRAM-SHA-256", "plain scram chosen") }
             Err(e) => { let _ = testing::check(false, &format!("choice: {}", e)) }
         }
         let _ = testing::check(
-            super::choose_mechanism(&#["SCRAM-SHA-256"], true).is_err()
+            super::choose_mechanism(&#["SCRAM-SHA-256"], true, false).is_err()
             "channel_binding=require is reported, not silently ignored"
         )
         let _ = testing::check(
-            super::choose_mechanism(&#["GSSAPI"], false).is_err()
+            super::choose_mechanism(&#["GSSAPI"], false, false).is_err()
             "an unsupported mechanism is reported"
         )
         let _ = testing::check(
-            super::choose_mechanism(&#[], false).is_err()
+            super::choose_mechanism(&#[], false, false).is_err()
             "no mechanism is reported"
         )
     }

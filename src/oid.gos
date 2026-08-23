@@ -353,6 +353,47 @@ mod oid_tests {
     }
 
     #[test]
+    fn the_type_classes_answer_for_the_types_they_name() {
+        for name in #[super::INT2, super::INT4, super::INT8, super::OID] {
+            let _ = testing::check(super::is_integer(name), &format!("{} is an integer", name))
+            let _ = testing::check(!super::is_float(name), &format!("{} is not a float", name))
+            let _ = testing::check(!super::is_temporal(name), &format!("{} is not temporal", name))
+        }
+        for name in #[super::FLOAT4, super::FLOAT8] {
+            let _ = testing::check(super::is_float(name), &format!("{} is a float", name))
+            let _ = testing::check(!super::is_integer(name), &format!("{} is not an integer", name))
+        }
+        // The class follows `pg_type`'s own date/time category, which counts
+        // `interval` among them even though it names a span rather than an
+        // instant.
+        for name in #[
+            super::DATE, super::TIME, super::TIMETZ
+            super::TIMESTAMP, super::TIMESTAMPTZ, super::INTERVAL
+        ] {
+            let _ = testing::check(super::is_temporal(name), &format!("{} is temporal", name))
+        }
+        // `numeric` is exact rather than binary floating point, so it is not
+        // in the float class whatever its values look like.
+        let _ = testing::check(!super::is_float(super::NUMERIC), "numeric is not a float")
+        let _ = testing::check(!super::is_integer(super::NUMERIC), "numeric is not an integer")
+        let _ = testing::check(!super::is_temporal(super::TEXT), "text is not temporal")
+    }
+
+    #[test]
+    fn a_multirange_is_told_apart_from_the_range_it_holds() {
+        let _ = testing::check(super::is_multirange(super::INT4MULTIRANGE), "int4multirange")
+        let _ = testing::check(!super::is_range(super::INT4MULTIRANGE), "and is not a range itself")
+        let _ = testing::check(super::is_range(super::INT4RANGE), "int4range")
+        let _ = testing::check(!super::is_multirange(super::INT4RANGE), "and is not a multirange")
+        let _ = testing::check_eq(
+            &super::range_element_of(super::INT4MULTIRANGE)
+            &super::range_element_of(super::INT4RANGE)
+            "both resolve to the element the bounds carry"
+        )
+        let _ = testing::check(!super::is_multirange(super::TEXT), "a scalar is neither")
+    }
+
+    #[test]
     fn range_elements_resolve() {
         let _ = testing::check_eq(
             &super::range_element_of(super::INT8RANGE)
