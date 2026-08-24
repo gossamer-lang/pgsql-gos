@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Move to `github.com/gossamer-lang/pgsql-gos`. Both the dependency key and the
+  `use` path take the new id; the module name stays `pgsql_gos`.
+
 ## 0.1.0 - first release
 
 - Speak the PostgreSQL frontend/backend protocol (version 3.0) in Gossamer

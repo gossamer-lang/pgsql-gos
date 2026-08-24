@@ -35,7 +35,7 @@ fn main() -> Result<(), errors::Error> {
 ```toml
 # project.toml
 [dependencies]
-"github.com/gossamer-lang/pgsql-gos" = { git = "https://github.com/gossamer-lang/pgsql-gos" tag="v0.1.0" }
+"github.com/gossamer-lang/pgsql-gos" = { git = "https://github.com/gossamer-lang/pgsql-gos" tag="v0.1.1" }
 ```
 
 The whole surface is reached through the imported module; the driver's
