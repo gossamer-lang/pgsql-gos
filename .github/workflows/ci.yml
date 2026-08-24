@@ -16,12 +16,86 @@ env:
   GOSSAMER_VERSION: latest
 
 jobs:
-  build:
-    name: check, lint, test
+  # Formatting and lint say nothing about a server, so they run once and
+  # answer before any of the matrix spends time on a database.
+  static:
+    name: fmt, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Gossamer toolchain
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: gos --version
+      # The same script a working copy runs, over the driver, every example,
+      # and both test projects. `gos test` typechecks what it runs, so there
+      # is no separate check step.
+      - name: Format and lint
+        run: ./quick-check.sh
+
+  # The driver's own suites against every server version it claims to
+  # support. The protocol is stable across them, but the type catalogue is
+  # not: multiranges arrived in 14, and a codec change that assumed a newer
+  # server would only show up here.
+  test:
+    name: test (postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['14', '15', '16', '17']
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: gos_pgsql_test
+          POSTGRES_DB: gos_pgsql_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      GOS_PGSQL_TEST_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
+      # The same server over TCP, which the suite uses to exercise
+      # SCRAM-SHA-256, channel binding, and the socket deadline.
+      GOS_PGSQL_TCP_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Gossamer toolchain
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: gos --version
+      - name: Report the server version
+        run: |
+          PGPASSWORD=gos_pgsql_test psql -h 127.0.0.1 -U postgres -d gos_pgsql_test -tAc 'select version()'
+
+      # The unit suite needs no server; the integration suite talks to one.
+      # `gos test .` typechecks and runs both.
+      - name: Test
+        run: gos test .
+
+      - name: Run every example
+        env:
+          GOS_PGSQL_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
+        run: examples/run-all.sh
+
+  # `gos test` runs on the bytecode VM by design, so tier agreement is not
+  # something the suites above can establish. This runs one program on all
+  # three tiers against a real server and compares the transcripts byte for
+  # byte.
+  parity:
+    name: tier parity
     runs-on: ubuntu-latest
 
-    # The integration suite under `tests/` talks to a real server, so the
-    # test step needs one running before it starts.
     services:
       postgres:
         image: postgres:16
@@ -39,32 +113,61 @@ jobs:
 
     env:
       GOS_PGSQL_TEST_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
-      # The same server over TCP, which the suite uses to exercise
-      # SCRAM-SHA-256 and the passwordless rejection path.
-      GOS_PGSQL_TCP_URL: host=127.0.0.1 port=5432 user=postgres password=gos_pgsql_test dbname=gos_pgsql_test
 
     steps:
       - uses: actions/checkout@v6
-
       - name: Install the Gossamer toolchain
         run: |
           curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: gos --version
 
-      - name: Report the toolchain version
-        run: gos --version
+      # A release build is what a deployment ships, so every example is built
+      # that way as well as run on the VM.
+      - name: Build every example for release
+        run: |
+          for dir in examples/*/; do
+            [ -f "$dir/project.toml" ] || continue
+            echo "--- $dir"
+            ( cd "$dir" && gos build --release . )
+          done
 
-      - name: Build
-        run: gos check .
+      - name: Tier parity
+        run: tests/parity/run.sh
 
-      - name: Lint
-        run: gos lint .
+  # A Unix-socket connection takes a different socket family, skips the TLS
+  # upgrade, and carries no read deadline, so none of that is covered by a
+  # server reached over TCP. The runner's own PostgreSQL provides the socket.
+  unix-socket:
+    name: unix socket
+    runs-on: ubuntu-latest
 
-      - name: Test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Gossamer toolchain
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: gos --version
+
+      - name: Start the runner's PostgreSQL and take a socket
+        run: |
+          sudo systemctl start postgresql
+          sudo -u postgres createuser --superuser "$USER"
+          sudo -u postgres createdb -O "$USER" gos_pgsql_test
+          pg_isready -h /var/run/postgresql
+
+      - name: Test over the socket
+        env:
+          GOS_PGSQL_TEST_URL: host=/var/run/postgresql dbname=gos_pgsql_test
         run: gos test .
 
-      # `gos test` runs on the bytecode VM by design, so tier agreement is
-      # not something the suites above can establish. This runs one program
-      # on all three tiers and compares the transcripts byte for byte.
-      - name: Tier parity
+      - name: Run every example over the socket
+        env:
+          GOS_PGSQL_URL: host=/var/run/postgresql dbname=gos_pgsql_test
+        run: examples/run-all.sh
+
+      - name: Tier parity over the socket
+        env:
+          GOS_PGSQL_TEST_URL: host=/var/run/postgresql dbname=gos_pgsql_test
         run: tests/parity/run.sh
