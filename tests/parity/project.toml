@@ -4,4 +4,4 @@ version = "0.1.0"
 gossamer-version = "^v0.55.3"
 
 [dependencies]
-"github.com/danpozmanter/pgsql-gos" = { path = "../.." }
+"github.com/gossamer-lang/pgsql-gos" = { path = "../.." }

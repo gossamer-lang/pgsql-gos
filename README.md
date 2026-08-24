@@ -1,6 +1,6 @@
 # pgsql-gos
 
-[![CI](https://github.com/danpozmanter/pgsql-gos/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/danpozmanter/pgsql-gos/actions/workflows/ci.yml)
+[![CI](https://github.com/gossamer-lang/pgsql-gos/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gossamer-lang/pgsql-gos/actions/workflows/ci.yml)
 
 A PostgreSQL driver written entirely in Gossamer.
 
@@ -12,7 +12,7 @@ type codec are all Gossamer source in `src/`.
 
 ```gossamer
 use std::errors
-use "github.com/danpozmanter/pgsql-gos" as pgsql
+use "github.com/gossamer-lang/pgsql-gos" as pgsql
 
 fn main() -> Result<(), errors::Error> {
     let mut db = pgsql::connect(&"host=/var/run/postgresql dbname=app")?
@@ -35,7 +35,7 @@ fn main() -> Result<(), errors::Error> {
 ```toml
 # project.toml
 [dependencies]
-"github.com/danpozmanter/pgsql-gos" = { git = "https://github.com/danpozmanter/pgsql-gos" tag="v0.1.0" }
+"github.com/gossamer-lang/pgsql-gos" = { git = "https://github.com/gossamer-lang/pgsql-gos" tag="v0.1.0" }
 ```
 
 The whole surface is reached through the imported module; the driver's

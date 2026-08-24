@@ -16,7 +16,7 @@
 use std::sync::channel_unbounded
 use std::{env, errors}
 
-use "github.com/danpozmanter/pgsql-gos" as pgsql
+use "github.com/gossamer-lang/pgsql-gos" as pgsql
 
 fn main() -> Result<(), errors::Error> {
     let url = env::var("GOS_PGSQL_TEST_URL")

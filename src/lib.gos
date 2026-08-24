@@ -24,7 +24,7 @@
 //
 // The whole surface is reached through this module.
 //
-//     use "github.com/danpozmanter/pgsql-gos" as pgsql
+//     use "github.com/gossamer-lang/pgsql-gos" as pgsql
 //
 //     fn main() -> Result<(), errors::Error> {
 //         let mut db = pgsql::connect(&"host=/var/run/postgresql dbname=app")?

@@ -18,7 +18,7 @@
 use std::sync::channel_unbounded
 use std::{env, errors, testing, time}
 
-use "github.com/danpozmanter/pgsql-gos" as pgsql
+use "github.com/gossamer-lang/pgsql-gos" as pgsql
 
 fn test_url() -> String {
     match env::var("GOS_PGSQL_TEST_URL") {

@@ -1,5 +1,5 @@
 [project]
-id      = "github.com/danpozmanter/pgsql-gos"
+id      = "github.com/gossamer-lang/pgsql-gos"
 version = "0.1.0"
 gossamer-version = "^v0.55.3"
 authors = ["Dan Pozmanter"]
