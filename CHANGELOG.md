@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.2
+
+- Require Gossamer v0.56.0, which removed the shared reference from the
+  language. Every `&` on an argument and every `&T` parameter is gone: a
+  value is passed without copying it, and only a `&mut` parameter writes back
+  to the caller's variable.
+- Take the connection back through a mutable reference: `pool.release(db)`
+  and `limiter.release(db)` are now `pool.release(&mut db)` and
+  `limiter.release(&mut db)`. Both close or reset the caller's connection, and
+  under v0.56 a by-value parameter cannot say so - the caller kept a binding
+  that still believed its session was open, which on the compiled tiers closed
+  one socket twice and faulted.
+- Rename `conn::Column`'s `format` field to `wire_format`. `format` is a
+  compiler-known call in v0.56 and nothing may be declared under that name.
+- Close a connection once. `close` on one already closed returned without
+  sending Terminate but closed the socket again.
+- Drop the `.clone()` a `&String` or `&Vec` parameter needed in v0.55. The
+  clones were redundant under v0.56 value semantics, and cloning an argument
+  into a map gave up a share the callee never took, so on the compiled tiers
+  the caller's SQL text became whatever the next allocation of that size wrote
+  and the server reported `42601 syntax error at or near "gos_pgsql_sNN"`.
+- Start the cancel-request goroutine with `spawn`, which replaced `go`.
+
 ## 0.1.1
 
 - Move to `github.com/gossamer-lang/pgsql-gos`. Both the dependency key and the

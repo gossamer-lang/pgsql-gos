@@ -117,7 +117,7 @@ pub struct Uuid {
 impl Date {
     // The date `days` after 1970-01-01.
     pub fn from_unix_days(days: i64) -> Date {
-        let (year, month, day) = civil_from_days(days)
+        let year, month, day = civil_from_days(days)
         Date { year: year, month: month, day: day, bound: Bound::Finite }
     }
 
@@ -131,12 +131,12 @@ impl Date {
     }
 
     // True when this date falls before `other`.
-    pub fn is_before(&self, other: &Date) -> bool {
+    pub fn is_before(&self, other: Date) -> bool {
         self.ordering_key() < other.ordering_key()
     }
 
     // True when this date falls after `other`.
-    pub fn is_after(&self, other: &Date) -> bool {
+    pub fn is_after(&self, other: Date) -> bool {
         self.ordering_key() > other.ordering_key()
     }
 
@@ -167,31 +167,31 @@ impl Date {
 }
 
 impl PartialOrd for Date {
-    fn cmp(&self, other: &Date) -> i64 {
+    fn cmp(&self, other: Date) -> i64 {
         compare(self.ordering_key(), other.ordering_key())
     }
 }
 
 impl Display for Date {
     // The date in the form PostgreSQL writes under the ISO DateStyle.
-    fn to_string(&self) -> String {
+    fn fmt(&self) -> String {
         match self.bound {
             Bound::Infinity => "infinity"
             Bound::NegInfinity => "-infinity"
             Bound::Finite => render_civil_date(self.year, self.month, self.day)
-            + &render_era(self.year)
+            + render_era(self.year)
         }
     }
 }
 
 // Parses `date` output: `2026-08-16`, `0044-03-15 BC`, or an infinity.
-pub fn parse_date(text: &String) -> Result<Date, errors::Error> {
+pub fn parse_date(text: String) -> Result<Date, errors::Error> {
     let t = text.trim()
-    if let Some(bound) = infinite_bound(&t) {
+    if let Some(bound) = infinite_bound(t) {
         return Ok(Date { year: 0, month: 1, day: 1, bound: bound })
     }
-    let (body, is_bc) = strip_era(&t)
-    let (year, month, day, rest) = read_civil_date(&body)?
+    let body, is_bc = strip_era(t)
+    let year, month, day, rest = read_civil_date(body)?
     if rest != "" {
         return Err(errors::newf("trailing text in date `{}`: {}", t, rest))
     }
@@ -208,7 +208,7 @@ pub fn parse_date(text: &String) -> Result<Date, errors::Error> {
 impl Time {
     // The time `micros` after midnight.
     pub fn from_day_micros(micros: i64) -> Time {
-        let (hour, minute, second, rest) = split_day_micros(micros)
+        let hour, minute, second, rest = split_day_micros(micros)
         Time {
             hour: hour
             minute: minute
@@ -231,18 +231,18 @@ impl Time {
     }
 
     // True when this time falls before `other`, both read in UTC.
-    pub fn is_before(&self, other: &Time) -> bool {
+    pub fn is_before(&self, other: Time) -> bool {
         self.to_utc_day_micros() < other.to_utc_day_micros()
     }
 
     // True when this time falls after `other`, both read in UTC.
-    pub fn is_after(&self, other: &Time) -> bool {
+    pub fn is_after(&self, other: Time) -> bool {
         self.to_utc_day_micros() > other.to_utc_day_micros()
     }
 }
 
 impl PartialOrd for Time {
-    fn cmp(&self, other: &Time) -> i64 {
+    fn cmp(&self, other: Time) -> i64 {
         compare(self.to_utc_day_micros(), other.to_utc_day_micros())
     }
 }
@@ -250,17 +250,17 @@ impl PartialOrd for Time {
 impl Display for Time {
     // The time in the form PostgreSQL writes: fractional seconds only when
     // there are any, and the offset only for a `timetz`.
-    fn to_string(&self) -> String {
+    fn fmt(&self) -> String {
         render_clock(self.hour, self.minute, self.second, self.micros)
-        + &render_offset(self.offset_minutes)
+        + render_offset(self.offset_minutes)
     }
 }
 
 // Parses `time` or `timetz` output: `12:34:56`, `12:34:56.789012+05:30`.
-pub fn parse_time(text: &String) -> Result<Time, errors::Error> {
+pub fn parse_time(text: String) -> Result<Time, errors::Error> {
     let t = text.trim()
-    let (hour, minute, second, micros, rest) = read_clock(&t)?
-    let offset = parse_offset(&rest)?
+    let hour, minute, second, micros, rest = read_clock(t)?
+    let offset = parse_offset(rest)?
     Ok(Time {
         hour: hour
         minute: minute
@@ -277,8 +277,8 @@ impl Timestamp {
     pub fn from_unix_micros(micros: i64) -> Timestamp {
         let days = floor_div(micros, MICROS_PER_DAY)
         let rest = micros - days * MICROS_PER_DAY
-        let (year, month, day) = civil_from_days(days)
-        let (hour, minute, second, fraction) = split_day_micros(rest)
+        let year, month, day = civil_from_days(days)
+        let hour, minute, second, fraction = split_day_micros(rest)
         Timestamp {
             year: year
             month: month
@@ -324,17 +324,17 @@ impl Timestamp {
     pub fn to_utc(&self) -> Timestamp {
         match self.bound {
             Bound::Finite => Timestamp::from_unix_micros(self.to_unix_micros())
-            _ => self.clone()
+            _ => self
         }
     }
 
     // True when this timestamp names an instant before `other`.
-    pub fn is_before(&self, other: &Timestamp) -> bool {
+    pub fn is_before(&self, other: Timestamp) -> bool {
         self.to_unix_micros() < other.to_unix_micros()
     }
 
     // True when this timestamp names an instant after `other`.
-    pub fn is_after(&self, other: &Timestamp) -> bool {
+    pub fn is_after(&self, other: Timestamp) -> bool {
         self.to_unix_micros() > other.to_unix_micros()
     }
 
@@ -367,15 +367,15 @@ impl Timestamp {
                     Some(minutes) => render_rfc3339_offset(minutes)
                 }
                 render_civil_date(self.year, self.month, self.day) + "T"
-                + &render_clock(self.hour, self.minute, self.second, self.micros)
-                + &zone
+                + render_clock(self.hour, self.minute, self.second, self.micros)
+                + zone
             }
         }
     }
 }
 
 impl PartialOrd for Timestamp {
-    fn cmp(&self, other: &Timestamp) -> i64 {
+    fn cmp(&self, other: Timestamp) -> i64 {
         compare(self.to_unix_micros(), other.to_unix_micros())
     }
 }
@@ -385,24 +385,24 @@ impl Display for Timestamp {
     // a space between the date and the time, fractional seconds only when
     // there are any, and a two-digit offset extended only as far as it
     // needs.
-    fn to_string(&self) -> String {
+    fn fmt(&self) -> String {
         match self.bound {
             Bound::Infinity => "infinity"
             Bound::NegInfinity => "-infinity"
             Bound::Finite => {
                 render_civil_date(self.year, self.month, self.day) + " "
-                + &render_clock(self.hour, self.minute, self.second, self.micros)
-                + &render_offset(self.offset_minutes)
-                + &render_era(self.year)
+                + render_clock(self.hour, self.minute, self.second, self.micros)
+                + render_offset(self.offset_minutes)
+                + render_era(self.year)
             }
         }
     }
 }
 
 // Parses `timestamp` or `timestamptz` output.
-pub fn parse_timestamp(text: &String) -> Result<Timestamp, errors::Error> {
+pub fn parse_timestamp(text: String) -> Result<Timestamp, errors::Error> {
     let t = text.trim()
-    if let Some(bound) = infinite_bound(&t) {
+    if let Some(bound) = infinite_bound(t) {
         return Ok(Timestamp {
             year: 0
             month: 1
@@ -415,8 +415,8 @@ pub fn parse_timestamp(text: &String) -> Result<Timestamp, errors::Error> {
             bound: bound
         })
     }
-    let (body, is_bc) = strip_era(&t)
-    let (year, month, day, after_date) = read_civil_date(&body)?
+    let body, is_bc = strip_era(t)
+    let year, month, day, after_date = read_civil_date(body)?
     // The server writes a space; RFC 3339 writes a `T`. Both are read.
     let separated = after_date.trim()
     if separated.starts_with("T") || separated.starts_with("t") {
@@ -441,8 +441,8 @@ pub fn parse_timestamp(text: &String) -> Result<Timestamp, errors::Error> {
             bound: Bound::Finite
         })
     }
-    let (hour, minute, second, micros, rest) = read_clock(&clock_text)?
-    let offset = parse_offset(&rest)?
+    let hour, minute, second, micros, rest = read_clock(clock_text)?
+    let offset = parse_offset(rest)?
     Ok(Timestamp {
         year: if is_bc { 1 - year } else { year }
         month: month
@@ -481,18 +481,18 @@ impl Interval {
 impl Display for Interval {
     // The interval in the form PostgreSQL writes under the default
     // `postgres` IntervalStyle.
-    fn to_string(&self) -> String {
+    fn fmt(&self) -> String {
         let mut parts: Vec<String> = #[]
         let years = self.months / 12
         let months = self.months - years * 12
         if years != 0 {
-            parts.push(format!("{} {}", years, plural(&"year", years)))
+            parts.push(format("{} {}", years, plural("year", years)))
         }
         if months != 0 {
-            parts.push(format!("{} {}", months, plural(&"mon", months)))
+            parts.push(format("{} {}", months, plural("mon", months)))
         }
         if self.days != 0 {
-            parts.push(format!("{} {}", self.days, plural(&"day", self.days)))
+            parts.push(format("{} {}", self.days, plural("day", self.days)))
         }
         if self.micros != 0 || parts.is_empty() {
             parts.push(render_interval_clock(self.micros))
@@ -504,13 +504,13 @@ impl Display for Interval {
 // Parses `interval` output in the default `postgres` style
 // (`1 year 2 mons 3 days 04:05:06.789`) or in ISO 8601 (`P1Y2M3DT4H5M6S`),
 // which is what `IntervalStyle=iso_8601` writes.
-pub fn parse_interval(text: &String) -> Result<Interval, errors::Error> {
+pub fn parse_interval(text: String) -> Result<Interval, errors::Error> {
     let t = text.trim()
     if t == "" {
         return Err(errors::new("interval is empty"))
     }
     if t.starts_with("P") || t.starts_with("-P") {
-        return parse_iso_interval(&t)
+        return parse_iso_interval(t)
     }
     let mut months = 0
     let mut days = 0
@@ -527,7 +527,7 @@ pub fn parse_interval(text: &String) -> Result<Interval, errors::Error> {
             continue
         }
         if word.contains(":") {
-            micros += parse_interval_clock(&word)?
+            micros += parse_interval_clock(word)?
             continue
         }
         match pending {
@@ -538,7 +538,7 @@ pub fn parse_interval(text: &String) -> Result<Interval, errors::Error> {
                 None => return Err(errors::newf("interval has no count for `{}`", word))
             }
             Some(count) => {
-                let unit = singular(&word)
+                let unit = singular(word)
                 match unit {
                     "year" | "yr" => months += count * 12
                     "mon" | "month" => months += count
@@ -565,9 +565,9 @@ pub fn parse_interval(text: &String) -> Result<Interval, errors::Error> {
 }
 
 // `P1Y2M3DT4H5M6.5S`, the ISO 8601 duration form.
-fn parse_iso_interval(text: &String) -> Result<Interval, errors::Error> {
+fn parse_iso_interval(text: String) -> Result<Interval, errors::Error> {
     let negated = text.starts_with("-")
-    let body = if negated { text.substring(1, text.byte_len()) } else { text.clone() }
+    let body = if negated { text.substring(1, text.byte_len()) } else { text }
     let mut months = 0
     let mut days = 0
     let mut micros = 0
@@ -584,7 +584,7 @@ fn parse_iso_interval(text: &String) -> Result<Interval, errors::Error> {
             continue
         }
         if (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 {
-            digits += &format!("{}", c as char)
+            digits += format("{}", c as char)
             i += 1
             continue
         }
@@ -594,13 +594,13 @@ fn parse_iso_interval(text: &String) -> Result<Interval, errors::Error> {
         }
         let whole = digits.to_i64()
         match (in_time, unit) {
-            (false, 'Y') => months += require_count(whole, &digits)? * 12
-            (false, 'M') => months += require_count(whole, &digits)?
-            (false, 'W') => days += require_count(whole, &digits)? * 7
-            (false, 'D') => days += require_count(whole, &digits)?
-            (true, 'H') => micros += require_count(whole, &digits)? * MICROS_PER_HOUR
-            (true, 'M') => micros += require_count(whole, &digits)? * MICROS_PER_MINUTE
-            (true, 'S') => micros += fractional_seconds(&digits)?
+            (false, 'Y') => months += require_count(whole, digits)? * 12
+            (false, 'M') => months += require_count(whole, digits)?
+            (false, 'W') => days += require_count(whole, digits)? * 7
+            (false, 'D') => days += require_count(whole, digits)?
+            (true, 'H') => micros += require_count(whole, digits)? * MICROS_PER_HOUR
+            (true, 'M') => micros += require_count(whole, digits)? * MICROS_PER_MINUTE
+            (true, 'S') => micros += fractional_seconds(digits)?
             _ => return Err(errors::newf("ISO interval has no unit `{}`", unit))
         }
         digits = ""
@@ -612,7 +612,7 @@ fn parse_iso_interval(text: &String) -> Result<Interval, errors::Error> {
     Ok(Interval { months: months, days: days, micros: micros })
 }
 
-fn require_count(parsed: Option<i64>, digits: &String) -> Result<i64, errors::Error> {
+fn require_count(parsed: Option<i64>, digits: String) -> Result<i64, errors::Error> {
     parsed.ok_or(errors::newf("interval count `{}` is not a whole number", digits))
 }
 
@@ -629,13 +629,13 @@ impl Uuid {
 
     // The UUID's hexadecimal digits with no hyphens.
     pub fn to_hex(&self) -> String {
-        buf::to_hex(&self.bytes)
+        buf::to_hex(self.bytes)
     }
 }
 
 impl PartialOrd for Uuid {
     // Byte order, which is the order the canonical text form sorts in too.
-    fn cmp(&self, other: &Uuid) -> i64 {
+    fn cmp(&self, other: Uuid) -> i64 {
         let shorter = min(self.bytes.len(), other.bytes.len())
         for position in 0..shorter {
             let ordering = compare(self.bytes[position] as i64, other.bytes[position] as i64)
@@ -649,19 +649,19 @@ impl PartialOrd for Uuid {
 
 impl Display for Uuid {
     // The canonical hyphenated form, in lower case.
-    fn to_string(&self) -> String {
-        let hex = buf::to_hex(&self.bytes)
+    fn fmt(&self) -> String {
+        let hex = buf::to_hex(self.bytes)
         if hex.byte_len() != 32 {
             return hex
         }
-        hex.substring(0, 8) + "-" + &hex.substring(8, 12) + "-" + &hex.substring(12, 16) + "-"
-        + &hex.substring(16, 20) + "-" + &hex.substring(20, 32)
+        hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) + "-"
+        + hex.substring(16, 20) + "-" + hex.substring(20, 32)
     }
 }
 
 // Parses a UUID in the canonical hyphenated form, in the bare 32-digit
 // form, or wrapped in braces, in either case.
-pub fn parse_uuid(text: &String) -> Result<Uuid, errors::Error> {
+pub fn parse_uuid(text: String) -> Result<Uuid, errors::Error> {
     let mut t = text.trim()
     if t.starts_with("{") && t.ends_with("}") {
         t = t.substring(1, t.byte_len() - 1)
@@ -670,7 +670,7 @@ pub fn parse_uuid(text: &String) -> Result<Uuid, errors::Error> {
     if hex.byte_len() != 32 {
         return Err(errors::newf("`{}` is not a uuid", text.trim()))
     }
-    let bytes = buf::from_hex(&hex)?
+    let bytes = buf::from_hex(hex)?
     Uuid::from_bytes(bytes)
 }
 
@@ -678,7 +678,7 @@ pub fn parse_uuid(text: &String) -> Result<Uuid, errors::Error> {
 
 // Decodes the four-byte binary `date`: days from 2000-01-01, with the two
 // endpoints spelled as the extremes of the range.
-pub fn date_from_binary(raw: &Vec<u8>) -> Result<Date, errors::Error> {
+pub fn date_from_binary(raw: Vec<u8>) -> Result<Date, errors::Error> {
     if raw.len() < 4 {
         return Err(errors::new("date binary payload is shorter than four bytes"))
     }
@@ -693,7 +693,7 @@ pub fn date_from_binary(raw: &Vec<u8>) -> Result<Date, errors::Error> {
 }
 
 // The four-byte binary `date`.
-pub fn date_to_binary(date: &Date) -> Vec<u8> {
+pub fn date_to_binary(date: Date) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     match date.bound {
         Bound::Infinity => buf::put_i32(&mut out, DAYS_INFINITY)
@@ -704,7 +704,7 @@ pub fn date_to_binary(date: &Date) -> Vec<u8> {
 }
 
 // Decodes the binary `time` (eight bytes) or `timetz` (twelve).
-pub fn time_from_binary(raw: &Vec<u8>) -> Result<Time, errors::Error> {
+pub fn time_from_binary(raw: Vec<u8>) -> Result<Time, errors::Error> {
     if raw.len() < 8 {
         return Err(errors::new("time binary payload is shorter than eight bytes"))
     }
@@ -718,7 +718,7 @@ pub fn time_from_binary(raw: &Vec<u8>) -> Result<Time, errors::Error> {
 }
 
 // The binary `time`, or `timetz` when the value carries an offset.
-pub fn time_to_binary(t: &Time) -> Vec<u8> {
+pub fn time_to_binary(t: Time) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     buf::put_i64(&mut out, t.to_day_micros())
     if let Some(minutes) = t.offset_minutes {
@@ -733,7 +733,7 @@ pub fn time_to_binary(t: &Time) -> Vec<u8> {
 // `has_zone` distinguishes the two types, which share a representation: a
 // `timestamptz` carries the UTC offset it was read at, and a `timestamp`
 // carries none, exactly as the text form spells them.
-pub fn timestamp_from_binary(raw: &Vec<u8>, has_zone: bool) -> Result<Timestamp, errors::Error> {
+pub fn timestamp_from_binary(raw: Vec<u8>, has_zone: bool) -> Result<Timestamp, errors::Error> {
     if raw.len() < 8 {
         return Err(errors::new("timestamp binary payload is shorter than eight bytes"))
     }
@@ -752,7 +752,7 @@ pub fn timestamp_from_binary(raw: &Vec<u8>, has_zone: bool) -> Result<Timestamp,
 }
 
 // The eight-byte binary `timestamp` / `timestamptz`.
-pub fn timestamp_to_binary(ts: &Timestamp) -> Vec<u8> {
+pub fn timestamp_to_binary(ts: Timestamp) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     match ts.bound {
         Bound::Infinity => buf::put_i64(&mut out, MICROS_INFINITY)
@@ -763,7 +763,7 @@ pub fn timestamp_to_binary(ts: &Timestamp) -> Vec<u8> {
 }
 
 // Decodes the sixteen-byte binary `interval`: microseconds, days, months.
-pub fn interval_from_binary(raw: &Vec<u8>) -> Result<Interval, errors::Error> {
+pub fn interval_from_binary(raw: Vec<u8>) -> Result<Interval, errors::Error> {
     if raw.len() < 16 {
         return Err(errors::new("interval binary payload is shorter than sixteen bytes"))
     }
@@ -775,7 +775,7 @@ pub fn interval_from_binary(raw: &Vec<u8>) -> Result<Interval, errors::Error> {
 }
 
 // The sixteen-byte binary `interval`.
-pub fn interval_to_binary(interval: &Interval) -> Vec<u8> {
+pub fn interval_to_binary(interval: Interval) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     buf::put_i64(&mut out, interval.micros)
     buf::put_i32(&mut out, interval.days)
@@ -856,7 +856,7 @@ fn split_day_micros(micros: i64) -> (i64, i64, i64, i64) {
 
 // --- text scanning -------------------------------------------------
 
-fn infinite_bound(text: &String) -> Option<Bound> {
+fn infinite_bound(text: String) -> Option<Bound> {
     match text.to_lowercase() {
         "infinity" | "+infinity" => Some(Bound::Infinity)
         "-infinity" => Some(Bound::NegInfinity)
@@ -866,7 +866,7 @@ fn infinite_bound(text: &String) -> Option<Bound> {
 
 // Splits a trailing ` BC` off a date, which is how the server writes a year
 // before the common era.
-fn strip_era(text: &String) -> (String, bool) {
+fn strip_era(text: String) -> (String, bool) {
     let upper = text.to_uppercase()
     if upper.ends_with(" BC") {
         return (text.substring(0, text.byte_len() - 3).trim(), true)
@@ -874,7 +874,7 @@ fn strip_era(text: &String) -> (String, bool) {
     if upper.ends_with(" AD") {
         return (text.substring(0, text.byte_len() - 3).trim(), false)
     }
-    (text.clone(), false)
+    (text, false)
 }
 
 // ` BC` for an astronomical year at or before zero, which is what the
@@ -887,22 +887,22 @@ fn render_civil_date(year: i64, month: i64, day: i64) -> String {
     // Years at or before zero are written in the era form, so the digits
     // shown are the BC year rather than the astronomical one.
     let shown = if year <= 0 { 1 - year } else { year }
-    format!("{:04}-{:02}-{:02}", shown, month, day)
+    format("{:04}-{:02}-{:02}", shown, month, day)
 }
 
-fn read_civil_date(text: &String) -> Result<(i64, i64, i64, String), errors::Error> {
+fn read_civil_date(text: String) -> Result<(i64, i64, i64, String), errors::Error> {
     let n = text.byte_len()
     let negative = n > 0 && text.byte_at(0) == 45
     let start = if negative { 1 } else { 0 }
-    let (year_text, after_year) = read_digits(text, start)
+    let year_text, after_year = read_digits(text, start)
     if year_text == "" || after_year >= n || text.byte_at(after_year) != 45 {
         return Err(errors::newf("`{}` is not a date", text))
     }
-    let (month_text, after_month) = read_digits(text, after_year + 1)
+    let month_text, after_month = read_digits(text, after_year + 1)
     if month_text == "" || after_month >= n || text.byte_at(after_month) != 45 {
         return Err(errors::newf("`{}` is not a date", text))
     }
-    let (day_text, after_day) = read_digits(text, after_month + 1)
+    let day_text, after_day = read_digits(text, after_month + 1)
     if day_text == "" {
         return Err(errors::newf("`{}` is not a date", text))
     }
@@ -916,13 +916,13 @@ fn read_civil_date(text: &String) -> Result<(i64, i64, i64, String), errors::Err
 }
 
 // Reads `HH:MM[:SS[.ffffff]]`, answering the fields and whatever follows.
-fn read_clock(text: &String) -> Result<(i64, i64, i64, i64, String), errors::Error> {
+fn read_clock(text: String) -> Result<(i64, i64, i64, i64, String), errors::Error> {
     let n = text.byte_len()
-    let (hour_text, after_hour) = read_digits(text, 0)
+    let hour_text, after_hour = read_digits(text, 0)
     if hour_text == "" || after_hour >= n || text.byte_at(after_hour) != 58 {
         return Err(errors::newf("`{}` is not a time", text))
     }
-    let (minute_text, after_minute) = read_digits(text, after_hour + 1)
+    let minute_text, after_minute = read_digits(text, after_hour + 1)
     if minute_text == "" {
         return Err(errors::newf("`{}` is not a time", text))
     }
@@ -935,15 +935,15 @@ fn read_clock(text: &String) -> Result<(i64, i64, i64, i64, String), errors::Err
             text.substring(after_minute, n)
         ))
     }
-    let (second_text, after_second) = read_digits(text, after_minute + 1)
+    let second_text, after_second = read_digits(text, after_minute + 1)
     if second_text == "" {
         return Err(errors::newf("`{}` is not a time", text))
     }
     let mut micros = 0
     let mut cursor = after_second
     if cursor < n && text.byte_at(cursor) == 46 {
-        let (fraction, after_fraction) = read_digits(text, cursor + 1)
-        micros = scale_fraction(&fraction)
+        let fraction, after_fraction = read_digits(text, cursor + 1)
+        micros = scale_fraction(fraction)
         cursor = after_fraction
     }
     Ok((
@@ -957,8 +957,8 @@ fn read_clock(text: &String) -> Result<(i64, i64, i64, i64, String), errors::Err
 
 // A fractional-second digit string as microseconds, padded or truncated to
 // the six digits PostgreSQL keeps.
-fn scale_fraction(digits: &String) -> i64 {
-    let mut six = digits.clone()
+fn scale_fraction(digits: String) -> i64 {
+    let mut six = digits
     while six.byte_len() < 6 {
         six += "0"
     }
@@ -967,7 +967,7 @@ fn scale_fraction(digits: &String) -> i64 {
 
 // Parses a trailing zone offset: `+05`, `-0530`, `+05:30`, `+05:30:00`, or
 // `Z`. An empty remainder means the value carries no zone.
-fn parse_offset(text: &String) -> Result<Option<i64>, errors::Error> {
+fn parse_offset(text: String) -> Result<Option<i64>, errors::Error> {
     let t = text.trim()
     if t == "" {
         return Ok(None)
@@ -993,7 +993,7 @@ fn parse_offset(text: &String) -> Result<Option<i64>, errors::Error> {
     Ok(Some(sign * (hours * 60 + minutes)))
 }
 
-fn read_digits(text: &String, start: i64) -> (String, i64) {
+fn read_digits(text: String, start: i64) -> (String, i64) {
     let n = text.byte_len()
     let mut end = start
     while end < n {
@@ -1009,7 +1009,7 @@ fn read_digits(text: &String, start: i64) -> (String, i64) {
 // --- text rendering ------------------------------------------------
 
 fn render_clock(hour: i64, minute: i64, second: i64, micros: i64) -> String {
-    format!("{:02}:{:02}:{:02}", hour, minute, second) + &render_fraction(micros)
+    format("{:02}:{:02}:{:02}", hour, minute, second) + render_fraction(micros)
 }
 
 // The fractional-second digits, with the trailing zeros the server also
@@ -1018,11 +1018,11 @@ fn render_fraction(micros: i64) -> String {
     if micros == 0 {
         return ""
     }
-    let mut digits = format!("{:06}", micros)
+    let mut digits = format("{:06}", micros)
     while digits.ends_with("0") {
         digits = digits.substring(0, digits.byte_len() - 1)
     }
-    "." + &digits
+    "." + digits
 }
 
 // The offset PostgreSQL writes: the hours alone when the minutes are zero,
@@ -1032,16 +1032,16 @@ fn render_offset(offset_minutes: Option<i64>) -> String {
     let sign = if minutes < 0 { "-" } else { "+" }
     let total = if minutes < 0 { -minutes } else { minutes }
     if total % 60 == 0 {
-        return format!("{}{:02}", sign, total / 60)
+        return format("{}{:02}", sign, total / 60)
     }
-    format!("{}{:02}:{:02}", sign, total / 60, total % 60)
+    format("{}{:02}:{:02}", sign, total / 60, total % 60)
 }
 
 // RFC 3339 always spells both halves of the offset.
 fn render_rfc3339_offset(minutes: i64) -> String {
     let sign = if minutes < 0 { "-" } else { "+" }
     let total = if minutes < 0 { -minutes } else { minutes }
-    format!("{}{:02}:{:02}", sign, total / 60, total % 60)
+    format("{}{:02}:{:02}", sign, total / 60, total % 60)
 }
 
 // The `HH:MM:SS.ffffff` part of an interval, which carries its own sign and
@@ -1049,19 +1049,19 @@ fn render_rfc3339_offset(minutes: i64) -> String {
 fn render_interval_clock(micros: i64) -> String {
     let negative = micros < 0
     let total = if negative { -micros } else { micros }
-    let (hour, minute, second, fraction) = split_day_micros(total)
+    let hour, minute, second, fraction = split_day_micros(total)
     let sign = if negative { "-" } else { "" }
-    sign + &format!("{:02}:{:02}:{:02}", hour, minute, second) + &render_fraction(fraction)
+    sign + format("{:02}:{:02}:{:02}", hour, minute, second) + render_fraction(fraction)
 }
 
 // A whole-or-fractional second count in an ISO 8601 duration, as
 // microseconds.
-fn fractional_seconds(digits: &String) -> Result<i64, errors::Error> {
+fn fractional_seconds(digits: String) -> Result<i64, errors::Error> {
     match digits.split_once(".") {
         Some((whole, fraction)) => {
             let seconds = whole.to_i64()
                 .ok_or(errors::newf("interval count `{}` is not a number", digits))?
-            let scaled = scale_fraction(&fraction)
+            let scaled = scale_fraction(fraction)
             if seconds < 0 || whole.starts_with("-") {
                 return Ok(seconds * MICROS_PER_SECOND - scaled)
             }
@@ -1077,14 +1077,14 @@ fn fractional_seconds(digits: &String) -> Result<i64, errors::Error> {
 
 // `HH:MM:SS[.ffffff]` inside an interval, which may be signed and may run
 // past a day's worth of hours.
-fn parse_interval_clock(text: &String) -> Result<i64, errors::Error> {
+fn parse_interval_clock(text: String) -> Result<i64, errors::Error> {
     let negative = text.starts_with("-")
     let body = if negative || text.starts_with("+") {
         text.substring(1, text.byte_len())
     } else {
-        text.clone()
+        text
     }
-    let (hour, minute, second, micros, rest) = read_clock(&body)?
+    let hour, minute, second, micros, rest = read_clock(body)?
     if rest.trim() != "" {
         return Err(errors::newf("trailing text in interval time `{}`: {}", text, rest))
     }
@@ -1095,20 +1095,20 @@ fn parse_interval_clock(text: &String) -> Result<i64, errors::Error> {
 
 // An interval unit with its plural `s` dropped, so one spelling covers
 // `1 day` and `2 days`.
-fn singular(word: &String) -> String {
+fn singular(word: String) -> String {
     if word.ends_with("s") {
         return word.substring(0, word.byte_len() - 1)
     }
-    word.clone()
+    word
 }
 
 // The unit spelled the way PostgreSQL spells it: singular only for exactly
 // one, so a negative count reads `-1 years`.
-fn plural(unit: &String, count: i64) -> String {
+fn plural(unit: String, count: i64) -> String {
     if count == 1 {
-        return unit.clone()
+        return unit
     }
-    unit.clone() + "s"
+    unit + "s"
 }
 
 #[cfg(test)]
@@ -1117,66 +1117,66 @@ mod temporal_tests {
 
     // Each parse answers a `Result`; a test that expects a value reads it
     // through these, so a parse that fails reports its own message.
-    fn ts(text: &String) -> super::Timestamp {
+    fn ts(text: String) -> super::Timestamp {
         match super::parse_timestamp(text) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn dt(text: &String) -> super::Date {
+    fn dt(text: String) -> super::Date {
         match super::parse_date(text) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn tm(text: &String) -> super::Time {
+    fn tm(text: String) -> super::Time {
         match super::parse_time(text) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn iv(text: &String) -> super::Interval {
+    fn iv(text: String) -> super::Interval {
         match super::parse_interval(text) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn uu(text: &String) -> super::Uuid {
+    fn uu(text: String) -> super::Uuid {
         match super::parse_uuid(text) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn from_binary_ts(raw: &Vec<u8>) -> super::Timestamp {
+    fn from_binary_ts(raw: Vec<u8>) -> super::Timestamp {
         match super::timestamp_from_binary(raw, true) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn from_binary_date(raw: &Vec<u8>) -> super::Date {
+    fn from_binary_date(raw: Vec<u8>) -> super::Date {
         match super::date_from_binary(raw) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn from_binary_time(raw: &Vec<u8>) -> super::Time {
+    fn from_binary_time(raw: Vec<u8>) -> super::Time {
         match super::time_from_binary(raw) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
-    fn from_binary_interval(raw: &Vec<u8>) -> super::Interval {
+    fn from_binary_interval(raw: Vec<u8>) -> super::Interval {
         match super::interval_from_binary(raw) {
             Ok(v) => v
-            Err(e) => panic!("{}", e)
+            Err(e) => panic("{}", e)
         }
     }
 
@@ -1194,173 +1194,173 @@ mod temporal_tests {
         ]
         for (year, month, day) in dates {
             let days = super::days_from_civil(year, month, day)
-            let (y, m, d) = super::civil_from_days(days)
+            let y, m, d = super::civil_from_days(days)
             let _ = testing::check_eq(
-                &format!("{}-{}-{}", y, m, d)
-                &format!("{}-{}-{}", year, month, day)
+                format("{}-{}-{}", y, m, d)
+                format("{}-{}-{}", year, month, day)
                 "civil round trip"
             )
         }
-        let _ = testing::check_eq(&super::days_from_civil(1970, 1, 1), &0, "unix epoch")
+        let _ = testing::check_eq(super::days_from_civil(1970, 1, 1), 0, "unix epoch")
         let _ = testing::check_eq(
-            &super::days_from_civil(2000, 1, 1)
-            &super::PG_EPOCH_DAYS
+            super::days_from_civil(2000, 1, 1)
+            super::PG_EPOCH_DAYS
             "postgres epoch"
         )
     }
 
     #[test]
     fn a_timestamp_keeps_its_microseconds_through_text() {
-        let ts = ts(&"2026-08-16 12:34:56.789012+00")
-        let _ = testing::check_eq(&ts.micros, &789_012, "microseconds survive")
-        let _ = testing::check_eq(&ts.offset_minutes.unwrap_or(-1), &0, "utc offset")
+        let ts = ts("2026-08-16 12:34:56.789012+00")
+        let _ = testing::check_eq(ts.micros, 789_012, "microseconds survive")
+        let _ = testing::check_eq(ts.offset_minutes.unwrap_or(-1), 0, "utc offset")
         let _ = testing::check_eq(
-            &ts.to_string()
-            &"2026-08-16 12:34:56.789012+00"
+            ts.to_string()
+            "2026-08-16 12:34:56.789012+00"
             "renders as the server wrote it"
         )
         let _ = testing::check_eq(
-            &ts.to_rfc3339()
-            &"2026-08-16T12:34:56.789012Z"
+            ts.to_rfc3339()
+            "2026-08-16T12:34:56.789012Z"
             "rfc 3339 form"
         )
         let _ = testing::check_eq(
-            &super::Timestamp::from_unix_micros(ts.to_unix_micros()).micros
-            &789_012
+            super::Timestamp::from_unix_micros(ts.to_unix_micros()).micros
+            789_012
             "epoch micros round trip"
         )
     }
 
     #[test]
     fn a_timestamp_without_a_zone_carries_none() {
-        let ts = ts(&"2026-08-16 12:34:56")
+        let ts = ts("2026-08-16 12:34:56")
         let _ = testing::check(ts.offset_minutes.is_none(), "no zone")
-        let _ = testing::check_eq(&ts.to_string(), &"2026-08-16 12:34:56", "renders bare")
+        let _ = testing::check_eq(ts.to_string(), "2026-08-16 12:34:56", "renders bare")
     }
 
     #[test]
     fn a_half_hour_zone_renders_both_halves() {
-        let ts = ts(&"2026-08-16 12:34:56+05:30")
-        let _ = testing::check_eq(&ts.offset_minutes.unwrap_or(0), &330, "offset minutes")
+        let ts = ts("2026-08-16 12:34:56+05:30")
+        let _ = testing::check_eq(ts.offset_minutes.unwrap_or(0), 330, "offset minutes")
         let _ = testing::check_eq(
-            &ts.to_string()
-            &"2026-08-16 12:34:56+05:30"
+            ts.to_string()
+            "2026-08-16 12:34:56+05:30"
             "renders both halves"
         )
         let _ = testing::check_eq(
-            &ts.to_utc().to_string()
-            &"2026-08-16 07:04:56+00"
+            ts.to_utc().to_string()
+            "2026-08-16 07:04:56+00"
             "converted to utc"
         )
     }
 
     #[test]
     fn the_two_infinities_survive_text_and_binary() {
-        let ts = ts(&"infinity")
-        let _ = testing::check_eq(&ts.to_string(), &"infinity", "infinity renders")
-        let binary = super::timestamp_to_binary(&ts)
-        let back = from_binary_ts(&binary)
-        let _ = testing::check_eq(&back.to_string(), &"infinity", "infinity in binary")
+        let ts = ts("infinity")
+        let _ = testing::check_eq(ts.to_string(), "infinity", "infinity renders")
+        let binary = super::timestamp_to_binary(ts)
+        let back = from_binary_ts(binary)
+        let _ = testing::check_eq(back.to_string(), "infinity", "infinity in binary")
 
-        let date = dt(&"-infinity")
-        let _ = testing::check_eq(&date.to_string(), &"-infinity", "-infinity renders")
-        let date_back = from_binary_date(&super::date_to_binary(&date))
-        let _ = testing::check_eq(&date_back.to_string(), &"-infinity", "-infinity in binary")
+        let date = dt("-infinity")
+        let _ = testing::check_eq(date.to_string(), "-infinity", "-infinity renders")
+        let date_back = from_binary_date(super::date_to_binary(date))
+        let _ = testing::check_eq(date_back.to_string(), "-infinity", "-infinity in binary")
     }
 
     #[test]
     fn binary_timestamps_agree_with_their_text_form() {
-        let ts = ts(&"2026-08-16 12:34:56.789012+00")
-        let raw = super::timestamp_to_binary(&ts)
-        let _ = testing::check_eq(&raw.len(), &8, "eight bytes")
-        let back = from_binary_ts(&raw)
+        let ts = ts("2026-08-16 12:34:56.789012+00")
+        let raw = super::timestamp_to_binary(ts)
+        let _ = testing::check_eq(raw.len(), 8, "eight bytes")
+        let back = from_binary_ts(raw)
         let _ = testing::check_eq(
-            &back.to_string()
-            &"2026-08-16 12:34:56.789012+00"
+            back.to_string()
+            "2026-08-16 12:34:56.789012+00"
             "binary decodes to the same instant"
         )
     }
 
     #[test]
     fn dates_and_times_parse_and_render() {
-        let date = dt(&"2026-08-16")
-        let _ = testing::check_eq(&date.to_string(), &"2026-08-16", "date text")
+        let date = dt("2026-08-16")
+        let _ = testing::check_eq(date.to_string(), "2026-08-16", "date text")
         let _ = testing::check_eq(
-            &from_binary_date(&super::date_to_binary(&date)).to_string()
-            &"2026-08-16"
+            from_binary_date(super::date_to_binary(date)).to_string()
+            "2026-08-16"
             "date binary"
         )
-        let t = tm(&"12:34:56.5")
-        let _ = testing::check_eq(&t.micros, &500_000, "half a second")
-        let _ = testing::check_eq(&t.to_string(), &"12:34:56.5", "time text")
-        let tz = tm(&"12:34:56-05")
-        let _ = testing::check_eq(&tz.offset_minutes.unwrap_or(0), &-300, "timetz offset")
-        let _ = testing::check_eq(&tz.to_string(), &"12:34:56-05", "timetz text")
+        let t = tm("12:34:56.5")
+        let _ = testing::check_eq(t.micros, 500_000, "half a second")
+        let _ = testing::check_eq(t.to_string(), "12:34:56.5", "time text")
+        let tz = tm("12:34:56-05")
+        let _ = testing::check_eq(tz.offset_minutes.unwrap_or(0), -300, "timetz offset")
+        let _ = testing::check_eq(tz.to_string(), "12:34:56-05", "timetz text")
         let _ = testing::check_eq(
-            &from_binary_time(&super::time_to_binary(&tz)).to_string()
-            &"12:34:56-05"
+            from_binary_time(super::time_to_binary(tz)).to_string()
+            "12:34:56-05"
             "timetz binary"
         )
     }
 
     #[test]
     fn a_year_before_the_common_era_uses_the_era_suffix() {
-        let date = dt(&"0044-03-15 BC")
-        let _ = testing::check_eq(&date.year, &-43, "astronomical year")
-        let _ = testing::check_eq(&date.to_string(), &"0044-03-15 BC", "era renders back")
+        let date = dt("0044-03-15 BC")
+        let _ = testing::check_eq(date.year, -43, "astronomical year")
+        let _ = testing::check_eq(date.to_string(), "0044-03-15 BC", "era renders back")
     }
 
     #[test]
     fn intervals_keep_their_three_components_separate() {
-        let interval = iv(&"1 year 2 mons 3 days 04:05:06.789")
-        let _ = testing::check_eq(&interval.months, &14, "months")
-        let _ = testing::check_eq(&interval.days, &3, "days")
+        let interval = iv("1 year 2 mons 3 days 04:05:06.789")
+        let _ = testing::check_eq(interval.months, 14, "months")
+        let _ = testing::check_eq(interval.days, 3, "days")
         let _ = testing::check_eq(
-            &interval.micros
-            &(4 * 3_600_000_000 + 5 * 60_000_000 + 6_789_000)
+            interval.micros
+            4 * 3_600_000_000 + 5 * 60_000_000 + 6_789_000
             "microseconds"
         )
         let _ = testing::check_eq(
-            &interval.to_string()
-            &"1 year 2 mons 3 days 04:05:06.789"
+            interval.to_string()
+            "1 year 2 mons 3 days 04:05:06.789"
             "renders as the server wrote it"
         )
-        let raw = super::interval_to_binary(&interval)
+        let raw = super::interval_to_binary(interval)
         let _ = testing::check_eq(
-            &from_binary_interval(&raw).to_string()
-            &"1 year 2 mons 3 days 04:05:06.789"
+            from_binary_interval(raw).to_string()
+            "1 year 2 mons 3 days 04:05:06.789"
             "binary interval"
         )
     }
 
     #[test]
     fn a_zero_interval_renders_as_a_zero_clock() {
-        let interval = iv(&"00:00:00")
+        let interval = iv("00:00:00")
         let _ = testing::check(interval.is_zero(), "zero")
-        let _ = testing::check_eq(&interval.to_string(), &"00:00:00", "zero renders")
+        let _ = testing::check_eq(interval.to_string(), "00:00:00", "zero renders")
     }
 
     #[test]
     fn a_negative_interval_keeps_its_sign_on_every_component() {
-        let interval = iv(&"-1 years -2 mons -3 days -04:05:06")
-        let _ = testing::check_eq(&interval.months, &-14, "negative months")
-        let _ = testing::check_eq(&interval.days, &-3, "negative days")
+        let interval = iv("-1 years -2 mons -3 days -04:05:06")
+        let _ = testing::check_eq(interval.months, -14, "negative months")
+        let _ = testing::check_eq(interval.days, -3, "negative days")
         let _ = testing::check(interval.micros < 0, "negative time")
         let _ = testing::check_eq(
-            &interval.to_string()
-            &"-1 years -2 mons -3 days -04:05:06"
+            interval.to_string()
+            "-1 years -2 mons -3 days -04:05:06"
             "renders back"
         )
     }
 
     #[test]
     fn an_iso_8601_interval_parses() {
-        let interval = iv(&"P1Y2M3DT4H5M6.5S")
-        let _ = testing::check_eq(&interval.months, &14, "iso months")
-        let _ = testing::check_eq(&interval.days, &3, "iso days")
+        let interval = iv("P1Y2M3DT4H5M6.5S")
+        let _ = testing::check_eq(interval.months, 14, "iso months")
+        let _ = testing::check_eq(interval.days, 3, "iso days")
         let _ = testing::check_eq(
-            &interval.micros
-            &(4 * 3_600_000_000 + 5 * 60_000_000 + 6_500_000)
+            interval.micros
+            4 * 3_600_000_000 + 5 * 60_000_000 + 6_500_000
             "iso microseconds"
         )
     }
@@ -1369,34 +1369,34 @@ mod temporal_tests {
     fn the_types_order_by_the_instant_they_name() {
         // Same instant, different zones: the civil fields disagree and the
         // instants do not.
-        let utc = ts(&"2026-08-16 12:00:00+00")
-        let east = ts(&"2026-08-16 17:30:00+05:30")
-        let _ = testing::check(!utc.is_before(&east), "the same instant is not before itself")
-        let _ = testing::check(!utc.is_after(&east), "nor after")
+        let utc = ts("2026-08-16 12:00:00+00")
+        let east = ts("2026-08-16 17:30:00+05:30")
+        let _ = testing::check(!utc.is_before(east), "the same instant is not before itself")
+        let _ = testing::check(!utc.is_after(east), "nor after")
 
-        let later = ts(&"2026-08-16 12:00:00.000001+00")
-        let _ = testing::check(utc.is_before(&later), "a microsecond later is later")
-        let _ = testing::check(later.is_after(&utc), "and the other way round")
+        let later = ts("2026-08-16 12:00:00.000001+00")
+        let _ = testing::check(utc.is_before(later), "a microsecond later is later")
+        let _ = testing::check(later.is_after(utc), "and the other way round")
 
         // Either infinity belongs at the end of the order, not at year zero.
-        let hi = ts(&"infinity")
-        let lo = ts(&"-infinity")
-        let _ = testing::check(utc.is_before(&hi), "everything is before infinity")
-        let _ = testing::check(utc.is_after(&lo), "and after -infinity")
-        let _ = testing::check(lo.is_before(&hi), "and the two bracket it")
+        let hi = ts("infinity")
+        let lo = ts("-infinity")
+        let _ = testing::check(utc.is_before(hi), "everything is before infinity")
+        let _ = testing::check(utc.is_after(lo), "and after -infinity")
+        let _ = testing::check(lo.is_before(hi), "and the two bracket it")
 
-        let early = dt(&"2026-08-16")
-        let late = dt(&"2026-08-17")
-        let _ = testing::check(early.is_before(&late), "dates order by day")
-        let _ = testing::check(dt(&"-infinity").is_before(&early), "-infinity first")
-        let _ = testing::check(early.is_before(&dt(&"infinity")), "infinity last")
+        let early = dt("2026-08-16")
+        let late = dt("2026-08-17")
+        let _ = testing::check(early.is_before(late), "dates order by day")
+        let _ = testing::check(dt("-infinity").is_before(early), "-infinity first")
+        let _ = testing::check(early.is_before(dt("infinity")), "infinity last")
 
         // A `timetz` orders by the moment of the day it names in UTC.
-        let noon_utc = tm(&"12:00:00+00")
-        let noon_east = tm(&"17:30:00+05:30")
-        let _ = testing::check(!noon_utc.is_before(&noon_east), "the same moment of the day")
-        let _ = testing::check(!noon_utc.is_after(&noon_east), "in either direction")
-        let _ = testing::check(tm(&"11:00:00+00").is_before(&noon_utc), "an hour earlier is earlier")
+        let noon_utc = tm("12:00:00+00")
+        let noon_east = tm("17:30:00+05:30")
+        let _ = testing::check(!noon_utc.is_before(noon_east), "the same moment of the day")
+        let _ = testing::check(!noon_utc.is_after(noon_east), "in either direction")
+        let _ = testing::check(tm("11:00:00+00").is_before(noon_utc), "an hour earlier is earlier")
     }
 
     #[test]
@@ -1407,17 +1407,17 @@ mod temporal_tests {
             "1970-01-01", "1969-12-31", "2000-02-29", "1900-03-01", "2024-02-29"
             "0001-01-01", "9999-12-31", "2026-08-23"
         ] {
-            match super::parse_date(&spelling) {
+            match super::parse_date(spelling) {
                 Ok(date) => {
                     let back = super::Date::from_unix_days(date.to_unix_days())
-                    let _ = testing::check_eq(&back.to_string(), &spelling, &format!("round trip {}", spelling))
+                    let _ = testing::check_eq(back.to_string(), spelling, format("round trip {}", spelling))
                 }
-                Err(e) => { let _ = testing::check(false, &format!("{}: {}", spelling, e)) }
+                Err(e) => { let _ = testing::check(false, format("{}: {}", spelling, e)) }
             }
         }
-        match super::parse_date(&"1970-01-01") {
-            Ok(epoch) => { let _ = testing::check_eq(&epoch.to_unix_days(), &0, "the epoch is day zero") }
-            Err(e) => { let _ = testing::check(false, &format!("epoch: {}", e)) }
+        match super::parse_date("1970-01-01") {
+            Ok(epoch) => { let _ = testing::check_eq(epoch.to_unix_days(), 0, "the epoch is day zero") }
+            Err(e) => { let _ = testing::check(false, format("epoch: {}", e)) }
         }
     }
 
@@ -1425,18 +1425,18 @@ mod temporal_tests {
     fn an_infinite_date_sorts_past_every_finite_one() {
         // Ordering is by the key rather than by the fields, so an infinity
         // does not land at year zero.
-        match (super::parse_date(&"infinity"), super::parse_date(&"-infinity")) {
+        match (super::parse_date("infinity"), super::parse_date("-infinity")) {
             (Ok(hi), Ok(lo)) => {
-                match super::parse_date(&"9999-12-31") {
+                match super::parse_date("9999-12-31") {
                     Ok(late) => {
-                        let _ = testing::check(late.is_before(&hi), "a late date is before infinity")
-                        let _ = testing::check(lo.is_before(&late), "-infinity is before it")
+                        let _ = testing::check(late.is_before(hi), "a late date is before infinity")
+                        let _ = testing::check(lo.is_before(late), "-infinity is before it")
                         let _ = testing::check(hi.ordering_key() > late.ordering_key(), "and the keys agree")
                         let _ = testing::check(lo.ordering_key() < late.ordering_key(), "at both ends")
                     }
-                    Err(e) => { let _ = testing::check(false, &format!("late: {}", e)) }
+                    Err(e) => { let _ = testing::check(false, format("late: {}", e)) }
                 }
-                let _ = testing::check_eq(&hi.to_unix_days(), &0, "an infinity names no day")
+                let _ = testing::check_eq(hi.to_unix_days(), 0, "an infinity names no day")
             }
             (_, _) => { let _ = testing::check(false, "both infinities parse") }
         }
@@ -1444,26 +1444,26 @@ mod temporal_tests {
 
     #[test]
     fn midnight_on_a_date_carries_the_date_and_no_zone() {
-        match super::parse_date(&"2026-08-23") {
+        match super::parse_date("2026-08-23") {
             Ok(date) => {
                 let at = date.at_midnight()
-                let _ = testing::check_eq(&at.to_string(), &"2026-08-23 00:00:00", "midnight")
+                let _ = testing::check_eq(at.to_string(), "2026-08-23 00:00:00", "midnight")
                 let _ = testing::check(at.offset_minutes.is_none(), "and no zone")
-                let _ = testing::check_eq(&at.date().to_string(), &"2026-08-23", "the date reads back")
+                let _ = testing::check_eq(at.date().to_string(), "2026-08-23", "the date reads back")
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse: {}", e)) }
         }
     }
 
     #[test]
     fn a_time_round_trips_through_its_microseconds_past_midnight() {
         for spelling in #["00:00:00", "12:34:56.789012", "23:59:59.999999", "01:02:03"] {
-            match super::parse_time(&spelling) {
+            match super::parse_time(spelling) {
                 Ok(clock) => {
                     let back = super::Time::from_day_micros(clock.to_day_micros())
-                    let _ = testing::check_eq(&back.to_string(), &spelling, &format!("round trip {}", spelling))
+                    let _ = testing::check_eq(back.to_string(), spelling, format("round trip {}", spelling))
                 }
-                Err(e) => { let _ = testing::check(false, &format!("{}: {}", spelling, e)) }
+                Err(e) => { let _ = testing::check(false, format("{}: {}", spelling, e)) }
             }
         }
     }
@@ -1472,13 +1472,13 @@ mod temporal_tests {
     fn two_zoned_times_compare_as_the_moments_of_the_day_they_name() {
         // 12:00+02 is 10:00 UTC, which is earlier in the day than 11:00 UTC
         // even though its written hour is later.
-        match (super::parse_time(&"12:00:00+02"), super::parse_time(&"11:00:00+00")) {
+        match (super::parse_time("12:00:00+02"), super::parse_time("11:00:00+00")) {
             (Ok(east), Ok(utc)) => {
-                let _ = testing::check(east.is_before(&utc), "the eastern clock names the earlier moment")
-                let _ = testing::check(!east.is_after(&utc), "and not the later one")
+                let _ = testing::check(east.is_before(utc), "the eastern clock names the earlier moment")
+                let _ = testing::check(!east.is_after(utc), "and not the later one")
                 let _ = testing::check_eq(
-                    &east.to_utc_day_micros()
-                    &(10 * 3_600 * 1_000_000)
+                    east.to_utc_day_micros()
+                    (10 * 3_600 * 1_000_000)
                     "ten hours past midnight UTC"
                 )
                 let _ = testing::check(
@@ -1492,48 +1492,48 @@ mod temporal_tests {
 
     #[test]
     fn a_timestamp_reports_the_epoch_in_both_the_units_it_offers() {
-        match super::parse_timestamp(&"1970-01-01 00:00:01.500000+00") {
+        match super::parse_timestamp("1970-01-01 00:00:01.500000+00") {
             Ok(at) => {
-                let _ = testing::check_eq(&at.to_unix_micros(), &1_500_000, "microseconds")
-                let _ = testing::check_eq(&at.to_unix_millis(), &1_500, "milliseconds drop the rest")
+                let _ = testing::check_eq(at.to_unix_micros(), 1_500_000, "microseconds")
+                let _ = testing::check_eq(at.to_unix_millis(), 1_500, "milliseconds drop the rest")
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse: {}", e)) }
         }
         // Before the epoch the division has to floor rather than truncate, or
         // a negative instant rounds towards zero and gains a millisecond.
-        match super::parse_timestamp(&"1969-12-31 23:59:59.500000+00") {
+        match super::parse_timestamp("1969-12-31 23:59:59.500000+00") {
             Ok(at) => {
-                let _ = testing::check_eq(&at.to_unix_micros(), &-500_000, "microseconds before the epoch")
-                let _ = testing::check_eq(&at.to_unix_millis(), &-500, "and the milliseconds floor")
+                let _ = testing::check_eq(at.to_unix_micros(), -500_000, "microseconds before the epoch")
+                let _ = testing::check_eq(at.to_unix_millis(), -500, "and the milliseconds floor")
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse: {}", e)) }
         }
     }
 
     #[test]
     fn a_zoned_timestamp_reads_back_as_the_same_instant_in_utc() {
-        match super::parse_timestamp(&"2026-08-23 12:00:00+02") {
+        match super::parse_timestamp("2026-08-23 12:00:00+02") {
             Ok(east) => {
                 let utc = east.to_utc()
-                let _ = testing::check_eq(&utc.hour, &10, "two hours earlier by the clock")
+                let _ = testing::check_eq(utc.hour, 10, "two hours earlier by the clock")
                 let _ = testing::check_eq(
-                    &utc.to_unix_micros()
-                    &east.to_unix_micros()
+                    utc.to_unix_micros()
+                    east.to_unix_micros()
                     "and the same instant"
                 )
-                let _ = testing::check(!east.is_before(&utc), "neither is before the other")
-                let _ = testing::check(!east.is_after(&utc), "in either direction")
+                let _ = testing::check(!east.is_before(utc), "neither is before the other")
+                let _ = testing::check(!east.is_after(utc), "in either direction")
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse: {}", e)) }
         }
     }
 
     #[test]
     fn an_interval_built_from_microseconds_carries_only_that_component() {
         let span = super::Interval::from_micros(90_000_000)
-        let _ = testing::check_eq(&span.months, &0, "no months")
-        let _ = testing::check_eq(&span.days, &0, "no days")
-        let _ = testing::check_eq(&span.micros, &90_000_000, "ninety seconds")
+        let _ = testing::check_eq(span.months, 0, "no months")
+        let _ = testing::check_eq(span.days, 0, "no days")
+        let _ = testing::check_eq(span.micros, 90_000_000, "ninety seconds")
         let _ = testing::check(!span.is_zero(), "and it is not zero")
         let _ = testing::check(super::Interval::from_micros(0).is_zero(), "zero is")
     }
@@ -1542,25 +1542,25 @@ mod temporal_tests {
     fn the_approximate_reading_of_an_interval_names_the_month_it_assumed() {
         // No fixed conversion between months, days, and microseconds exists,
         // so this reading is the caller's decision to take 30-day months.
-        match super::parse_interval(&"1 mon") {
+        match super::parse_interval("1 mon") {
             Ok(month) => {
                 let _ = testing::check_eq(
-                    &month.to_approximate_micros()
-                    &(30 * 24 * 3_600 * 1_000_000)
+                    month.to_approximate_micros()
+                    (30 * 24 * 3_600 * 1_000_000)
                     "a month is thirty days here"
                 )
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse: {}", e)) }
         }
-        match super::parse_interval(&"1 day 02:00:00") {
+        match super::parse_interval("1 day 02:00:00") {
             Ok(span) => {
                 let _ = testing::check_eq(
-                    &span.to_approximate_micros()
-                    &(26 * 3_600 * 1_000_000)
+                    span.to_approximate_micros()
+                    (26 * 3_600 * 1_000_000)
                     "a day is twenty-four hours, and the clock adds to it"
                 )
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse: {}", e)) }
         }
     }
 
@@ -1569,17 +1569,17 @@ mod temporal_tests {
         let raw: Vec<u8> = #[
             1, 147, 193, 244, 31, 16, 112, 0, 128, 0, 1, 35, 69, 103, 137, 171
         ]
-        match super::Uuid::from_bytes(raw.clone()) {
+        match super::Uuid::from_bytes(raw) {
             Ok(id) => {
                 let _ = testing::check_eq(
-                    &id.to_string()
-                    &"0193c1f4-1f10-7000-8000-0123456789ab"
+                    id.to_string()
+                    "0193c1f4-1f10-7000-8000-0123456789ab"
                     "the canonical spelling"
                 )
-                let _ = testing::check_eq(&id.to_hex(), &"0193c1f41f10700080000123456789ab", "bare hex")
-                let _ = testing::check_eq(&id.bytes.len(), &16, "sixteen bytes")
+                let _ = testing::check_eq(id.to_hex(), "0193c1f41f10700080000123456789ab", "bare hex")
+                let _ = testing::check_eq(id.bytes.len(), 16, "sixteen bytes")
             }
-            Err(e) => { let _ = testing::check(false, &format!("from_bytes: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("from_bytes: {}", e)) }
         }
         let _ = testing::check(super::Uuid::from_bytes(#[1, 2, 3]).is_err(), "a short payload is rejected")
     }
@@ -1587,13 +1587,13 @@ mod temporal_tests {
     #[test]
     fn uuids_parse_from_every_spelling_and_render_canonically() {
         let canonical = "00112233-4455-6677-8899-aabbccddeeff"
-        let hyphenated = uu(&canonical)
-        let _ = testing::check_eq(&hyphenated.to_string(), &canonical, "hyphenated")
-        let bare = uu(&"00112233445566778899AABBCCDDEEFF")
-        let _ = testing::check_eq(&bare.to_string(), &canonical, "bare and upper case")
-        let braced = uu(&format!("{{{}}}", canonical))
-        let _ = testing::check_eq(&braced.to_string(), &canonical, "braced")
-        let _ = testing::check(super::parse_uuid(&"not-a-uuid").is_err(), "rejects a non-uuid")
-        let _ = testing::check_eq(&hyphenated.bytes.len(), &16, "sixteen bytes")
+        let hyphenated = uu(canonical)
+        let _ = testing::check_eq(hyphenated.to_string(), canonical, "hyphenated")
+        let bare = uu("00112233445566778899AABBCCDDEEFF")
+        let _ = testing::check_eq(bare.to_string(), canonical, "bare and upper case")
+        let braced = uu(format("{{{}}}", canonical))
+        let _ = testing::check_eq(braced.to_string(), canonical, "braced")
+        let _ = testing::check(super::parse_uuid("not-a-uuid").is_err(), "rejects a non-uuid")
+        let _ = testing::check_eq(hyphenated.bytes.len(), 16, "sixteen bytes")
     }
 }

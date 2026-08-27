@@ -1,8 +1,8 @@
 [project]
 id = "example.com/pgsql-gos-notify"
 version = "0.1.0"
-gossamer-version = "^v0.55.3"
+gossamer-version = "^v0.56.0"
 
 [dependencies]
-# pgsql_gos = { git = "https://github.com/gossamer-lang/pgsql-gos", tag = "v0.1.1" }
+# pgsql_gos = { git = "https://github.com/gossamer-lang/pgsql-gos", tag = "v0.1.2" }
 pgsql_gos = { path = "../.." }

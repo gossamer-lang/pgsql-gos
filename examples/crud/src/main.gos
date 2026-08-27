@@ -17,14 +17,14 @@ struct Person {
 
 fn main() -> Result<(), errors::Error> {
     let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
-    let mut db = pgsql::connect(&url)?
+    let mut db = pgsql::connect(url)?
     defer db.close()
 
-    println!("connected to PostgreSQL {} as backend {}", db.server_version(), db.backend_pid())
-    println!("tls: {}", db.is_tls())
+    println("connected to PostgreSQL {} as backend {}", db.server_version(), db.backend_pid())
+    println("tls: {}", db.is_tls())
 
-    db.batch_execute(&"DROP TABLE IF EXISTS people")?
-    db.batch_execute(&"""
+    db.batch_execute("DROP TABLE IF EXISTS people")?
+    db.batch_execute("""
     CREATE TABLE people (
         id     serial PRIMARY KEY,
         name   text NOT NULL,
@@ -35,20 +35,20 @@ fn main() -> Result<(), errors::Error> {
     """)?
 
     let inserted = db.execute(
-        &"INSERT INTO people (name, score, tags) VALUES ($1, $2, $3)"
-        &#[pgsql::text("Ada"), pgsql::numeric("99.50"), pgsql::text_array(#["math", "engines"])]
+        "INSERT INTO people (name, score, tags) VALUES ($1, $2, $3)"
+        #[pgsql::text("Ada"), pgsql::numeric("99.50"), pgsql::text_array(#["math", "engines"])]
     )?
-    println!("inserted {} row(s)", inserted)
+    println("inserted {} row(s)", inserted)
 
     let id = db.query_value(
-        &"INSERT INTO people (name, score) VALUES ($1, $2) RETURNING id"
-        &#[pgsql::text("Grace"), pgsql::numeric("100.00")]
+        "INSERT INTO people (name, score) VALUES ($1, $2) RETURNING id"
+        #[pgsql::text("Grace"), pgsql::numeric("100.00")]
     )?
-    println!("second row got id {}", id.as_int().unwrap_or(-1))
+    println("second row got id {}", id.as_int().unwrap_or(-1))
 
-    for row in db.query(&"SELECT id, name, score, tags FROM people ORDER BY id", &#[])? {
+    for row in db.query("SELECT id, name, score, tags FROM people ORDER BY id", #[])? {
         let tags = row.opt_text_of("tags")?.unwrap_or("-")
-        println!(
+        println(
             "  {} {} score={} tags={}"
             row.i64_of("id")?
             row.text_of("name")?
@@ -59,37 +59,37 @@ fn main() -> Result<(), errors::Error> {
 
     // A timestamptz reads at the resolution the server keeps it.
     let row = db.query_one(
-        &"SELECT id, name, score, joined FROM people ORDER BY id LIMIT 1"
-        &#[]
+        "SELECT id, name, score, joined FROM people ORDER BY id LIMIT 1"
+        #[]
     )?
     let joined = row.timestamp_of("joined")?
-    println!("first row joined at {} ({} microseconds past the epoch)", joined, joined.to_unix_micros())
+    println("first row joined at {} ({} microseconds past the epoch)", joined, joined.to_unix_micros())
 
     // And the whole row maps onto a struct of this program's own.
-    match json::decode::<Person>(&pgsql::row_json(&row)) {
-        Ok(person) => println!("mapped: #{} {} scored {}", person.id, person.name, person.score)
-        Err(e) => println!("mapping failed: {}", e)
+    match json::decode::<Person>(pgsql::row_json(row)) {
+        Ok(person) => println("mapped: #{} {} scored {}", person.id, person.name, person.score)
+        Err(e) => println("mapping failed: {}", e)
     }
 
     // A bulk load streams a batch at a time, so nothing holds the payload.
-    let mut copy = db.copy_in_begin(&"COPY people (name, score) FROM STDIN")?
+    let mut copy = db.copy_in_begin("COPY people (name, score) FROM STDIN")?
     for batch_start in (0..1_000).step_by(250) {
         let mut batch: Vec<Vec<pgsql::value::Value>> = #[]
         for offset in 0..250 {
             let n = batch_start + offset
-            batch.push(#[pgsql::text(format!("person{}", n)), pgsql::numeric(format!("{}.00", n))])
+            batch.push(#[pgsql::text(format("person{}", n)), pgsql::numeric(format("{}.00", n))])
         }
-        db.copy_in_write_rows(&mut copy, &batch)?
+        db.copy_in_write_rows(&mut copy, batch)?
     }
-    println!("copied {} row(s) in", db.copy_in_end(&mut copy)?)
+    println("copied {} row(s) in", db.copy_in_end(&mut copy)?)
 
     // A transaction that rolls back leaves nothing behind.
     let mut tx = db.transaction()?
-    let _ = db.execute(&"DELETE FROM people", &#[])?
+    let _ = db.execute("DELETE FROM people", #[])?
     db.rollback(&mut tx)?
-    let remaining = db.query_value(&"SELECT count(*) FROM people", &#[])?
-    println!("after rollback, {} row(s) remain", remaining.as_int().unwrap_or(-1))
+    let remaining = db.query_value("SELECT count(*) FROM people", #[])?
+    println("after rollback, {} row(s) remain", remaining.as_int().unwrap_or(-1))
 
-    db.batch_execute(&"DROP TABLE people")?
+    db.batch_execute("DROP TABLE people")?
     Ok(())
 }

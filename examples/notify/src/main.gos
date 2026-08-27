@@ -22,31 +22,31 @@ const IDLE_TIMEOUT_MS: i64 = 2_000
 
 fn main() -> Result<(), errors::Error> {
     let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
-    setup(&url)?
+    setup(url)?
 
-    let (done, finished) = channel_unbounded()
+    let done, finished = channel_unbounded()
     cohort {
         spawn(|| {
-            match worker(&url) {
+            match worker(url) {
                 Ok(count) => done.send(count)
                 Err(e) => {
-                    eprintln!("worker failed: {}", e)
+                    eprintln("worker failed: {}", e)
                     done.send(-1)
                 }
             }
         })
         spawn(|| {
-            match producer(&url) {
+            match producer(url) {
                 Ok(_) => ()
-                Err(e) => eprintln!("producer failed: {}", e)
+                Err(e) => eprintln("producer failed: {}", e)
             }
         })
     }?
     done.close()
 
     let handled = finished.recv().unwrap_or(-1)
-    println!("worker handled {} of {} jobs", handled, JOBS)
-    teardown(&url)?
+    println("worker handled {} of {} jobs", handled, JOBS)
+    teardown(url)?
     if handled != JOBS {
         return Err(errors::newf("expected {} jobs handled, got {}", JOBS, handled))
     }
@@ -55,27 +55,27 @@ fn main() -> Result<(), errors::Error> {
 
 // Commits a job, then announces it. The order matters: a worker woken before
 // the commit would look and find nothing.
-fn producer(url: &String) -> Result<(), errors::Error> {
+fn producer(url: String) -> Result<(), errors::Error> {
     let mut db = pgsql::connect(url)?
     defer db.close()
     for n in 0..JOBS {
         let mut tx = db.transaction()?
         let _ = db.execute(
-            &"INSERT INTO jobs (payload) VALUES ($1)"
-            &#[pgsql::text(format!("job-{}", n))]
+            "INSERT INTO jobs (payload) VALUES ($1)"
+            #[pgsql::text(format("job-{}", n))]
         )?
         db.commit(&mut tx)?
-        db.notify(CHANNEL, &format!("{}", n))?
+        db.notify(CHANNEL, format("{}", n))?
         time::sleep(time::Duration::from_millis(10))
     }
-    println!("producer queued {} jobs", JOBS)
+    println("producer queued {} jobs", JOBS)
     Ok(())
 }
 
 // Waits on the channel and drains the table whenever it wakes. Stops when
 // nothing has arrived for `IDLE_TIMEOUT_MS`, which stands in for whatever
 // shutdown signal a real worker would take.
-fn worker(url: &String) -> Result<i64, errors::Error> {
+fn worker(url: String) -> Result<i64, errors::Error> {
     let mut db = pgsql::connect(url)?
     defer db.close()
     db.listen(CHANNEL)?
@@ -97,17 +97,17 @@ fn worker(url: &String) -> Result<i64, errors::Error> {
                     ()
                 }
                 if wakeups <= 3 {
-                    println!("  woken by {} on {} (pid {})", n.payload, n.channel, n.pid)
+                    println("  woken by {} on {} (pid {})", n.payload, n.channel, n.pid)
                 }
             }
             None => {
-                println!("  nothing for {} ms, stopping", IDLE_TIMEOUT_MS)
+                println("  nothing for {} ms, stopping", IDLE_TIMEOUT_MS)
                 break
             }
         }
     }
     db.unlisten(CHANNEL)?
-    println!("worker woke {} time(s) for {} job(s)", wakeups, handled)
+    println("worker woke {} time(s) for {} job(s)", wakeups, handled)
     Ok(handled)
 }
 
@@ -115,7 +115,7 @@ fn worker(url: &String) -> Result<i64, errors::Error> {
 // queue could not hand the same job to both.
 fn claim_ready(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
     let claimed = db.query(
-        &"""
+        """
         UPDATE jobs SET state = 'done', done_at = now()
         WHERE id IN (
             SELECT id FROM jobs WHERE state = 'ready'
@@ -123,16 +123,16 @@ fn claim_ready(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
         )
         RETURNING id, payload
         """
-        &#[]
+        #[]
     )?
     Ok(claimed.len())
 }
 
-fn setup(url: &String) -> Result<(), errors::Error> {
+fn setup(url: String) -> Result<(), errors::Error> {
     let mut db = pgsql::connect(url)?
     defer db.close()
-    db.batch_execute(&"DROP TABLE IF EXISTS jobs")?
-    db.batch_execute(&"""
+    db.batch_execute("DROP TABLE IF EXISTS jobs")?
+    db.batch_execute("""
     CREATE TABLE jobs (
         id      bigserial PRIMARY KEY,
         payload text NOT NULL,
@@ -142,10 +142,10 @@ fn setup(url: &String) -> Result<(), errors::Error> {
     """)
 }
 
-fn teardown(url: &String) -> Result<(), errors::Error> {
+fn teardown(url: String) -> Result<(), errors::Error> {
     let mut db = pgsql::connect(url)?
     defer db.close()
-    let left = db.query_value(&"SELECT count(*) FROM jobs WHERE state = 'ready'", &#[])?
-    println!("jobs still ready at the end: {}", left.as_int().unwrap_or(-1))
-    db.batch_execute(&"DROP TABLE IF EXISTS jobs")
+    let left = db.query_value("SELECT count(*) FROM jobs WHERE state = 'ready'", #[])?
+    println("jobs still ready at the end: {}", left.as_int().unwrap_or(-1))
+    db.batch_execute("DROP TABLE IF EXISTS jobs")
 }

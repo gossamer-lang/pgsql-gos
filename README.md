@@ -15,16 +15,16 @@ use std::errors
 use "github.com/gossamer-lang/pgsql-gos" as pgsql
 
 fn main() -> Result<(), errors::Error> {
-    let mut db = pgsql::connect(&"host=/var/run/postgresql dbname=app")?
+    let mut db = pgsql::connect("host=/var/run/postgresql dbname=app")?
     defer db.close()
 
     let _ = db.execute(
-        &"INSERT INTO people (name, age) VALUES ($1, $2)",
-        &#[pgsql::text("Ada"), pgsql::int(36)],
+        "INSERT INTO people (name, age) VALUES ($1, $2)"
+        #[pgsql::text("Ada"), pgsql::int(36)]
     )?
 
-    for row in db.query(&"SELECT name, age FROM people ORDER BY name", &#[])? {
-        println!("{} is {}", row.text_of("name")?, row.i64_of("age")?)
+    for row in db.query("SELECT name, age FROM people ORDER BY name", #[])? {
+        println("{} is {}", row.text_of("name")?, row.i64_of("age")?)
     }
     Ok(())
 }
@@ -35,7 +35,7 @@ fn main() -> Result<(), errors::Error> {
 ```toml
 # project.toml
 [dependencies]
-"github.com/gossamer-lang/pgsql-gos" = { git = "https://github.com/gossamer-lang/pgsql-gos" tag="v0.1.1" }
+"github.com/gossamer-lang/pgsql-gos" = { git = "https://github.com/gossamer-lang/pgsql-gos" tag="v0.1.2" }
 ```
 
 The whole surface is reached through the imported module; the driver's
@@ -50,10 +50,10 @@ falls back to the standard `PG*` environment variable and then to libpq's own
 default:
 
 ```gossamer
-pgsql::connect(&"host=localhost port=5432 user=me password=secret dbname=app")?
-pgsql::connect(&"postgres://me:secret@localhost/app?sslmode=require")?
-pgsql::connect(&"host=/var/run/postgresql dbname=app")?           // Unix socket
-pgsql::connect(&"host=a.example.com,b.example.com dbname=app \
+pgsql::connect("host=localhost port=5432 user=me password=secret dbname=app")?
+pgsql::connect("postgres://me:secret@localhost/app?sslmode=require")?
+pgsql::connect("host=/var/run/postgresql dbname=app")?           // Unix socket
+pgsql::connect("host=a.example.com,b.example.com dbname=app \
                 target_session_attrs=read-write")?               // failover
 ```
 
@@ -78,7 +78,7 @@ query to fail rather than hang usually wants the last two:
 | `statement_timeout` | milliseconds | the server's own `statement_timeout`, so a long query is cancelled by the server and reports `57014`. |
 
 ```gossamer
-pgsql::connect(&"host=db.example.com dbname=app \
+pgsql::connect("host=db.example.com dbname=app \
                 connect_timeout=5 socket_timeout=30 statement_timeout=10000")?
 ```
 
@@ -191,12 +191,12 @@ survive both directions in both wire formats (`at.bound`).
 Ordering is by the instant a value names, not by its fields: two timestamps
 in different zones name their instants with different civil fields, and
 either infinity belongs at the end of the order rather than at year zero.
-Read it with `a.is_before(&b)` / `a.is_after(&b)`, and sort a sequence by the
+Read it with `a.is_before(b)` / `a.is_after(b)`, and sort a sequence by the
 epoch reading:
 
 ```gossamer
 let at = row.timestamp_of("created_at")?
-at.is_before(&deadline)      at.is_after(&start)
+at.is_before(deadline)      at.is_after(start)
 rows.sort_by_key(|row| row.timestamp_of("created_at")?.to_unix_micros())
 ```
 
@@ -212,9 +212,9 @@ so every digit survives, `json` and `jsonb` spliced as the documents they
 are, `bytea` as an array of bytes, an array column as a JSON array:
 
 ```gossamer
-db.query_json(&"SELECT id, name FROM people", &#[])?      // [{"id":1,...},...]
-db.query_one_json(&"SELECT ... WHERE id = $1", &#[id])?   // {"id":1,...}
-pgsql::row_json(&row)   pgsql::rows_json(&rows)
+db.query_json("SELECT id, name FROM people", #[])?      // [{"id":1,...},...]
+db.query_one_json("SELECT ... WHERE id = $1", #[id])?   // {"id":1,...}
+pgsql::row_json(row)   pgsql::rows_json(rows)
 ```
 
 That is also how a row reaches a struct of your own, since Gossamer derives
@@ -225,8 +225,8 @@ use std::encoding::json
 
 struct Person { id: i64, name: String }
 
-let row = db.query_one(&"SELECT id, name FROM people WHERE id = $1", &#[id])?
-let person = json::decode::<Person>(&pgsql::row_json(&row))
+let row = db.query_one("SELECT id, name FROM people WHERE id = $1", #[id])?
+let person = json::decode::<Person>(pgsql::row_json(row))
 ```
 
 The decode has to live in your own program rather than in the driver:
@@ -243,8 +243,8 @@ function the parameter list alone:
 ```gossamer
 let columns: Vec<String> = #["id", "name"]
 db.execute(
-    &pgsql::insert_sql(&"people", &columns)
-    &#[pgsql::int(person.id), pgsql::text(person.name)]
+    pgsql::insert_sql("people", columns)
+    #[pgsql::int(person.id), pgsql::text(person.name)]
 )?
 ```
 
@@ -259,14 +259,14 @@ Parameters go as text except a `bytea`, which goes as binary.
 ## Statements
 
 ```gossamer
-db.execute(&sql, &params)?          // rows affected
-db.query(&sql, &params)?            // every row
-db.query_one(&sql, &params)?        // exactly one row, or an error
-db.query_opt(&sql, &params)?        // at most one row
-db.query_value(&sql, &params)?      // the single value of a 1x1 result
-db.query_raw(&sql, &params)?        // a stream, pulled with next_row
-db.batch_execute(&sql)?             // DDL or a script, no parameters
-db.simple_query(&sql)?              // every result set of a multi-statement query
+db.execute(sql, params)?          // rows affected
+db.query(sql, params)?            // every row
+db.query_one(sql, params)?        // exactly one row, or an error
+db.query_opt(sql, params)?        // at most one row
+db.query_value(sql, params)?      // the single value of a 1x1 result
+db.query_raw(sql, params)?        // a stream, pulled with next_row
+db.batch_execute(sql)?             // DDL or a script, no parameters
+db.simple_query(sql)?              // every result set of a multi-statement query
 ```
 
 A parameterized call prepares its statement on first use and caches it by SQL
@@ -299,7 +299,7 @@ OIDs and column descriptions) when you want to hold it yourself.
 For a result too large to hold at once, stream it:
 
 ```gossamer
-let mut rows = db.query_raw(&"SELECT id FROM big", &#[])?
+let mut rows = db.query_raw("SELECT id FROM big", #[])?
 loop {
     match db.next_row(&mut rows)? {
         Some(row) => consume(row.i64_at(0)?),
@@ -315,7 +315,7 @@ A server-side portal fetches in batches inside a transaction:
 
 ```gossamer
 let mut tx = db.transaction()?
-let mut portal = db.open_portal(&"SELECT id FROM big", &#[])?
+let mut portal = db.open_portal("SELECT id FROM big", #[])?
 loop {
     let batch = db.fetch(&mut portal, 500)?
     if batch.len() == 0 { break }
@@ -324,23 +324,23 @@ loop {
 db.commit(&mut tx)?
 ```
 
-`db.pipeline(&sql_list, &param_sets)` sends several statements before reading
+`db.pipeline(sql_list, param_sets)` sends several statements before reading
 any reply, for a batch of writes in one round trip.
 
 ## Transactions
 
 ```gossamer
 let mut tx = db.transaction()?
-let _ = db.execute(&"UPDATE accounts SET balance = balance - $1 WHERE id = $2", &#[...])?
+let _ = db.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", #[...])?
 let point = db.savepoint(&mut tx)?
-match db.execute(&risky, &#[])? {
+match db.execute(risky, #[])? {
     ...
 }
 db.rollback_to(point)?      // the transaction stays usable
 db.commit(&mut tx)?
 ```
 
-`db.begin_with(&options)` sets the isolation level, `READ ONLY`, and
+`db.begin_with(options)` sets the isolation level, `READ ONLY`, and
 `DEFERRABLE`:
 
 ```gossamer
@@ -362,10 +362,10 @@ savepoint when the transaction should survive it.
 ## COPY
 
 ```gossamer
-db.copy_in_rows(&"COPY people (name, age) FROM STDIN", &rows)?   // escaped for you
-db.copy_in(&"COPY people FROM STDIN WITH (FORMAT csv)", &bytes)? // your own payload
-db.copy_out(&"COPY people TO STDOUT")?                           // raw bytes
-db.copy_out_lines(&"COPY people TO STDOUT")?                     // split into lines
+db.copy_in_rows("COPY people (name, age) FROM STDIN", rows)?   // escaped for you
+db.copy_in("COPY people FROM STDIN WITH (FORMAT csv)", bytes)? // your own payload
+db.copy_out("COPY people TO STDOUT")?                           // raw bytes
+db.copy_out_lines("COPY people TO STDOUT")?                     // split into lines
 ```
 
 `copy_in_rows` renders each row in COPY's text format, escaping tabs,
@@ -376,20 +376,20 @@ A load too large to hold at once streams a chunk at a time. A chunk needs no
 relation to a row boundary - the server reassembles the stream:
 
 ```gossamer
-let mut copy = db.copy_in_begin(&"COPY people (name, age) FROM STDIN")?
+let mut copy = db.copy_in_begin("COPY people (name, age) FROM STDIN")?
 for batch in batches {
-    db.copy_in_write_rows(&mut copy, &batch)?     // or copy_in_write for bytes
+    db.copy_in_write_rows(&mut copy, batch)?     // or copy_in_write for bytes
 }
 let rows = db.copy_in_end(&mut copy)?
 ```
 
-`db.copy_in_abort(&mut copy, &reason)` gives up part-way, and the server
+`db.copy_in_abort(&mut copy, reason)` gives up part-way, and the server
 commits none of it.
 
 A result too large to hold reads the same way, by chunk or by line:
 
 ```gossamer
-let mut copy = db.copy_out_begin(&"COPY people TO STDOUT")?
+let mut copy = db.copy_out_begin("COPY people TO STDOUT")?
 while let Some(line) = db.copy_out_line(&mut copy)? {
     consume(line)
 }
@@ -404,8 +404,8 @@ abandons one early and drains whatever the server was still sending.
 db.listen("orders")?
 db.notify("orders", "order 42 shipped")?
 match db.poll_notification(5_000)? {
-    Some(n) => println!("{}: {}", n.channel, n.payload),
-    None => println!("nothing within five seconds"),
+    Some(n) => println("{}: {}", n.channel, n.payload)
+    None => println("nothing within five seconds")
 }
 ```
 
@@ -425,12 +425,12 @@ let cancel = || {
     time::sleep(1_000)
     let _ = token.cancel()
 }
-go cancel()
-let outcome = db.query(&"SELECT pg_sleep(60)", &#[])   // reports 57014
+spawn(cancel, reason: "cancel token")
+let outcome = db.query("SELECT pg_sleep(60)", #[])   // reports 57014
 ```
 
-Capture the token in a closure rather than passing it as a `go` argument: the
-compiled concurrency ABI moves no aggregate across that boundary.
+Capture the token in a closure rather than passing it as a `spawn` argument:
+the compiled concurrency ABI moves no aggregate across that boundary.
 
 ## Errors
 
@@ -439,10 +439,10 @@ appended when it sent them. The SQLSTATE is the part to branch on - it is
 stable across server versions and locales:
 
 ```gossamer
-match db.execute(&insert, &params) {
+match db.execute(insert, params) {
     Ok(n) => n,
-    Err(e) if pgsql::unique_violation(&e) => 0,
-    Err(e) if pgsql::retryable(&e) => retry(),
+    Err(e) if pgsql::unique_violation(e) => 0,
+    Err(e) if pgsql::retryable(e) => retry(),
     Err(e) => return Err(e),
 }
 ```
@@ -453,8 +453,8 @@ call still reads the code the server sent:
 
 ```gossamer
 let wrapped = errors::wrap(e, "saving the person")
-pgsql::unique_violation(&wrapped)     // still true
-pgsql::sqlstate_of(&wrapped)          // still "23505"
+pgsql::unique_violation(wrapped)     // still true
+pgsql::sqlstate_of(wrapped)          // still "23505"
 ```
 
 `pgsql::sqlstate_of`, `unique_violation`, `foreign_key_violation`,
@@ -474,7 +474,7 @@ Concurrent work takes a connection each.
 cohort {
     for shard in shards {
         spawn(|| {
-            let mut db = pgsql::connect(&url)?
+            let mut db = pgsql::connect(url)?
             defer db.close()
             work(&mut db, shard)
         })
@@ -482,11 +482,11 @@ cohort {
 }?
 ```
 
-`pgsql::pool_open(&url, max)` gives one goroutine a pool that reuses
+`pgsql::pool_open(url, max)` gives one goroutine a pool that reuses
 connections and caps how many exist.
 
 ```gossamer
-let mut pool = pgsql::pool_open(&url, 8)?
+let mut pool = pgsql::pool_open(url, 8)?
 pool.warm(2)?                        // open some before the first caller
 pool.set_test_on_acquire(true)       // a round trip before lending, so a
                                      // restarted server reconnects rather
@@ -496,7 +496,7 @@ pool.set_reset_on_release(false)     // keep what a borrower set (see below)
 
 let mut db = pool.acquire()?
 let outcome = work(&mut db)
-pool.release(db)
+pool.release(&mut db)
 ```
 
 A connection coming back is put back to what a freshly opened one is before
@@ -521,8 +521,9 @@ connections happen to fail. The age is checked when a connection would be
 lent and when one comes back, so a connection in use is never taken from its
 borrower. `db.age_ms()` reports it.
 
-A pool belongs to the goroutine that owns it: a connection is an aggregate with nested growable storage, which the
-compiled concurrency ABI has no ownership descriptor for, so it can neither
+A pool belongs to the goroutine that owns it: a connection is an aggregate
+with nested growable storage, which the compiled concurrency ABI has no
+ownership descriptor for, so it can neither
 be captured by a spawned goroutine nor sent through a channel. The compiler
 says so - capturing a pool in a `spawn` is a check-time error, and
 `sync::Shared` guards a single word rather than an aggregate - so this is a
@@ -533,17 +534,17 @@ at once while each goroutine opens and owns its own. What crosses the
 goroutine boundary is a permit, which a channel carries safely:
 
 ```gossamer
-let limiter = pgsql::limit_open(&url, 8)?
+let limiter = pgsql::limit_open(url, 8)?
 cohort {
     for shard in shards {
-        spawn(|| work(&limiter, shard))
+        spawn(|| work(limiter, shard))
     }
 }?
 
-fn work(limiter: &pgsql::pool::Limiter, shard: i64) -> Result<(), errors::Error> {
+fn work(limiter: pgsql::pool::Limiter, shard: i64) -> Result<(), errors::Error> {
     let mut db = limiter.acquire()?      // waits for a permit, then connects
     let outcome = run(&mut db, shard)
-    limiter.release(db)                  // closes it and gives the permit back
+    limiter.release(&mut db)             // closes it, gives the permit back
     outcome
 }
 ```
@@ -734,21 +735,21 @@ a driver one - see [the toolchain section](#known-defect-preparing-statements-on
 
 ## Toolchain
 
-The driver needs Gossamer v0.55.3 or newer. An earlier toolchain builds it and
-the bytecode VM runs it correctly, but two reference-counting defects fixed in
-v0.55.3 make a compiled program unreliable - see below.
+The driver needs Gossamer v0.56.0 or newer: v0.56 removed the shared reference
+from the language, and the driver is written in the by-value spelling that
+replaced it.
 
 `tests/parity/run.sh` runs one program on the bytecode VM (`gos run`,
 `gos test`), the Cranelift JIT (`gos build`), and LLVM AOT (`gos build
 --release`) and compares the transcripts byte for byte, on every CI run. The
 three tiers agree.
 
-### The two defects this driver found
+### The three defects this driver found
 
-Both were in the toolchain's reference counting, both hit only the compiled
-tiers, and both are fixed in v0.55.3. They are recorded here because the
-shapes that found them are now part of `tests/parity`, and because a project
-pinned to an older toolchain still meets them.
+All three are in the toolchain's reference counting, all three hit only the
+compiled tiers, and the first two are fixed in v0.55.3. They are recorded here
+because the shapes that found them are now part of `tests/parity`, and because
+a project pinned to an older toolchain still meets them.
 
 **A map insert freed the caller's copy of the key.** A consuming insert copies
 the key's bytes and gives up the one reference the call handed it, but it was
@@ -769,9 +770,19 @@ itself, though reading one back hands a share out. The driver's cached
 `Statement` carries a `String`, so evicting one after enough other allocation
 read freed memory and faulted.
 
-The bytecode VM was unaffected by both, which is why `gos test` stayed green
-throughout and only a tier comparison found them. `tests/parity` now runs 400
+**A cloned argument freed the caller's binding again in v0.56.** The first
+defect's shape returns under v0.56.0: `map.insert(key.clone(), value)` on a
+`String` reaching the frame through several by-value calls gives up a share
+the callee never took, and the caller's binding becomes whatever the next
+allocation of that size wrote - the same `42601 syntax error at or near
+"gos_pgsql_sNN"` the first defect reported. The driver no longer writes the
+shape: v0.56 passes a value without copying it, so the `.clone()` a `&String`
+parameter needed in v0.55 is redundant, and every one of them is gone. A
+project still carrying v0.55-era clones meets this on v0.56.
+
+The bytecode VM was unaffected by all three, which is why `gos test` stayed
+green throughout and only a tier comparison found them. `tests/parity` now runs 400
 statements with distinct SQL and prints how many failed, which is zero, and
 reads and evicts the statement cache after a bulk load and prints what it
-summed and held. Either defect returns as a differing transcript rather than
-as an intermittent failure in a deployed program.
+summed and held. Any of them returns as a differing transcript rather than as
+an intermittent failure in a deployed program.

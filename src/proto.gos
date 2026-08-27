@@ -81,7 +81,7 @@ pub const TX_FAILED: i64 = 69
 
 // A tagged frontend message: the tag, an Int32 length covering itself and
 // the body, then the body.
-pub fn frame(tag: i64, body: &Vec<u8>) -> Vec<u8> {
+pub fn frame(tag: i64, body: Vec<u8>) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     buf::put_u8(&mut out, tag)
     buf::put_i32(&mut out, 4 + body.len())
@@ -92,7 +92,7 @@ pub fn frame(tag: i64, body: &Vec<u8>) -> Vec<u8> {
 // An untagged message: an Int32 length covering itself and the body, then
 // the body. The startup, SSL-request, and cancel-request packets use this
 // shape because they precede any tag negotiation.
-pub fn untagged(body: &Vec<u8>) -> Vec<u8> {
+pub fn untagged(body: Vec<u8>) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     buf::put_i32(&mut out, 4 + body.len())
     buf::put_bytes(&mut out, body)
@@ -103,7 +103,7 @@ pub fn untagged(body: &Vec<u8>) -> Vec<u8> {
 pub fn ssl_request() -> Vec<u8> {
     let mut body: Vec<u8> = #[]
     buf::put_i32(&mut body, SSL_REQUEST_CODE)
-    untagged(&body)
+    untagged(body)
 }
 
 // A CancelRequest for the given backend, sent on its own connection.
@@ -112,7 +112,7 @@ pub fn cancel_request(pid: i64, secret: i64) -> Vec<u8> {
     buf::put_i32(&mut body, CANCEL_REQUEST_CODE)
     buf::put_i32(&mut body, pid)
     buf::put_i32(&mut body, secret)
-    untagged(&body)
+    untagged(body)
 }
 
 // The name a `CommandComplete` tag reports, and the row count it carries.
@@ -120,10 +120,10 @@ pub fn cancel_request(pid: i64, secret: i64) -> Vec<u8> {
 // The count is the tag's last whitespace-separated field for the commands
 // that report one (`INSERT 0 3`, `UPDATE 2`, `SELECT 5`); a command with no
 // count (`BEGIN`, `CREATE TABLE`) reports 0.
-pub fn command_complete(body: &Vec<u8>) -> (String, i64) {
+pub fn command_complete(body: Vec<u8>) -> (String, i64) {
     let n = body.len()
     let end = if n > 0 && body[n - 1] == 0 { n - 1 } else { n }
-    let tag = buf::utf8_lossy(&buf::slice(body, 0, end))
+    let tag = buf::utf8_lossy(buf::slice(body, 0, end))
     let fields = tag.split(" ").filter(|field| field != "")
     let count = fields.last().unwrap_or("").to_i64().unwrap_or(0)
     (tag, count)
@@ -136,22 +136,22 @@ mod proto_tests {
     #[test]
     fn frame_writes_the_tag_and_a_self_inclusive_length() {
         let body: Vec<u8> = #[1, 2, 3]
-        let msg = super::frame(super::F_QUERY, &body)
-        let _ = testing::check_eq(&msg.len(), &8, "tag plus length plus body")
-        let _ = testing::check_eq(&(msg[0] as i64), &super::F_QUERY, "tag byte")
-        let _ = testing::check_eq(&buf::i32_at(&msg, 1), &7, "length covers itself")
+        let msg = super::frame(super::F_QUERY, body)
+        let _ = testing::check_eq(msg.len(), 8, "tag plus length plus body")
+        let _ = testing::check_eq((msg[0] as i64), super::F_QUERY, "tag byte")
+        let _ = testing::check_eq(buf::i32_at(msg, 1), 7, "length covers itself")
     }
 
     #[test]
     fn untagged_writes_only_the_length_and_body() {
         let mut body: Vec<u8> = #[]
         buf::put_i32(&mut body, super::PROTOCOL_VERSION)
-        let msg = super::untagged(&body)
-        let _ = testing::check_eq(&msg.len(), &8, "length plus body")
-        let _ = testing::check_eq(&buf::i32_at(&msg, 0), &8, "self-inclusive length")
+        let msg = super::untagged(body)
+        let _ = testing::check_eq(msg.len(), 8, "length plus body")
+        let _ = testing::check_eq(buf::i32_at(msg, 0), 8, "self-inclusive length")
         let _ = testing::check_eq(
-            &buf::i32_at(&msg, 4)
-            &super::PROTOCOL_VERSION
+            buf::i32_at(msg, 4)
+            super::PROTOCOL_VERSION
             "protocol version"
         )
     }
@@ -159,28 +159,28 @@ mod proto_tests {
     #[test]
     fn cancel_request_carries_the_backend_key() {
         let msg = super::cancel_request(4_242, 987_654)
-        let _ = testing::check_eq(&msg.len(), &16, "cancel packet length")
+        let _ = testing::check_eq(msg.len(), 16, "cancel packet length")
         let _ = testing::check_eq(
-            &buf::i32_at(&msg, 4)
-            &super::CANCEL_REQUEST_CODE
+            buf::i32_at(msg, 4)
+            super::CANCEL_REQUEST_CODE
             "cancel code"
         )
-        let _ = testing::check_eq(&buf::i32_at(&msg, 8), &4_242, "pid")
-        let _ = testing::check_eq(&buf::i32_at(&msg, 12), &987_654, "secret")
+        let _ = testing::check_eq(buf::i32_at(msg, 8), 4_242, "pid")
+        let _ = testing::check_eq(buf::i32_at(msg, 12), 987_654, "secret")
     }
 
     #[test]
     fn command_complete_reads_the_tag_and_row_count() {
         let mut body: Vec<u8> = #[]
-        buf::put_cstr(&mut body, &"INSERT 0 3")
-        let (tag, count) = super::command_complete(&body)
-        let _ = testing::check_eq(&tag, &"INSERT 0 3", "tag text")
-        let _ = testing::check_eq(&count, &3, "row count")
+        buf::put_cstr(&mut body, "INSERT 0 3")
+        let tag, count = super::command_complete(body)
+        let _ = testing::check_eq(tag, "INSERT 0 3", "tag text")
+        let _ = testing::check_eq(count, 3, "row count")
 
         let mut begin: Vec<u8> = #[]
-        buf::put_cstr(&mut begin, &"BEGIN")
-        let (begin_tag, begin_count) = super::command_complete(&begin)
-        let _ = testing::check_eq(&begin_tag, &"BEGIN", "countless tag")
-        let _ = testing::check_eq(&begin_count, &0, "countless tag reports zero")
+        buf::put_cstr(&mut begin, "BEGIN")
+        let begin_tag, begin_count = super::command_complete(begin)
+        let _ = testing::check_eq(begin_tag, "BEGIN", "countless tag")
+        let _ = testing::check_eq(begin_count, 0, "countless tag reports zero")
     }
 }

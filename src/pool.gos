@@ -44,18 +44,18 @@ pub struct Pool {
 }
 
 // Opens a pool of at most `max_size` connections, with none opened yet.
-pub fn open(url: &String, max_size: i64) -> Result<Pool, errors::Error> {
+pub fn open(url: String, max_size: i64) -> Result<Pool, errors::Error> {
     let cfg = config::parse(url)?
-    open_with(&cfg, max_size)
+    open_with(cfg, max_size)
 }
 
 // Opens a pool from already-parsed parameters.
-pub fn open_with(cfg: &config::Config, max_size: i64) -> Result<Pool, errors::Error> {
+pub fn open_with(cfg: config::Config, max_size: i64) -> Result<Pool, errors::Error> {
     if max_size < 1 {
         return Err(errors::newf("pool size must be at least 1, got {}", max_size))
     }
     Ok(Pool {
-        cfg: cfg.clone()
+        cfg: cfg
         idle: #[]
         live: 0
         max_size: max_size
@@ -114,7 +114,7 @@ impl Pool {
     }
 
     // True when `pooled` has been open longer than the pool keeps one.
-    fn is_expired(&self, pooled: &client::Client) -> bool {
+    fn is_expired(&self, pooled: client::Client) -> bool {
         self.max_lifetime_ms > 0 && pooled.age_ms() >= self.max_lifetime_ms
     }
 
@@ -123,7 +123,7 @@ impl Pool {
     pub fn warm(&mut self, count: i64) -> Result<(), errors::Error> {
         let target = min(count, self.max_size)
         while self.idle.len() < target && self.live < self.max_size {
-            let opened = client::connect_with(&self.cfg)?
+            let opened = client::connect_with(self.cfg)?
             self.live += 1
             self.idle.push(opened)
         }
@@ -141,7 +141,7 @@ impl Pool {
                 self.live -= 1
                 continue
             }
-            if self.is_expired(&pooled) {
+            if self.is_expired(pooled) {
                 pooled.close()
                 self.live -= 1
                 continue
@@ -163,7 +163,7 @@ impl Pool {
                 self.max_size
             ))
         }
-        let opened = client::connect_with(&self.cfg)?
+        let opened = client::connect_with(self.cfg)?
         self.live += 1
         Ok(opened)
     }
@@ -173,18 +173,18 @@ impl Pool {
     // A closed connection is dropped rather than kept, and one left inside a
     // transaction is rolled back first, so the next caller starts from a
     // clean session rather than inheriting this one's.
-    pub fn release(&mut self, mut pooled: client::Client) {
+    pub fn release(&mut self, pooled: &mut client::Client) {
         if pooled.is_closed() {
             self.live -= 1
             return
         }
-        if self.is_expired(&pooled) {
+        if self.is_expired(*pooled) {
             pooled.close()
             self.live -= 1
             return
         }
         if pooled.in_transaction() {
-            match pooled.batch_execute(&"ROLLBACK") {
+            match pooled.batch_execute("ROLLBACK") {
                 Ok(_) => ()
                 Err(_) => {
                     pooled.close()
@@ -205,7 +205,8 @@ impl Pool {
                 }
             }
         }
-        self.idle.push(pooled)
+        let taken = *pooled
+        self.idle.push(taken)
     }
 
     // Closes every idle connection, leaving any that are lent out alone.
@@ -233,7 +234,7 @@ impl Pool {
 //     fn work(limiter: &pgsql::pool::Limiter, shard: i64) -> Result<(), errors::Error> {
 //         let mut db = limiter.acquire()?
 //         let outcome = run(&mut db, shard)
-//         limiter.release(db)
+//         limiter.release(&mut db)
 //         outcome
 //     }
 pub struct Limiter {
@@ -252,19 +253,19 @@ pub struct Limiter {
 
 // Opens a limiter allowing at most `max_size` connections at once. The URL
 // is validated here, so a bad one is reported before any goroutine starts.
-pub fn limit(url: &String, max_size: i64) -> Result<Limiter, errors::Error> {
+pub fn limit(url: String, max_size: i64) -> Result<Limiter, errors::Error> {
     if max_size < 1 {
         return Err(errors::newf("limiter size must be at least 1, got {}", max_size))
     }
     let _ = config::parse(url)?
     // Unbounded, so the permits can be seeded before any goroutine waits on
     // them; the count of values in flight is the bound that matters.
-    let (permits, leases) = channel_unbounded()
+    let permits, leases = channel_unbounded()
     for _permit in 0..max_size {
         permits.send(1)
     }
     Ok(Limiter {
-        url: url.clone()
+        url: url
         permits: permits
         leases: leases
         max_size: max_size
@@ -285,7 +286,7 @@ impl Limiter {
         let Some(_permit) = self.leases.recv() else {
             return Err(errors::new("the limiter is closed"))
         }
-        match client::connect(&self.url) {
+        match client::connect(self.url) {
             Ok(opened) => Ok(opened)
             Err(e) => {
                 self.permits.send(1)
@@ -295,7 +296,7 @@ impl Limiter {
     }
 
     // Closes a connection and gives its permit back.
-    pub fn release(&self, mut opened: client::Client) {
+    pub fn release(&self, opened: &mut client::Client) {
         opened.close()
         self.permits.send(1)
     }
@@ -307,12 +308,12 @@ mod pool_tests {
 
     #[test]
     fn a_pool_needs_at_least_one_connection() {
-        match super::open(&"user=nobody", 0) {
+        match super::open("user=nobody", 0) {
             Ok(_) => { let _ = testing::check(false, "size 0 must be rejected") }
             Err(e) => {
                 let _ = testing::check(
-                    format!("{}", e).contains("at least 1")
-                    &format!("reported: {}", e)
+                    format("{}", e).contains("at least 1")
+                    format("reported: {}", e)
                 )
             }
         }
@@ -320,12 +321,12 @@ mod pool_tests {
 
     #[test]
     fn a_limiter_needs_at_least_one_permit() {
-        match super::limit(&"user=nobody", 0) {
+        match super::limit("user=nobody", 0) {
             Ok(_) => { let _ = testing::check(false, "size 0 must be rejected") }
             Err(e) => {
                 let _ = testing::check(
-                    format!("{}", e).contains("at least 1")
-                    &format!("reported: {}", e)
+                    format("{}", e).contains("at least 1")
+                    format("reported: {}", e)
                 )
             }
         }
@@ -333,31 +334,31 @@ mod pool_tests {
 
     #[test]
     fn a_limiter_reports_its_cap() {
-        match super::limit(&"user=nobody dbname=nothing", 3) {
-            Ok(limiter) => { let _ = testing::check_eq(&limiter.size(), &3, "cap") }
-            Err(e) => { let _ = testing::check(false, &format!("limit: {}", e)) }
+        match super::limit("user=nobody dbname=nothing", 3) {
+            Ok(limiter) => { let _ = testing::check_eq(limiter.size(), 3, "cap") }
+            Err(e) => { let _ = testing::check(false, format("limit: {}", e)) }
         }
     }
 
     #[test]
     fn a_new_pool_holds_no_connections() {
-        match super::open(&"user=nobody dbname=nothing", 4) {
+        match super::open("user=nobody dbname=nothing", 4) {
             Ok(mut p) => {
-                let _ = testing::check_eq(&p.size(), &4, "cap")
-                let _ = testing::check_eq(&p.live_count(), &0, "nothing open yet")
-                let _ = testing::check_eq(&p.idle_count(), &0, "nothing idle yet")
+                let _ = testing::check_eq(p.size(), 4, "cap")
+                let _ = testing::check_eq(p.live_count(), 0, "nothing open yet")
+                let _ = testing::check_eq(p.idle_count(), 0, "nothing idle yet")
                 p.set_test_on_acquire(true)
                 let _ = testing::check(p.test_on_acquire, "test on acquire")
                 let _ = testing::check(p.reset_on_release, "a returning connection is reset by default")
                 p.set_reset_on_release(false)
                 let _ = testing::check(!p.reset_on_release, "the reset can be turned off")
-                let _ = testing::check_eq(&p.max_lifetime_ms, &0, "no lifetime bound by default")
+                let _ = testing::check_eq(p.max_lifetime_ms, 0, "no lifetime bound by default")
                 p.set_max_lifetime(30_000)
-                let _ = testing::check_eq(&p.max_lifetime_ms, &30_000, "a lifetime bound is kept")
+                let _ = testing::check_eq(p.max_lifetime_ms, 30_000, "a lifetime bound is kept")
                 p.set_max_lifetime(-1)
-                let _ = testing::check_eq(&p.max_lifetime_ms, &0, "a negative bound is none")
+                let _ = testing::check_eq(p.max_lifetime_ms, 0, "a negative bound is none")
             }
-            Err(e) => { let _ = testing::check(false, &format!("open: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("open: {}", e)) }
         }
     }
 }

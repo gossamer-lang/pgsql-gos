@@ -28,22 +28,22 @@ use crate::{conn, oid, value}
 //
 // A duplicated column name appears once, holding the first of them, which
 // is the column the row's own name lookups answer.
-pub fn row_json(row: &conn::Row) -> String {
+pub fn row_json(row: conn::Row) -> String {
     let mut fields: Vec<String> = #[]
     let mut written: Set<String> = #{}
     for (index, column) in row.columns.iter().enumerate() {
-        if written.contains(&column.name) {
+        if written.contains(column.name) {
             continue
         }
-        let _ = written.insert(column.name.clone())
-        fields.push(quote_json(&column.name) + ":" + &value_json(&row.at(index), column.type_oid))
+        let _ = written.insert(column.name)
+        fields.push(quote_json(column.name) + ":" + value_json(row.at(index), column.type_oid))
     }
-    "{" + &fields.join(",") + "}"
+    "{" + fields.join(",") + "}"
 }
 
 // A result set as a JSON array of objects.
-pub fn rows_json(rows: &Vec<conn::Row>) -> String {
-    "[" + &rows.map(|row| row_json(&row)).join(",") + "]"
+pub fn rows_json(rows: Vec<conn::Row>) -> String {
+    "[" + rows.map(|row| row_json(row)).join(",") + "]"
 }
 
 // One value as the JSON its column's type calls for.
@@ -60,7 +60,7 @@ pub fn rows_json(rows: &Vec<conn::Row>) -> String {
 //
 // A `float8` NaN or infinity has no JSON spelling, so it becomes the string
 // PostgreSQL writes for it rather than a number JSON cannot hold.
-pub fn value_json(cell: &value::Value, type_oid: i64) -> String {
+pub fn value_json(cell: value::Value, type_oid: i64) -> String {
     if cell.is_null() {
         return "null"
     }
@@ -71,16 +71,16 @@ pub fn value_json(cell: &value::Value, type_oid: i64) -> String {
         oid::BOOL => if cell.as_bool().unwrap_or(false) { "true" } else { "false" }
         oid::JSON | oid::JSONB => {
             let document = cell.render()
-            if json::valid(&document) { document } else { quote_json(&document) }
+            if json::valid(document) { document } else { quote_json(document) }
         }
         oid::BYTEA => match cell.as_bytes() {
-            Some(data) => "[" + &data.map(|byte| (byte as i64).to_string()).join(",") + "]"
+            Some(data) => "[" + data.map(|byte| (byte as i64).to_string()).join(",") + "]"
             None => "null"
         }
         oid::FLOAT4 | oid::FLOAT8 => {
             let rendered = cell.render()
             if rendered == "NaN" || rendered.ends_with("Infinity") {
-                return quote_json(&rendered)
+                return quote_json(rendered)
             }
             rendered
         }
@@ -88,10 +88,10 @@ pub fn value_json(cell: &value::Value, type_oid: i64) -> String {
             if oid::is_integer(type_oid) {
                 match cell.as_int() {
                     Some(n) => n.to_string()
-                    None => quote_json(&cell.render())
+                    None => quote_json(cell.render())
                 }
             } else {
-                quote_json(&cell.render())
+                quote_json(cell.render())
             }
         }
     }
@@ -100,32 +100,32 @@ pub fn value_json(cell: &value::Value, type_oid: i64) -> String {
 // An array column as a JSON array. A literal the element type cannot read
 // stays the string the server wrote, so nothing is lost to a decode that
 // does not apply.
-fn array_json(cell: &value::Value, element_oid: i64) -> String {
+fn array_json(cell: value::Value, element_oid: i64) -> String {
     let literal = cell.render()
-    let Ok(elements) = value::parse_array_literal(&literal, element_oid) else {
-        return quote_json(&literal)
+    let Ok(elements) = value::parse_array_literal(literal, element_oid) else {
+        return quote_json(literal)
     }
-    "[" + &elements.map(|element| value_json(&element, element_oid)).join(",") + "]"
+    "[" + elements.map(|element| value_json(element, element_oid)).join(",") + "]"
 }
 
 // --- statement builders -------------------------------------------
 
 // `INSERT INTO <table> (<columns>) VALUES ($1, ...)`, with one placeholder
 // per column in the order given.
-pub fn insert_sql(table: &String, columns: &Vec<String>) -> String {
-    format!(
+pub fn insert_sql(table: String, columns: Vec<String>) -> String {
+    format(
         "INSERT INTO {} ({}) VALUES ({})"
         quote_ident(table)
-        columns.map(|name| quote_ident(&name)).join(", ")
+        columns.map(|name| quote_ident(name)).join(", ")
         placeholders(columns.len())
     )
 }
 
 // `SELECT <columns> FROM <table>`.
-pub fn select_sql(table: &String, columns: &Vec<String>) -> String {
-    format!(
+pub fn select_sql(table: String, columns: Vec<String>) -> String {
+    format(
         "SELECT {} FROM {}"
-        columns.map(|name| quote_ident(&name)).join(", ")
+        columns.map(|name| quote_ident(name)).join(", ")
         quote_ident(table)
     )
 }
@@ -133,13 +133,13 @@ pub fn select_sql(table: &String, columns: &Vec<String>) -> String {
 // `UPDATE <table> SET <columns> = ... WHERE <key> = $n`, numbering the
 // placeholders so the key's is last: the parameter list is the columns'
 // values followed by the key's.
-pub fn update_sql(table: &String, columns: &Vec<String>, key: &String) -> String {
+pub fn update_sql(table: String, columns: Vec<String>, key: String) -> String {
     let assignments = columns
         .iter()
         .enumerate()
-        .map(|(position, name)| format!("{} = ${}", quote_ident(&name), position + 1))
+        .map(|(position, name)| format("{} = ${}", quote_ident(name), position + 1))
         .collect()
-    format!(
+    format(
         "UPDATE {} SET {} WHERE {} = ${}"
         quote_ident(table)
         assignments.join(", ")
@@ -150,18 +150,18 @@ pub fn update_sql(table: &String, columns: &Vec<String>, key: &String) -> String
 
 // `$1, $2, ... $n`.
 pub fn placeholders(count: i64) -> String {
-    (1..count + 1).map(|position| format!("${}", position)).collect().join(", ")
+    (1..count + 1).map(|position| format("${}", position)).collect().join(", ")
 }
 
 // Quotes an identifier by doubling embedded quotes, so a table or column
 // name cannot end the statement and start another.
-fn quote_ident(name: &String) -> String {
-    "\"" + &name.replace("\"", "\"\"") + "\""
+fn quote_ident(name: String) -> String {
+    "\"" + name.replace("\"", "\"\"") + "\""
 }
 
 // A JSON string literal. Byte offsets: every byte the grammar reserves is
 // ASCII, so a multi-byte character copies through untouched.
-fn quote_json(text: &String) -> String {
+fn quote_json(text: String) -> String {
     let mut out = "\""
     for byte in text.bytes() {
         match byte {
@@ -174,9 +174,9 @@ fn quote_json(text: &String) -> String {
             9 => out += "\\t"
             _ => {
                 if byte < 32 {
-                    out += &format!("\\u{:04x}", byte as i64)
+                    out += format("\\u{:04x}", byte as i64)
                 } else {
-                    out += &format!("{}", byte as char)
+                    out += format("{}", byte as char)
                 }
             }
         }
@@ -190,15 +190,15 @@ mod rowmap_tests {
 
     use crate::{conn, oid, value}
 
-    fn column(name: &String, type_oid: i64) -> conn::Column {
+    fn column(name: String, type_oid: i64) -> conn::Column {
         conn::Column {
-            name: name.clone()
+            name: name
             table_oid: 0
             column_id: 0
             type_oid: type_oid
             type_modifier: -1
             type_size: -1
-            format: value::FORMAT_TEXT
+            wire_format: value::FORMAT_TEXT
         }
     }
 
@@ -206,16 +206,16 @@ mod rowmap_tests {
     fn a_row_renders_each_column_as_the_json_its_type_calls_for() {
         let row = conn::Row::new(
             #[
-                column(&"id", oid::INT8)
-                column(&"name", oid::TEXT)
-                column(&"ratio", oid::FLOAT8)
-                column(&"exact", oid::NUMERIC)
-                column(&"active", oid::BOOL)
-                column(&"note", oid::TEXT)
-                column(&"tags", oid::TEXT_ARRAY)
-                column(&"doc", oid::JSONB)
-                column(&"blob", oid::BYTEA)
-                column(&"at", oid::TIMESTAMPTZ)
+                column("id", oid::INT8)
+                column("name", oid::TEXT)
+                column("ratio", oid::FLOAT8)
+                column("exact", oid::NUMERIC)
+                column("active", oid::BOOL)
+                column("note", oid::TEXT)
+                column("tags", oid::TEXT_ARRAY)
+                column("doc", oid::JSONB)
+                column("blob", oid::BYTEA)
+                column("at", oid::TIMESTAMPTZ)
             ]
             #[
                 value::Value::Int(7)
@@ -227,12 +227,12 @@ mod rowmap_tests {
                 value::Value::Text("{one,\"two,three\"}")
                 value::Value::Json("{\"a\":1}")
                 value::Value::Bytes(#[0, 255])
-                value::decode_text(oid::TIMESTAMPTZ, &"2026-08-16 12:34:56+00".as_bytes())
+                value::decode_text(oid::TIMESTAMPTZ, "2026-08-16 12:34:56+00".as_bytes())
             ]
         )
         let _ = testing::check_eq(
-            &super::row_json(&row)
-            &"{\"id\":7,\"name\":\"Ada\",\"ratio\":1.5,\"exact\":\"12.500\",\"active\":true,\"note\":null,\"tags\":[\"one\",\"two,three\"],\"doc\":{\"a\":1},\"blob\":[0,255],\"at\":\"2026-08-16 12:34:56+00\"}"
+            super::row_json(row)
+            "{\"id\":7,\"name\":\"Ada\",\"ratio\":1.5,\"exact\":\"12.500\",\"active\":true,\"note\":null,\"tags\":[\"one\",\"two,three\"],\"doc\":{\"a\":1},\"blob\":[0,255],\"at\":\"2026-08-16 12:34:56+00\"}"
             "row as json"
         )
     }
@@ -240,12 +240,12 @@ mod rowmap_tests {
     #[test]
     fn a_reserved_character_is_escaped_in_both_a_key_and_a_value() {
         let row = conn::Row::new(
-            #[column(&"a\"b", oid::TEXT)]
+            #[column("a\"b", oid::TEXT)]
             #[value::Value::Text("line\nbreak\\and\"quote")]
         )
         let _ = testing::check_eq(
-            &super::row_json(&row)
-            &"{\"a\\\"b\":\"line\\nbreak\\\\and\\\"quote\"}"
+            super::row_json(row)
+            "{\"a\\\"b\":\"line\\nbreak\\\\and\\\"quote\"}"
             "escapes"
         )
     }
@@ -253,25 +253,25 @@ mod rowmap_tests {
     #[test]
     fn a_non_finite_float_becomes_the_name_postgres_writes() {
         let row = conn::Row::new(
-            #[column(&"n", oid::FLOAT8), column(&"i", oid::FLOAT8)]
+            #[column("n", oid::FLOAT8), column("i", oid::FLOAT8)]
             #[value::Value::Float(value::nan()), value::Value::Float(value::infinity())]
         )
         let _ = testing::check_eq(
-            &super::row_json(&row)
-            &"{\"n\":\"NaN\",\"i\":\"Infinity\"}"
+            super::row_json(row)
+            "{\"n\":\"NaN\",\"i\":\"Infinity\"}"
             "no JSON number can hold either"
         )
     }
 
     #[test]
     fn a_result_set_renders_as_an_array_of_objects() {
-        let columns = #[column(&"id", oid::INT4)]
+        let columns = #[column("id", oid::INT4)]
         let rows = #[
-            conn::Row::new(columns.clone(), #[value::Value::Int(1)])
-            conn::Row::new(columns.clone(), #[value::Value::Int(2)])
+            conn::Row::new(columns, #[value::Value::Int(1)])
+            conn::Row::new(columns, #[value::Value::Int(2)])
         ]
-        let _ = testing::check_eq(&super::rows_json(&rows), &"[{\"id\":1},{\"id\":2}]", "rows")
-        let _ = testing::check_eq(&super::rows_json(&#[]), &"[]", "no rows")
+        let _ = testing::check_eq(super::rows_json(rows), "[{\"id\":1},{\"id\":2}]", "rows")
+        let _ = testing::check_eq(super::rows_json(#[]), "[]", "no rows")
     }
 
     #[test]
@@ -298,9 +298,9 @@ mod rowmap_tests {
         ]
         for (cell, type_oid, expected) in cases {
             let _ = testing::check_eq(
-                &super::value_json(&cell, type_oid)
-                &expected
-                &format!("{} as {}", cell.render(), oid::name_of(type_oid))
+                super::value_json(cell, type_oid)
+                expected
+                format("{} as {}", cell.render(), oid::name_of(type_oid))
             )
         }
     }
@@ -308,23 +308,23 @@ mod rowmap_tests {
     #[test]
     fn an_array_column_renders_as_a_json_array_of_its_element_type() {
         let _ = testing::check_eq(
-            &super::value_json(&value::Value::Text("{1,2,3}"), oid::INT8_ARRAY)
-            &"[1,2,3]"
+            super::value_json(value::Value::Text("{1,2,3}"), oid::INT8_ARRAY)
+            "[1,2,3]"
             "integers stay numbers"
         )
         let _ = testing::check_eq(
-            &super::value_json(&value::Value::Text("{a,b}"), oid::TEXT_ARRAY)
-            &"[\"a\",\"b\"]"
+            super::value_json(value::Value::Text("{a,b}"), oid::TEXT_ARRAY)
+            "[\"a\",\"b\"]"
             "text is quoted"
         )
         let _ = testing::check_eq(
-            &super::value_json(&value::Value::Text("{}"), oid::INT8_ARRAY)
-            &"[]"
+            super::value_json(value::Value::Text("{}"), oid::INT8_ARRAY)
+            "[]"
             "an empty array"
         )
         let _ = testing::check_eq(
-            &super::value_json(&value::Value::Text("{1,NULL,3}"), oid::INT8_ARRAY)
-            &"[1,null,3]"
+            super::value_json(value::Value::Text("{1,NULL,3}"), oid::INT8_ARRAY)
+            "[1,null,3]"
             "a NULL element"
         )
     }
@@ -334,13 +334,13 @@ mod rowmap_tests {
         // Splicing an invalid document would produce a response that is not
         // JSON at all, which is worse than reporting the text as a string.
         let _ = testing::check_eq(
-            &super::value_json(&value::Value::Json("not json"), oid::JSON)
-            &"\"not json\""
+            super::value_json(value::Value::Json("not json"), oid::JSON)
+            "\"not json\""
             "an unparseable document is quoted"
         )
         let _ = testing::check_eq(
-            &super::value_json(&value::Value::Json("[1, 2]"), oid::JSON)
-            &"[1, 2]"
+            super::value_json(value::Value::Json("[1, 2]"), oid::JSON)
+            "[1, 2]"
             "a valid one is spliced as written"
         )
     }
@@ -349,14 +349,14 @@ mod rowmap_tests {
     fn an_update_numbers_its_key_after_the_columns_it_sets() {
         let columns: Vec<String> = #["name", "score"]
         let _ = testing::check_eq(
-            &super::update_sql(&"people", &columns, &"id")
-            &"UPDATE \"people\" SET \"name\" = $1, \"score\" = $2 WHERE \"id\" = $3"
+            super::update_sql("people", columns, "id")
+            "UPDATE \"people\" SET \"name\" = $1, \"score\" = $2 WHERE \"id\" = $3"
             "the key's placeholder comes last"
         )
         let one: Vec<String> = #["name"]
         let _ = testing::check_eq(
-            &super::update_sql(&"people", &one, &"id")
-            &"UPDATE \"people\" SET \"name\" = $1 WHERE \"id\" = $2"
+            super::update_sql("people", one, "id")
+            "UPDATE \"people\" SET \"name\" = $1 WHERE \"id\" = $2"
             "and with one column too"
         )
     }
@@ -367,39 +367,39 @@ mod rowmap_tests {
         // somewhere else, so a quote inside one has to be escaped rather than
         // closing the identifier.
         let hostile: Vec<String> = #["name\" ; DROP TABLE people --"]
-        let built = super::insert_sql(&"people", &hostile)
+        let built = super::insert_sql("people", hostile)
         let _ = testing::check(
             built.contains("\"name\"\" ; DROP TABLE people --\"")
-            &format!("the quote is doubled rather than closing: {}", built)
+            format("the quote is doubled rather than closing: {}", built)
         )
-        let _ = testing::check_eq(&super::placeholders(1), &"$1", "one placeholder")
-        let _ = testing::check_eq(&super::placeholders(3), &"$1, $2, $3", "three")
-        let _ = testing::check_eq(&super::placeholders(0), &"", "none")
+        let _ = testing::check_eq(super::placeholders(1), "$1", "one placeholder")
+        let _ = testing::check_eq(super::placeholders(3), "$1, $2, $3", "three")
+        let _ = testing::check_eq(super::placeholders(0), "", "none")
     }
 
     #[test]
     fn statement_builders_quote_their_identifiers_and_number_their_placeholders() {
         let columns: Vec<String> = #["id", "name"]
         let _ = testing::check_eq(
-            &super::insert_sql(&"people", &columns)
-            &"INSERT INTO \"people\" (\"id\", \"name\") VALUES ($1, $2)"
+            super::insert_sql("people", columns)
+            "INSERT INTO \"people\" (\"id\", \"name\") VALUES ($1, $2)"
             "insert"
         )
         let _ = testing::check_eq(
-            &super::select_sql(&"people", &columns)
-            &"SELECT \"id\", \"name\" FROM \"people\""
+            super::select_sql("people", columns)
+            "SELECT \"id\", \"name\" FROM \"people\""
             "select"
         )
         let _ = testing::check_eq(
-            &super::update_sql(&"people", &#["name"], &"id")
-            &"UPDATE \"people\" SET \"name\" = $1 WHERE \"id\" = $2"
+            super::update_sql("people", #["name"], "id")
+            "UPDATE \"people\" SET \"name\" = $1 WHERE \"id\" = $2"
             "update numbers the key last"
         )
-        let _ = testing::check_eq(&super::placeholders(3), &"$1, $2, $3", "placeholders")
-        let _ = testing::check_eq(&super::placeholders(0), &"", "no placeholders")
+        let _ = testing::check_eq(super::placeholders(3), "$1, $2, $3", "placeholders")
+        let _ = testing::check_eq(super::placeholders(0), "", "no placeholders")
         let _ = testing::check_eq(
-            &super::insert_sql(&"odd\"name", &#["a"])
-            &"INSERT INTO \"odd\"\"name\" (\"a\") VALUES ($1)"
+            super::insert_sql("odd\"name", #["a"])
+            "INSERT INTO \"odd\"\"name\" (\"a\") VALUES ($1)"
             "an embedded quote is doubled"
         )
     }

@@ -54,30 +54,30 @@ pub const PROTOCOL_VERSION: String = "3.0"
 
 // Connects using a libpq keyword string (`host=localhost dbname=app`) or a
 // URI (`postgres://me@localhost/app`).
-pub fn connect(url: &String) -> Result<client::Client, errors::Error> {
+pub fn connect(url: String) -> Result<client::Client, errors::Error> {
     client::connect(url)
 }
 
 // Connects using parameters built or edited by hand.
-pub fn connect_with(cfg: &config::Config) -> Result<client::Client, errors::Error> {
+pub fn connect_with(cfg: config::Config) -> Result<client::Client, errors::Error> {
     client::connect_with(cfg)
 }
 
 // Parses a connection string into parameters, so a caller can adjust them
 // before connecting.
-pub fn parse_config(url: &String) -> Result<config::Config, errors::Error> {
+pub fn parse_config(url: String) -> Result<config::Config, errors::Error> {
     config::parse(url)
 }
 
 // Opens a pool of at most `max_size` connections, for one goroutine.
-pub fn pool_open(url: &String, max_size: i64) -> Result<pool::Pool, errors::Error> {
+pub fn pool_open(url: String, max_size: i64) -> Result<pool::Pool, errors::Error> {
     pool::open(url, max_size)
 }
 
 // Opens a limiter allowing at most `max_size` connections at once, for work
 // spread across goroutines: each opens its own connection, and the permits
 // are what they share.
-pub fn limit_open(url: &String, max_size: i64) -> Result<pool::Limiter, errors::Error> {
+pub fn limit_open(url: String, max_size: i64) -> Result<pool::Limiter, errors::Error> {
     pool::limit(url, max_size)
 }
 
@@ -127,7 +127,7 @@ pub fn bytes(v: Vec<u8>) -> value::Value {
 // server reads for every array type, so the element type only has to match
 // the column.
 pub fn array(items: Vec<value::Value>) -> value::Value {
-    value::Value::Text(value::render_array_literal(&items))
+    value::Value::Text(value::render_array_literal(items))
 }
 
 // An integer-array parameter.
@@ -172,33 +172,33 @@ pub fn json(document: String) -> value::Value {
 
 // Parses a timestamp in the form PostgreSQL writes, for building one from
 // text a program already holds.
-pub fn parse_timestamp(text: &String) -> Result<temporal::Timestamp, errors::Error> {
+pub fn parse_timestamp(text: String) -> Result<temporal::Timestamp, errors::Error> {
     temporal::parse_timestamp(text)
 }
 
 // Parses a date in the form PostgreSQL writes.
-pub fn parse_date(text: &String) -> Result<temporal::Date, errors::Error> {
+pub fn parse_date(text: String) -> Result<temporal::Date, errors::Error> {
     temporal::parse_date(text)
 }
 
 // Parses a time in the form PostgreSQL writes.
-pub fn parse_time(text: &String) -> Result<temporal::Time, errors::Error> {
+pub fn parse_time(text: String) -> Result<temporal::Time, errors::Error> {
     temporal::parse_time(text)
 }
 
 // Parses an interval in the `postgres` or ISO 8601 style.
-pub fn parse_interval(text: &String) -> Result<temporal::Interval, errors::Error> {
+pub fn parse_interval(text: String) -> Result<temporal::Interval, errors::Error> {
     temporal::parse_interval(text)
 }
 
 // Parses a UUID in the canonical, bare, or braced form.
-pub fn parse_uuid(text: &String) -> Result<temporal::Uuid, errors::Error> {
+pub fn parse_uuid(text: String) -> Result<temporal::Uuid, errors::Error> {
     temporal::parse_uuid(text)
 }
 
 // A composite parameter, as its literal.
 pub fn record(fields: Vec<value::Value>) -> value::Value {
-    value::Value::Text(value::render_record_literal(&fields))
+    value::Value::Text(value::render_record_literal(fields))
 }
 
 // An `Option<i64>`, as a parameter: `None` binds NULL.
@@ -222,29 +222,29 @@ pub fn opt_text(v: Option<String>) -> value::Value {
 // A row as a JSON object, keyed by column name and typed by each column's
 // own OID. This is what a program serves from a handler, and what
 // `std::encoding::json::decode` reads to reach a struct of its own.
-pub fn row_json(row: &conn::Row) -> String {
+pub fn row_json(row: conn::Row) -> String {
     rowmap::row_json(row)
 }
 
 // A result set as a JSON array of objects.
-pub fn rows_json(rows: &Vec<conn::Row>) -> String {
+pub fn rows_json(rows: Vec<conn::Row>) -> String {
     rowmap::rows_json(rows)
 }
 
 // `INSERT INTO <table> (<columns>) VALUES ($1, ...)`, with the identifiers
 // quoted and one placeholder per column.
-pub fn insert_sql(table: &String, columns: &Vec<String>) -> String {
+pub fn insert_sql(table: String, columns: Vec<String>) -> String {
     rowmap::insert_sql(table, columns)
 }
 
 // `SELECT <columns> FROM <table>`, with the identifiers quoted.
-pub fn select_sql(table: &String, columns: &Vec<String>) -> String {
+pub fn select_sql(table: String, columns: Vec<String>) -> String {
     rowmap::select_sql(table, columns)
 }
 
 // `UPDATE <table> SET <columns> = ... WHERE <key> = $n`, numbering the key's
 // placeholder last.
-pub fn update_sql(table: &String, columns: &Vec<String>, key: &String) -> String {
+pub fn update_sql(table: String, columns: Vec<String>, key: String) -> String {
     rowmap::update_sql(table, columns, key)
 }
 
@@ -261,38 +261,38 @@ pub fn placeholders(count: i64) -> String {
 // The SQLSTATE of a driver error, or `""` when the failure did not come
 // from the server. Every server error is reported as `[SQLSTATE] message`,
 // which is what this reads back.
-pub fn sqlstate_of(e: &errors::Error) -> String {
+pub fn sqlstate_of(e: errors::Error) -> String {
     dberror::sqlstate_of(e)
 }
 
 // True when the error is one a caller retries: a serialization failure or a
 // deadlock, the two outcomes a correct transaction can hit through no fault
 // of its own.
-pub fn retryable(e: &errors::Error) -> bool {
+pub fn retryable(e: errors::Error) -> bool {
     let code = sqlstate_of(e)
     code == "40001" || code == "40P01"
 }
 
 // True when the error reports a unique-constraint violation.
-pub fn unique_violation(e: &errors::Error) -> bool {
+pub fn unique_violation(e: errors::Error) -> bool {
     sqlstate_of(e) == "23505"
 }
 
 // True when the error reports a foreign-key violation.
-pub fn foreign_key_violation(e: &errors::Error) -> bool {
+pub fn foreign_key_violation(e: errors::Error) -> bool {
     sqlstate_of(e) == "23503"
 }
 
 // True when the error reports a not-null violation.
-pub fn not_null_violation(e: &errors::Error) -> bool {
+pub fn not_null_violation(e: errors::Error) -> bool {
     sqlstate_of(e) == "23502"
 }
 
 // True when the error's SQLSTATE class (its first two characters) is
 // `class`: `23` integrity constraint, `40` transaction rollback, `42`
 // syntax or access rule, `08` connection exception.
-pub fn in_error_class(e: &errors::Error, class: String) -> bool {
-    sqlstate_of(e).starts_with(&class)
+pub fn in_error_class(e: errors::Error, class: String) -> bool {
+    sqlstate_of(e).starts_with(class)
 }
 
 // --- type names ---------------------------------------------------
@@ -309,45 +309,45 @@ mod lib_tests {
     #[test]
     fn parameter_constructors_build_the_matching_values() {
         let _ = testing::check(super::null().is_null(), "null")
-        let _ = testing::check_eq(&super::int(7).as_int().unwrap_or(0), &7, "int")
-        let _ = testing::check_eq(&super::text("hi").as_text().unwrap_or(""), &"hi", "text")
+        let _ = testing::check_eq(super::int(7).as_int().unwrap_or(0), 7, "int")
+        let _ = testing::check_eq(super::text("hi").as_text().unwrap_or(""), "hi", "text")
         let _ = testing::check(super::boolean(true).as_bool().unwrap_or(false), "bool")
         let _ = testing::check_eq(
-            &super::numeric("1.250").as_text().unwrap_or("")
-            &"1.250"
+            super::numeric("1.250").as_text().unwrap_or("")
+            "1.250"
             "numeric keeps its digits"
         )
         let _ = testing::check(super::opt_int(None).is_null(), "None binds NULL")
-        let _ = testing::check_eq(&super::opt_int(Some(3)).as_int().unwrap_or(0), &3, "Some binds")
+        let _ = testing::check_eq(super::opt_int(Some(3)).as_int().unwrap_or(0), 3, "Some binds")
     }
 
     #[test]
     fn array_constructors_carry_their_element_type() {
         let ints = super::int_array(#[1, 2, 3])
-        let _ = testing::check_eq(&ints.render(), &"{1,2,3}", "int array literal")
+        let _ = testing::check_eq(ints.render(), "{1,2,3}", "int array literal")
         let texts = super::text_array(#["a", "b,c"])
-        let _ = testing::check_eq(&texts.render(), &"{a,\"b,c\"}", "text array quotes as needed")
+        let _ = testing::check_eq(texts.render(), "{a,\"b,c\"}", "text array quotes as needed")
     }
 
     #[test]
     fn sqlstate_reads_back_out_of_a_server_error() {
         let e = errors::new("[23505] duplicate key value violates unique constraint")
-        let _ = testing::check_eq(&super::sqlstate_of(&e), &"23505", "sqlstate")
-        let _ = testing::check(super::unique_violation(&e), "unique violation")
-        let _ = testing::check(super::in_error_class(&e, "23"), "integrity class")
-        let _ = testing::check(!super::retryable(&e), "not retryable")
+        let _ = testing::check_eq(super::sqlstate_of(e), "23505", "sqlstate")
+        let _ = testing::check(super::unique_violation(e), "unique violation")
+        let _ = testing::check(super::in_error_class(e, "23"), "integrity class")
+        let _ = testing::check(!super::retryable(e), "not retryable")
 
         let serialization = errors::new("[40001] could not serialize access")
-        let _ = testing::check(super::retryable(&serialization), "serialization failure retries")
+        let _ = testing::check(super::retryable(serialization), "serialization failure retries")
 
         let local = errors::new("connecting to 127.0.0.1:5432: refused")
-        let _ = testing::check_eq(&super::sqlstate_of(&local), &"", "a local failure has none")
-        let _ = testing::check(!super::unique_violation(&local), "no false classification")
+        let _ = testing::check_eq(super::sqlstate_of(local), "", "a local failure has none")
+        let _ = testing::check(!super::unique_violation(local), "no false classification")
     }
 
     #[test]
     fn type_names_come_from_the_oid_catalogue() {
-        let _ = testing::check_eq(&super::type_name(oid::INT4), &"int4", "int4")
-        let _ = testing::check_eq(&super::type_name(oid::TEXT_ARRAY), &"text[]", "text[]")
+        let _ = testing::check_eq(super::type_name(oid::INT4), "int4", "int4")
+        let _ = testing::check_eq(super::type_name(oid::TEXT_ARRAY), "text[]", "text[]")
     }
 }

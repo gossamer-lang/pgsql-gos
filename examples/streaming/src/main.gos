@@ -18,7 +18,7 @@ const BATCH: i64 = 5_000
 
 fn main() -> Result<(), errors::Error> {
     let url = env::var("GOS_PGSQL_URL").unwrap_or("host=/var/run/postgresql dbname=gos_pgsql_test")
-    let mut db = pgsql::connect(&url)?
+    let mut db = pgsql::connect(url)?
     defer db.close()
 
     setup(&mut db)?
@@ -27,12 +27,12 @@ fn main() -> Result<(), errors::Error> {
     let by_batch = by_portal(&mut db)?
     let by_copy = by_copy_out(&mut db)?
 
-    println!("")
-    println!("all three read the same {} rows: {}", ROWS, by_stream == by_batch && by_batch == by_copy)
-    println!("checksum {}", by_stream)
+    println("")
+    println("all three read the same {} rows: {}", ROWS, by_stream == by_batch && by_batch == by_copy)
+    println("checksum {}", by_stream)
 
     abandoning_a_read_leaves_the_connection_usable(&mut db)?
-    db.batch_execute(&"DROP TABLE IF EXISTS readings")?
+    db.batch_execute("DROP TABLE IF EXISTS readings")?
     Ok(())
 }
 
@@ -40,7 +40,7 @@ fn main() -> Result<(), errors::Error> {
 // the end leaves the connection ready with no further call.
 fn by_row_stream(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
     let started = time::now_ms()
-    let mut stream = db.query_raw(&"SELECT id, celsius FROM readings ORDER BY id", &#[])?
+    let mut stream = db.query_raw("SELECT id, celsius FROM readings ORDER BY id", #[])?
     let mut checksum = 0
     let mut seen = 0
     loop {
@@ -62,7 +62,7 @@ fn by_row_stream(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
 fn by_portal(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
     let started = time::now_ms()
     let mut tx = db.transaction()?
-    let mut portal = db.open_portal(&"SELECT id, celsius FROM readings ORDER BY id", &#[])?
+    let mut portal = db.open_portal("SELECT id, celsius FROM readings ORDER BY id", #[])?
     let mut checksum = 0
     let mut seen = 0
     let mut batches = 0
@@ -79,7 +79,7 @@ fn by_portal(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
     }
     db.commit(&mut tx)?
     report("portal     ", seen, checksum, started)
-    println!("             {} batches of at most {}", batches, BATCH)
+    println("             {} batches of at most {}", batches, BATCH)
     Ok(checksum)
 }
 
@@ -87,7 +87,7 @@ fn by_portal(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
 // line at a time so the payload never has to fit in memory either.
 fn by_copy_out(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
     let started = time::now_ms()
-    let mut copy = db.copy_out_begin(&"COPY (SELECT id, celsius FROM readings ORDER BY id) TO STDOUT")?
+    let mut copy = db.copy_out_begin("COPY (SELECT id, celsius FROM readings ORDER BY id) TO STDOUT")?
     let mut checksum = 0
     let mut seen = 0
     while let Some(line) = db.copy_out_line(&mut copy)? {
@@ -98,7 +98,7 @@ fn by_copy_out(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
         seen += 1
     }
     report("copy out   ", seen, checksum, started)
-    println!("             {} bytes received", copy.bytes_received())
+    println("             {} bytes received", copy.bytes_received())
     Ok(checksum)
 }
 
@@ -107,24 +107,24 @@ fn by_copy_out(db: &mut pgsql::client::Client) -> Result<i64, errors::Error> {
 fn abandoning_a_read_leaves_the_connection_usable(
     db: &mut pgsql::client::Client
 ) -> Result<(), errors::Error> {
-    println!("")
-    let mut stream = db.query_raw(&"SELECT id FROM readings ORDER BY id", &#[])?
+    println("")
+    let mut stream = db.query_raw("SELECT id FROM readings ORDER BY id", #[])?
     let _ = db.next_row(&mut stream)?
     db.close_stream(&mut stream)?
     db.ping()?
 
-    let mut copy = db.copy_out_begin(&"COPY readings TO STDOUT")?
+    let mut copy = db.copy_out_begin("COPY readings TO STDOUT")?
     let _ = db.copy_out_next(&mut copy)?
     db.copy_out_end(&mut copy)?
     db.ping()?
 
-    println!("a stream and a COPY both abandoned part way: the connection still works")
+    println("a stream and a COPY both abandoned part way: the connection still works")
     Ok(())
 }
 
 fn report(label: String, seen: i64, checksum: i64, started: i64) {
     let elapsed = max(time::now_ms() - started, 1)
-    println!(
+    println(
         "{} {} rows in {} ms ({} rows/s), checksum {}"
         label
         seen
@@ -135,10 +135,10 @@ fn report(label: String, seen: i64, checksum: i64, started: i64) {
 }
 
 fn setup(db: &mut pgsql::client::Client) -> Result<(), errors::Error> {
-    println!("loading {} rows", ROWS)
-    db.batch_execute(&"DROP TABLE IF EXISTS readings")?
-    db.batch_execute(&"CREATE TABLE readings (id bigint PRIMARY KEY, celsius numeric(6,2))")?
-    db.batch_execute(&format!(
+    println("loading {} rows", ROWS)
+    db.batch_execute("DROP TABLE IF EXISTS readings")?
+    db.batch_execute("CREATE TABLE readings (id bigint PRIMARY KEY, celsius numeric(6,2))")?
+    db.batch_execute(format(
         "INSERT INTO readings SELECT i, (i % 4000) / 100.0 FROM generate_series(1, {}) i"
         ROWS
     ))?

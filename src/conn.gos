@@ -41,7 +41,7 @@ pub struct Column {
     // Declared size in bytes; negative for a variable-length type.
     pub type_size: i64
     // Wire format the server is sending this column in.
-    pub format: i64
+    pub wire_format: i64
 }
 
 // A prepared statement on the server.
@@ -100,15 +100,15 @@ pub struct PgConn {
 // The two arms read alike but bind different socket types, so the call in
 // each resolves to that type's own method.
 #[lint(allow(match_same_arms))]
-fn socket_write(sock: &Socket, data: &Vec<u8>) -> Result<(), errors::Error> {
+fn socket_write(sock: Socket, data: Vec<u8>) -> Result<(), errors::Error> {
     match sock {
-        Socket::Tcp(stream) => stream.write_all(data.clone())
-        Socket::Unix(stream) => stream.write_all(data.clone())
+        Socket::Tcp(stream) => stream.write_all(data)
+        Socket::Unix(stream) => stream.write_all(data)
     }
 }
 
 #[lint(allow(match_same_arms))]
-fn socket_read(sock: &Socket, max: i64) -> Result<Vec<u8>, errors::Error> {
+fn socket_read(sock: Socket, max: i64) -> Result<Vec<u8>, errors::Error> {
     match sock {
         Socket::Tcp(stream) => stream.read(max)
         Socket::Unix(stream) => stream.read(max)
@@ -116,7 +116,7 @@ fn socket_read(sock: &Socket, max: i64) -> Result<Vec<u8>, errors::Error> {
 }
 
 #[lint(allow(match_same_arms))]
-fn socket_close(sock: &Socket) {
+fn socket_close(sock: Socket) {
     match sock {
         Socket::Tcp(stream) => stream.close()
         Socket::Unix(stream) => stream.close()
@@ -129,11 +129,11 @@ const READ_CHUNK: i64 = 65_536
 
 impl PgConn {
     // Sends raw bytes, marking the connection dead if the socket fails.
-    pub (package) fn send(&mut self, data: &Vec<u8>) -> Result<(), errors::Error> {
+    pub (package) fn send(&mut self, data: Vec<u8>) -> Result<(), errors::Error> {
         if self.closed {
             return Err(errors::new("connection is closed"))
         }
-        match socket_write(&self.sock, data) {
+        match socket_write(self.sock, data) {
             Ok(_) => Ok(())
             Err(e) => {
                 self.closed = true
@@ -146,10 +146,10 @@ impl PgConn {
     // does not grow without bound across a long stream of messages.
     fn fill(&mut self) -> Result<(), errors::Error> {
         if self.inbox_pos > 0 {
-            self.inbox = buf::slice(&self.inbox, self.inbox_pos, self.inbox.len())
+            self.inbox = buf::slice(self.inbox, self.inbox_pos, self.inbox.len())
             self.inbox_pos = 0
         }
-        match socket_read(&self.sock, READ_CHUNK) {
+        match socket_read(self.sock, READ_CHUNK) {
             Ok(chunk) => {
                 if chunk.len() == 0 {
                     self.closed = true
@@ -165,7 +165,7 @@ impl PgConn {
                     // read stopped, and naming it says what to change.
                     return Err(errors::wrap(
                         e
-                        format!(
+                        format(
                             "reading from server (socket_timeout is {} ms)"
                             self.socket_timeout_ms
                         )
@@ -183,7 +183,7 @@ impl PgConn {
         if available < 5 {
             return None
         }
-        let length = buf::i32_at(&self.inbox, self.inbox_pos + 1)
+        let length = buf::i32_at(self.inbox, self.inbox_pos + 1)
         if length < 4 {
             return None
         }
@@ -191,8 +191,8 @@ impl PgConn {
         if available < total {
             return None
         }
-        let tag = buf::u8_at(&self.inbox, self.inbox_pos)
-        let body = buf::slice(&self.inbox, self.inbox_pos + 5, self.inbox_pos + total)
+        let tag = buf::u8_at(self.inbox, self.inbox_pos)
+        let body = buf::slice(self.inbox, self.inbox_pos + 5, self.inbox_pos + total)
         self.inbox_pos += total
         Some((tag, body))
     }
@@ -210,14 +210,14 @@ impl PgConn {
     // One message, with the asynchronous ones absorbed.
     pub (package) fn recv(&mut self) -> Result<(i64, Vec<u8>), errors::Error> {
         loop {
-            let (tag, body) = self.recv_raw()?
+            let tag, body = self.recv_raw()?
             match tag {
                 proto::B_PARAMETER_STATUS => {
-                    let (name, setting) = parse_parameter_status(&body)
+                    let name, setting = parse_parameter_status(body)
                     let _ = self.params.insert(name, setting)
                 }
-                proto::B_NOTICE_RESPONSE => self.notices.push(dberror::parse(&body))
-                proto::B_NOTIFICATION_RESPONSE => self.pending.push(parse_notification(&body))
+                proto::B_NOTICE_RESPONSE => self.notices.push(dberror::parse(body))
+                proto::B_NOTIFICATION_RESPONSE => self.pending.push(parse_notification(body))
                 _ => return Ok((tag, body))
             }
         }
@@ -250,7 +250,7 @@ impl PgConn {
         if available < 5 {
             return false
         }
-        let length = buf::i32_at(&self.inbox, self.inbox_pos + 1)
+        let length = buf::i32_at(self.inbox, self.inbox_pos + 1)
         length >= 4 && available >= 1 + length
     }
 
@@ -258,7 +258,7 @@ impl PgConn {
 
     // A session parameter the server reported (`server_version`,
     // `client_encoding`, `TimeZone`, ...).
-    pub fn parameter(&self, name: &String) -> Option<String> {
+    pub fn parameter(&self, name: String) -> Option<String> {
         self.params.get(name)
     }
 
@@ -308,22 +308,22 @@ impl PgConn {
 
     // Notices the server reported since the last call, and clears them.
     pub fn take_notices(&mut self) -> Vec<dberror::DbError> {
-        let out = self.notices.clone()
+        let out = self.notices
         self.notices = #[]
         out
     }
 
     // A fresh name for a statement or portal, unique within the session.
-    pub (package) fn next_name(&mut self, prefix: &String) -> String {
+    pub (package) fn next_name(&mut self, prefix: String) -> String {
         self.name_counter += 1
-        format!("gos_pgsql_{}{}", prefix, self.name_counter)
+        format("gos_pgsql_{}{}", prefix, self.name_counter)
     }
 
     // --- ready-state plumbing -------------------------------------
 
     // Records what a ReadyForQuery reports: the transaction status, and that
     // no portal is mid-stream.
-    fn mark_ready(&mut self, body: &Vec<u8>) {
+    fn mark_ready(&mut self, body: Vec<u8>) {
         self.tx_status = buf::u8_at(body, 0)
         self.portal_open = false
     }
@@ -335,19 +335,19 @@ impl PgConn {
         let mut counts: Vec<i64> = #[]
         let mut failure: Option<dberror::DbError> = None
         loop {
-            let (tag, body) = self.recv()?
+            let tag, body = self.recv()?
             match tag {
                 proto::B_COMMAND_COMPLETE => {
-                    let (_, count) = proto::command_complete(&body)
+                    let _, count = proto::command_complete(body)
                     counts.push(count)
                 }
                 proto::B_ERROR_RESPONSE => {
                     if failure.is_none() {
-                        failure = Some(dberror::parse(&body))
+                        failure = Some(dberror::parse(body))
                     }
                 }
                 proto::B_READY_FOR_QUERY => {
-                    self.mark_ready(&body)
+                    self.mark_ready(body)
                     break
                 }
                 _ => ()
@@ -379,32 +379,32 @@ impl PgConn {
 
     // One result set from the simple query protocol. A simple query may
     // carry several statements, so a call answers a list of these.
-    pub fn simple_query(&mut self, sql: &String) -> Result<Vec<SimpleResult>, errors::Error> {
+    pub fn simple_query(&mut self, sql: String) -> Result<Vec<SimpleResult>, errors::Error> {
         self.ensure_ready()?
         let mut body: Vec<u8> = #[]
         buf::put_cstr(&mut body, sql)
-        let message = proto::frame(proto::F_QUERY, &body)
-        self.send(&message)?
+        let message = proto::frame(proto::F_QUERY, body)
+        self.send(message)?
 
         let mut results: Vec<SimpleResult> = #[]
         let mut columns: Vec<Column> = #[]
         let mut rows: Vec<Vec<value::Value>> = #[]
         let mut failure: Option<dberror::DbError> = None
         loop {
-            let (tag, msg) = self.recv()?
+            let tag, msg = self.recv()?
             match tag {
                 proto::B_ROW_DESCRIPTION => {
-                    columns = parse_row_description(&msg)
+                    columns = parse_row_description(msg)
                     rows = #[]
                 }
-                proto::B_DATA_ROW => rows.push(decode_data_row(&msg, &columns))
+                proto::B_DATA_ROW => rows.push(decode_data_row(msg, columns))
                 proto::B_COMMAND_COMPLETE => {
-                    let (tag_text, count) = proto::command_complete(&msg)
+                    let tag_text, count = proto::command_complete(msg)
                     results.push(SimpleResult {
                         tag: tag_text
                         rows_affected: count
-                        columns: columns.clone()
-                        rows: rows.clone()
+                        columns: columns
+                        rows: rows
                     })
                     columns = #[]
                     rows = #[]
@@ -419,11 +419,11 @@ impl PgConn {
                 }
                 proto::B_ERROR_RESPONSE => {
                     if failure.is_none() {
-                        failure = Some(dberror::parse(&msg))
+                        failure = Some(dberror::parse(msg))
                     }
                 }
                 proto::B_READY_FOR_QUERY => {
-                    self.mark_ready(&msg)
+                    self.mark_ready(msg)
                     break
                 }
                 _ => ()
@@ -438,7 +438,7 @@ impl PgConn {
     // Runs one or more statements for their effect, reporting the first
     // failure. This is the simple query protocol, so the statements share a
     // single implicit transaction unless the text opens one.
-    pub fn batch_execute(&mut self, sql: &String) -> Result<(), errors::Error> {
+    pub fn batch_execute(&mut self, sql: String) -> Result<(), errors::Error> {
         let _ = self.simple_query(sql)?
         Ok(())
     }
@@ -450,19 +450,19 @@ impl PgConn {
     // an empty list lets the server infer them.
     pub fn prepare(
         &mut self
-        sql: &String
-        param_oids: &Vec<i64>
+        sql: String
+        param_oids: Vec<i64>
     ) -> Result<Statement, errors::Error> {
-        let name = self.next_name(&"s")
-        self.prepare_named(&name, sql, param_oids)
+        let name = self.next_name("s")
+        self.prepare_named(name, sql, param_oids)
     }
 
     // As `prepare`, under a caller-chosen server-side name.
     pub fn prepare_named(
         &mut self
-        name: &String
-        sql: &String
-        param_oids: &Vec<i64>
+        name: String
+        sql: String
+        param_oids: Vec<i64>
     ) -> Result<Statement, errors::Error> {
         self.ensure_ready()?
         let mut out: Vec<u8> = #[]
@@ -474,36 +474,36 @@ impl PgConn {
         for oid in param_oids {
             buf::put_i32(&mut parse_body, oid)
         }
-        out.extend(proto::frame(proto::F_PARSE, &parse_body))
+        out.extend(proto::frame(proto::F_PARSE, parse_body))
 
         let mut describe_body: Vec<u8> = #[]
         buf::put_u8(&mut describe_body, proto::TARGET_STATEMENT)
         buf::put_cstr(&mut describe_body, name)
-        out.extend(proto::frame(proto::F_DESCRIBE, &describe_body))
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(proto::frame(proto::F_DESCRIBE, describe_body))
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
 
-        let mut described_params: Vec<i64> = param_oids.clone()
+        let mut described_params: Vec<i64> = param_oids
         let mut columns: Vec<Column> = #[]
         let mut failure: Option<dberror::DbError> = None
         loop {
-            let (tag, msg) = self.recv()?
+            let tag, msg = self.recv()?
             match tag {
                 proto::B_PARAMETER_DESCRIPTION => {
                     let mut oids: Vec<i64> = #[]
-                    for i in 0..buf::i16_at(&msg, 0) {
-                        oids.push(buf::u32_at(&msg, 2 + i * 4))
+                    for i in 0..buf::i16_at(msg, 0) {
+                        oids.push(buf::u32_at(msg, 2 + i * 4))
                     }
                     described_params = oids
                 }
-                proto::B_ROW_DESCRIPTION => { columns = parse_row_description(&msg) }
+                proto::B_ROW_DESCRIPTION => { columns = parse_row_description(msg) }
                 proto::B_ERROR_RESPONSE => {
                     if failure.is_none() {
-                        failure = Some(dberror::parse(&msg))
+                        failure = Some(dberror::parse(msg))
                     }
                 }
                 proto::B_READY_FOR_QUERY => {
-                    self.mark_ready(&msg)
+                    self.mark_ready(msg)
                     break
                 }
                 // ParseComplete and NoData carry no shape of their own.
@@ -513,7 +513,7 @@ impl PgConn {
         match failure {
             Some(e) => Err(e.as_error())
             None => Ok(Statement {
-                name: name.clone()
+                name: name
                 param_oids: described_params
                 columns: columns
             })
@@ -521,18 +521,18 @@ impl PgConn {
     }
 
     // Drops a prepared statement from the server.
-    pub fn close_statement(&mut self, statement: &Statement) -> Result<(), errors::Error> {
+    pub fn close_statement(&mut self, statement: Statement) -> Result<(), errors::Error> {
         if self.closed {
             return Ok(())
         }
         self.ensure_ready()?
         let mut body: Vec<u8> = #[]
         buf::put_u8(&mut body, proto::TARGET_STATEMENT)
-        buf::put_cstr(&mut body, &statement.name)
+        buf::put_cstr(&mut body, statement.name)
         let mut out: Vec<u8> = #[]
-        out.extend(proto::frame(proto::F_CLOSE, &body))
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(proto::frame(proto::F_CLOSE, body))
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
         self.drain_to_ready()
     }
 
@@ -541,9 +541,9 @@ impl PgConn {
     // applies to every column.
     pub (package) fn bind(
         &mut self
-        statement: &Statement
-        portal: &String
-        params: &Vec<value::Value>
+        statement: Statement
+        portal: String
+        params: Vec<value::Value>
         result_format: i64
     ) -> Result<Vec<u8>, errors::Error> {
         if params.len() != statement.param_oids.len() && statement.param_oids.len() > 0 {
@@ -555,7 +555,7 @@ impl PgConn {
         }
         let mut body: Vec<u8> = #[]
         buf::put_cstr(&mut body, portal)
-        buf::put_cstr(&mut body, &statement.name)
+        buf::put_cstr(&mut body, statement.name)
 
         // Each parameter carries its own format code, so a `bytea` goes as
         // binary while the rest go as text. The encodings are concatenated
@@ -576,7 +576,7 @@ impl PgConn {
             } else {
                 0
             }
-            match value::encode_binary(&param, type_oid) {
+            match value::encode_binary(param, type_oid) {
                 Some(bytes) => {
                     formats.push(value::FORMAT_BINARY)
                     lengths.push(bytes.len())
@@ -592,46 +592,46 @@ impl PgConn {
         }
 
         buf::put_i16(&mut body, formats.len())
-        for format in formats {
-            buf::put_i16(&mut body, format)
+        for wire_format in formats {
+            buf::put_i16(&mut body, wire_format)
         }
         buf::put_i16(&mut body, lengths.len())
         let mut offset = 0
         for length in lengths {
             buf::put_i32(&mut body, length)
             if length > 0 {
-                buf::put_bytes(&mut body, &buf::slice(&blob, offset, offset + length))
+                buf::put_bytes(&mut body, buf::slice(blob, offset, offset + length))
                 offset += length
             }
         }
         // One result format code applied to every column.
         buf::put_i16(&mut body, 1)
         buf::put_i16(&mut body, result_format)
-        Ok(proto::frame(proto::F_BIND, &body))
+        Ok(proto::frame(proto::F_BIND, body))
     }
 
     // An Execute message for `portal`, fetching at most `max_rows` rows (0
     // for all of them).
-    pub (package) fn execute_message(portal: &String, max_rows: i64) -> Vec<u8> {
+    pub (package) fn execute_message(portal: String, max_rows: i64) -> Vec<u8> {
         let mut body: Vec<u8> = #[]
         buf::put_cstr(&mut body, portal)
         buf::put_i32(&mut body, max(max_rows, 0))
-        proto::frame(proto::F_EXECUTE, &body)
+        proto::frame(proto::F_EXECUTE, body)
     }
 
     // Runs a statement for its effect and reports the rows it affected.
     pub fn execute(
         &mut self
-        statement: &Statement
-        params: &Vec<value::Value>
+        statement: Statement
+        params: Vec<value::Value>
     ) -> Result<i64, errors::Error> {
         self.ensure_ready()?
-        let bind_message = self.bind(statement, &"", params, value::FORMAT_TEXT)?
+        let bind_message = self.bind(statement, "", params, value::FORMAT_TEXT)?
         let mut out: Vec<u8> = #[]
         out.extend(bind_message)
-        out.extend(PgConn::execute_message(&"", 0))
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(PgConn::execute_message("", 0))
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
         Ok(self.collect_counts()?.last().unwrap_or(0))
     }
 
@@ -639,32 +639,32 @@ impl PgConn {
     // the portal stays open until the stream is drained or closed.
     pub fn query(
         &mut self
-        statement: &Statement
-        params: &Vec<value::Value>
+        statement: Statement
+        params: Vec<value::Value>
         result_format: i64
     ) -> Result<RowStream, errors::Error> {
         self.ensure_ready()?
-        let portal = self.next_name(&"p")
-        let bind_message = self.bind(statement, &portal, params, result_format)?
+        let portal = self.next_name("p")
+        let bind_message = self.bind(statement, portal, params, result_format)?
         let mut out: Vec<u8> = #[]
         out.extend(bind_message)
-        out.extend(PgConn::execute_message(&portal, 0))
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(PgConn::execute_message(portal, 0))
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
 
         // The Bind is the first thing that can fail: a parameter the server
         // cannot coerce is reported here, before any row arrives.
-        let (tag, msg) = self.recv()?
+        let tag, msg = self.recv()?
         if tag == proto::B_ERROR_RESPONSE {
-            let failure = dberror::parse(&msg)
+            let failure = dberror::parse(msg)
             self.drain_to_ready()?
             return Err(failure.as_error())
         }
         self.portal_open = true
         // Result columns come from the Describe done at prepare time; a
         // binary-format request re-labels them so decoding matches the wire.
-        let columns = relabel_formats(&statement.columns, result_format)
-        let index = column_index(&columns)
+        let columns = relabel_formats(statement.columns, result_format)
+        let index = column_index(columns)
         Ok(RowStream {
             portal: portal
             columns: columns
@@ -684,17 +684,17 @@ impl PgConn {
             return Ok(None)
         }
         loop {
-            let (tag, msg) = self.recv()?
+            let tag, msg = self.recv()?
             match tag {
                 proto::B_DATA_ROW => {
                     return Ok(Some(Row {
-                        columns: stream.columns.clone()
-                        values: decode_data_row(&msg, &stream.columns)
+                        columns: stream.columns
+                        values: decode_data_row(msg, stream.columns)
                         index: stream.index
                     }))
                 }
                 proto::B_COMMAND_COMPLETE => {
-                    let (tag_text, count) = proto::command_complete(&msg)
+                    let tag_text, count = proto::command_complete(msg)
                     stream.tag = tag_text
                     stream.rows_affected = count
                     stream.done = true
@@ -717,7 +717,7 @@ impl PgConn {
                     return Ok(None)
                 }
                 proto::B_ERROR_RESPONSE => {
-                    let failure = dberror::parse(&msg)
+                    let failure = dberror::parse(msg)
                     stream.done = true
                     self.portal_open = false
                     self.drain_to_ready()?
@@ -725,8 +725,8 @@ impl PgConn {
                 }
                 // BindComplete and RowDescription may precede the rows.
                 proto::B_ROW_DESCRIPTION => {
-                    stream.columns = parse_row_description(&msg)
-                    stream.index = column_index(&stream.columns)
+                    stream.columns = parse_row_description(msg)
+                    stream.index = column_index(stream.columns)
                 }
                 _ => ()
             }
@@ -754,20 +754,20 @@ impl PgConn {
     // statement's transaction ends, so this is only useful inside one.
     pub fn open_portal(
         &mut self
-        statement: &Statement
-        params: &Vec<value::Value>
+        statement: Statement
+        params: Vec<value::Value>
         result_format: i64
     ) -> Result<Portal, errors::Error> {
         self.ensure_ready()?
-        let name = self.next_name(&"c")
-        let bind_message = self.bind(statement, &name, params, result_format)?
+        let name = self.next_name("c")
+        let bind_message = self.bind(statement, name, params, result_format)?
         let mut out: Vec<u8> = #[]
         out.extend(bind_message)
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
         self.drain_to_ready()?
-        let columns = relabel_formats(&statement.columns, result_format)
-        let index = column_index(&columns)
+        let columns = relabel_formats(statement.columns, result_format)
+        let index = column_index(columns)
         Ok(Portal { name: name, columns: columns, index: index, exhausted: false })
     }
 
@@ -783,18 +783,18 @@ impl PgConn {
         }
         self.ensure_ready()?
         let mut out: Vec<u8> = #[]
-        out.extend(PgConn::execute_message(&portal.name, batch_size))
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(PgConn::execute_message(portal.name, batch_size))
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
 
         let mut rows: Vec<Row> = #[]
         let mut failure: Option<dberror::DbError> = None
         loop {
-            let (tag, msg) = self.recv()?
+            let tag, msg = self.recv()?
             match tag {
                 proto::B_DATA_ROW => rows.push(Row {
-                    columns: portal.columns.clone()
-                    values: decode_data_row(&msg, &portal.columns)
+                    columns: portal.columns
+                    values: decode_data_row(msg, portal.columns)
                     index: portal.index
                 })
                 proto::B_COMMAND_COMPLETE | proto::B_EMPTY_QUERY_RESPONSE => {
@@ -803,11 +803,11 @@ impl PgConn {
                 proto::B_ERROR_RESPONSE => {
                     portal.exhausted = true
                     if failure.is_none() {
-                        failure = Some(dberror::parse(&msg))
+                        failure = Some(dberror::parse(msg))
                     }
                 }
                 proto::B_READY_FOR_QUERY => {
-                    self.mark_ready(&msg)
+                    self.mark_ready(msg)
                     break
                 }
                 _ => ()
@@ -828,11 +828,11 @@ impl PgConn {
         self.ensure_ready()?
         let mut body: Vec<u8> = #[]
         buf::put_u8(&mut body, proto::TARGET_PORTAL)
-        buf::put_cstr(&mut body, &portal.name)
+        buf::put_cstr(&mut body, portal.name)
         let mut out: Vec<u8> = #[]
-        out.extend(proto::frame(proto::F_CLOSE, &body))
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(proto::frame(proto::F_CLOSE, body))
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
         self.drain_to_ready()
     }
 
@@ -845,8 +845,8 @@ impl PgConn {
     // unless the caller opened a transaction of its own.
     pub fn pipeline(
         &mut self
-        statements: &Vec<Statement>
-        params: &Vec<Vec<value::Value>>
+        statements: Vec<Statement>
+        params: Vec<Vec<value::Value>>
     ) -> Result<Vec<i64>, errors::Error> {
         if statements.len() != params.len() {
             return Err(errors::newf(
@@ -861,12 +861,12 @@ impl PgConn {
         // is an aggregate held inside another, and the Bind message reads them
         // several times.
         for (statement, row) in statements.iter().zip(params.iter()) {
-            let bind_message = self.bind(&statement, &"", &row, value::FORMAT_TEXT)?
+            let bind_message = self.bind(statement, "", row, value::FORMAT_TEXT)?
             out.extend(bind_message)
-            out.extend(PgConn::execute_message(&"", 0))
+            out.extend(PgConn::execute_message("", 0))
         }
-        out.extend(proto::frame(proto::F_SYNC, &#[]))
-        self.send(&out)?
+        out.extend(proto::frame(proto::F_SYNC, #[]))
+        self.send(out)?
         self.collect_counts()
     }
 
@@ -879,16 +879,16 @@ impl PgConn {
     // lines, CSV, or the binary format. A chunk needs no relation to a row
     // boundary - the server reassembles the stream - so a bulk load never
     // has to be held in memory at once.
-    pub fn copy_in_begin(&mut self, sql: &String) -> Result<CopyIn, errors::Error> {
+    pub fn copy_in_begin(&mut self, sql: String) -> Result<CopyIn, errors::Error> {
         self.ensure_ready()?
         let mut query_body: Vec<u8> = #[]
         buf::put_cstr(&mut query_body, sql)
-        let message = proto::frame(proto::F_QUERY, &query_body)
-        self.send(&message)?
+        let message = proto::frame(proto::F_QUERY, query_body)
+        self.send(message)?
 
-        let (tag, msg) = self.recv()?
+        let tag, msg = self.recv()?
         if tag == proto::B_ERROR_RESPONSE {
-            let failure = dberror::parse(&msg)
+            let failure = dberror::parse(msg)
             self.drain_to_ready()?
             return Err(failure.as_error())
         }
@@ -906,7 +906,7 @@ impl PgConn {
     pub fn copy_in_write(
         &mut self
         copy: &mut CopyIn
-        data: &Vec<u8>
+        data: Vec<u8>
     ) -> Result<(), errors::Error> {
         if copy.done {
             return Err(errors::new("this COPY FROM STDIN has already finished"))
@@ -915,7 +915,7 @@ impl PgConn {
             return Ok(())
         }
         copy.sent += data.len()
-        self.send(&proto::frame(proto::F_COPY_DATA, data))
+        self.send(proto::frame(proto::F_COPY_DATA, data))
     }
 
     // Ends a COPY FROM STDIN, reporting the rows the server accepted.
@@ -924,13 +924,13 @@ impl PgConn {
             return Err(errors::new("this COPY FROM STDIN has already finished"))
         }
         copy.done = true
-        self.send(&proto::frame(proto::F_COPY_DONE, &#[]))?
+        self.send(proto::frame(proto::F_COPY_DONE, #[]))?
         Ok(self.collect_counts()?.last().unwrap_or(0))
     }
 
     // Streams `data` into the server with `COPY ... FROM STDIN` in one
     // call, reporting the rows the server accepted.
-    pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
+    pub fn copy_in(&mut self, sql: String, data: Vec<u8>) -> Result<i64, errors::Error> {
         let mut copy = self.copy_in_begin(sql)?
         self.copy_in_write(&mut copy, data)?
         self.copy_in_end(&mut copy)
@@ -939,11 +939,11 @@ impl PgConn {
     // Abandons an in-progress COPY FROM STDIN with a reason the server
     // reports back as an error. Used when the data source fails part-way,
     // so the server does not commit a partial copy.
-    pub fn copy_fail(&mut self, reason: &String) -> Result<(), errors::Error> {
+    pub fn copy_fail(&mut self, reason: String) -> Result<(), errors::Error> {
         let mut body: Vec<u8> = #[]
         buf::put_cstr(&mut body, reason)
-        let message = proto::frame(proto::F_COPY_FAIL, &body)
-        self.send(&message)?
+        let message = proto::frame(proto::F_COPY_FAIL, body)
+        self.send(message)?
         // The server answers with the error the failure caused, which is
         // the expected outcome rather than a problem to report.
         let _ = self.drain_to_ready()
@@ -954,7 +954,7 @@ impl PgConn {
     pub fn copy_in_abort(
         &mut self
         copy: &mut CopyIn
-        reason: &String
+        reason: String
     ) -> Result<(), errors::Error> {
         if copy.done {
             return Ok(())
@@ -965,12 +965,12 @@ impl PgConn {
 
     // Starts a `COPY ... TO STDOUT`, answering the handle chunks are pulled
     // from.
-    pub fn copy_out_begin(&mut self, sql: &String) -> Result<CopyOut, errors::Error> {
+    pub fn copy_out_begin(&mut self, sql: String) -> Result<CopyOut, errors::Error> {
         self.ensure_ready()?
         let mut query_body: Vec<u8> = #[]
         buf::put_cstr(&mut query_body, sql)
-        let message = proto::frame(proto::F_QUERY, &query_body)
-        self.send(&message)?
+        let message = proto::frame(proto::F_QUERY, query_body)
+        self.send(message)?
         Ok(CopyOut { done: false, failure: None, received: 0, residue: #[], residue_pos: 0 })
     }
 
@@ -987,7 +987,7 @@ impl PgConn {
             }
         }
         loop {
-            let (tag, msg) = self.recv()?
+            let tag, msg = self.recv()?
             match tag {
                 proto::B_COPY_DATA => {
                     // The framed message leaves the loop as the caller's
@@ -998,11 +998,11 @@ impl PgConn {
                 }
                 proto::B_ERROR_RESPONSE => {
                     if copy.failure.is_none() {
-                        copy.failure = Some(dberror::parse(&msg))
+                        copy.failure = Some(dberror::parse(msg))
                     }
                 }
                 proto::B_READY_FOR_QUERY => {
-                    self.mark_ready(&msg)
+                    self.mark_ready(msg)
                     copy.done = true
                     return match copy.failure {
                         Some(e) => Err(e.as_error())
@@ -1023,9 +1023,9 @@ impl PgConn {
     // The trailing newline is not part of the line.
     pub fn copy_out_line(&mut self, copy: &mut CopyOut) -> Result<Option<String>, errors::Error> {
         loop {
-            let newline = index_of_byte(&copy.residue, copy.residue_pos, 10)
+            let newline = index_of_byte(copy.residue, copy.residue_pos, 10)
             if newline >= 0 {
-                let line = buf::utf8_lossy(&buf::slice(&copy.residue, copy.residue_pos, newline))
+                let line = buf::utf8_lossy(buf::slice(copy.residue, copy.residue_pos, newline))
                 copy.residue_pos = newline + 1
                 if copy.residue_pos >= copy.residue.len() {
                     copy.residue = #[]
@@ -1036,7 +1036,7 @@ impl PgConn {
             // What has been handed out is dropped before asking for more,
             // so the buffer holds only the partial line.
             if copy.residue_pos > 0 {
-                copy.residue = buf::slice(&copy.residue, copy.residue_pos, copy.residue.len())
+                copy.residue = buf::slice(copy.residue, copy.residue_pos, copy.residue.len())
                 copy.residue_pos = 0
             }
             match self.copy_out_next(copy)? {
@@ -1046,7 +1046,7 @@ impl PgConn {
                         return Ok(None)
                     }
                     // A final line the server did not terminate.
-                    let line = buf::utf8_lossy(&copy.residue)
+                    let line = buf::utf8_lossy(copy.residue)
                     copy.residue = #[]
                     copy.residue_pos = 0
                     return Ok(Some(line))
@@ -1069,7 +1069,7 @@ impl PgConn {
     }
 
     // Reads a `COPY ... TO STDOUT` in full.
-    pub fn copy_out(&mut self, sql: &String) -> Result<Vec<u8>, errors::Error> {
+    pub fn copy_out(&mut self, sql: String) -> Result<Vec<u8>, errors::Error> {
         let mut copy = self.copy_out_begin(sql)?
         let mut out: Vec<u8> = #[]
         while let Some(chunk) = self.copy_out_next(&mut copy)? {
@@ -1102,8 +1102,8 @@ impl PgConn {
         }
         // Anything already read from the socket is framed first.
         while self.has_buffered_message() {
-            let (tag, body) = self.recv_raw()?
-            self.absorb_async(tag, &body)
+            let tag, body = self.recv_raw()?
+            self.absorb_async(tag, body)
             if let Some(n) = self.take_notification() {
                 return Ok(Some(n))
             }
@@ -1128,7 +1128,7 @@ impl PgConn {
             }
             match self.recv_raw() {
                 Ok((tag, body)) => {
-                    self.absorb_async(tag, &body)
+                    self.absorb_async(tag, body)
                     if let Some(n) = self.take_notification() {
                         return Ok(Some(n))
                     }
@@ -1136,7 +1136,7 @@ impl PgConn {
                 Err(e) => {
                     // A read deadline reached with nothing to show is the
                     // answer "no notification", not a broken connection.
-                    if self.closed && format!("{}", e).contains("closed") {
+                    if self.closed && format("{}", e).contains("closed") {
                         return Err(e)
                     }
                     self.closed = false
@@ -1147,12 +1147,12 @@ impl PgConn {
     }
 
     // Files an out-of-band message where it belongs.
-    fn absorb_async(&mut self, tag: i64, body: &Vec<u8>) {
+    fn absorb_async(&mut self, tag: i64, body: Vec<u8>) {
         match tag {
             proto::B_NOTIFICATION_RESPONSE => self.pending.push(parse_notification(body))
             proto::B_NOTICE_RESPONSE => self.notices.push(dberror::parse(body))
             proto::B_PARAMETER_STATUS => {
-                let (name, setting) = parse_parameter_status(body)
+                let name, setting = parse_parameter_status(body)
                 let _ = self.params.insert(name, setting)
             }
             proto::B_READY_FOR_QUERY => { self.tx_status = buf::u8_at(body, 0) }
@@ -1171,16 +1171,17 @@ impl PgConn {
         if self.backend_pid == 0 {
             return Err(errors::new("no backend key: the server sent no BackendKeyData"))
         }
-        send_cancel(&self.host, self.backend_pid, self.backend_secret)
+        send_cancel(self.host, self.backend_pid, self.backend_secret)
     }
 
     // Sends Terminate and closes the socket. Idempotent.
     pub fn close(&mut self) {
-        if !self.closed {
-            let message = proto::frame(proto::F_TERMINATE, &#[])
-            let _ = socket_write(&self.sock, &message)
+        if self.closed {
+            return
         }
-        socket_close(&self.sock)
+        let message = proto::frame(proto::F_TERMINATE, #[])
+        let _ = socket_write(self.sock, message)
+        socket_close(self.sock)
         self.closed = true
     }
 }
@@ -1230,7 +1231,7 @@ impl CopyOut {
 }
 
 // The offset of `wanted` in `data` at or after `start`, or -1.
-fn index_of_byte(data: &Vec<u8>, start: i64, wanted: i64) -> i64 {
+fn index_of_byte(data: Vec<u8>, start: i64, wanted: i64) -> i64 {
     let n = data.len()
     let mut i = start
     while i < n {
@@ -1297,11 +1298,11 @@ pub struct Row {
 
 // Column name to position for a result set. A duplicated name keeps its
 // first position, which is what the server's own `SELECT` semantics imply.
-pub fn column_index(columns: &Vec<Column>) -> Map<String, i64> {
+pub fn column_index(columns: Vec<Column>) -> Map<String, i64> {
     let mut index: Map<String, i64> = Map::new()
     for (position, column) in columns.iter().enumerate() {
-        if index.get(&column.name).is_none() {
-            let _ = index.insert(column.name.clone(), position)
+        if index.get(column.name).is_none() {
+            let _ = index.insert(column.name, position)
         }
     }
     index
@@ -1310,7 +1311,7 @@ pub fn column_index(columns: &Vec<Column>) -> Map<String, i64> {
 impl Row {
     // A row over `columns`, building the name index the accessors read.
     pub fn new(columns: Vec<Column>, values: Vec<value::Value>) -> Row {
-        let index = column_index(&columns)
+        let index = column_index(columns)
         Row { columns: columns, values: values, index: index }
     }
 
@@ -1331,12 +1332,12 @@ impl Row {
     // duplicated name resolves to its first occurrence, which is what the
     // server's own `SELECT` semantics imply.
     pub fn index_of(&self, name: String) -> i64 {
-        self.index.get_or(&name, -1)
+        self.index.get_or(name, -1)
     }
 
     // The value of the column named `name`.
     pub fn get(&self, name: String) -> Result<value::Value, errors::Error> {
-        let index = self.index_of(name.clone())
+        let index = self.index_of(name)
         if index < 0 {
             return Err(errors::newf("no column named `{}` in this row", name))
         }
@@ -1357,27 +1358,27 @@ impl Row {
 impl Row {
     // The column at `index` as an `i64`.
     pub fn i64_at(&self, index: i64) -> Result<i64, errors::Error> {
-        self.at(index).as_int().ok_or(self.conversion_error(index, &"an integer"))
+        self.at(index).as_int().ok_or(self.conversion_error(index, "an integer"))
     }
 
     // The column at `index` as an `f64`.
     pub fn f64_at(&self, index: i64) -> Result<f64, errors::Error> {
-        self.at(index).as_float().ok_or(self.conversion_error(index, &"a float"))
+        self.at(index).as_float().ok_or(self.conversion_error(index, "a float"))
     }
 
     // The column at `index` as a `bool`.
     pub fn bool_at(&self, index: i64) -> Result<bool, errors::Error> {
-        self.at(index).as_bool().ok_or(self.conversion_error(index, &"a boolean"))
+        self.at(index).as_bool().ok_or(self.conversion_error(index, "a boolean"))
     }
 
     // The column at `index` as text. Every non-NULL value has a text form.
     pub fn text_at(&self, index: i64) -> Result<String, errors::Error> {
-        self.at(index).as_text().ok_or(self.conversion_error(index, &"text"))
+        self.at(index).as_text().ok_or(self.conversion_error(index, "text"))
     }
 
     // The column at `index` as bytes.
     pub fn bytes_at(&self, index: i64) -> Result<Vec<u8>, errors::Error> {
-        self.at(index).as_bytes().ok_or(self.conversion_error(index, &"bytes"))
+        self.at(index).as_bytes().ok_or(self.conversion_error(index, "bytes"))
     }
 
     // The column at `index` as an array's elements, each decoded under the
@@ -1393,8 +1394,8 @@ impl Row {
             ))
         }
         match self.at(index).as_text() {
-            Some(text) => value::parse_array_literal(&text, element)
-            None => Err(self.conversion_error(index, &"an array"))
+            Some(text) => value::parse_array_literal(text, element)
+            None => Err(self.conversion_error(index, "an array"))
         }
     }
 
@@ -1402,8 +1403,8 @@ impl Row {
     // the server wrote: a record carries no field types on the wire.
     pub fn record_at(&self, index: i64) -> Result<Vec<value::Value>, errors::Error> {
         match self.at(index).as_text() {
-            Some(text) => value::parse_record_literal(&text)
-            None => Err(self.conversion_error(index, &"a composite"))
+            Some(text) => value::parse_record_literal(text)
+            None => Err(self.conversion_error(index, "a composite"))
         }
     }
 
@@ -1419,8 +1420,8 @@ impl Row {
             ))
         }
         match self.at(index).as_text() {
-            Some(text) => value::parse_range_literal(&text, element)
-            None => Err(self.conversion_error(index, &"a range"))
+            Some(text) => value::parse_range_literal(text, element)
+            None => Err(self.conversion_error(index, "a range"))
         }
     }
 
@@ -1437,40 +1438,40 @@ impl Row {
         }
         let element = oid::range_element_of(type_oid)
         match self.at(index).as_text() {
-            Some(text) => value::parse_multirange_literal(&text, element)
-            None => Err(self.conversion_error(index, &"a multirange"))
+            Some(text) => value::parse_multirange_literal(text, element)
+            None => Err(self.conversion_error(index, "a multirange"))
         }
     }
 
     // The column at `index` as a timestamp, at the microsecond resolution
     // the server keeps. A `date` reads as midnight on that date.
     pub fn timestamp_at(&self, index: i64) -> Result<temporal::Timestamp, errors::Error> {
-        self.at(index).as_timestamp().ok_or(self.conversion_error(index, &"a timestamp"))
+        self.at(index).as_timestamp().ok_or(self.conversion_error(index, "a timestamp"))
     }
 
     // The column at `index` as a date.
     pub fn date_at(&self, index: i64) -> Result<temporal::Date, errors::Error> {
-        self.at(index).as_date().ok_or(self.conversion_error(index, &"a date"))
+        self.at(index).as_date().ok_or(self.conversion_error(index, "a date"))
     }
 
     // The column at `index` as a time of day.
     pub fn time_at(&self, index: i64) -> Result<temporal::Time, errors::Error> {
-        self.at(index).as_time().ok_or(self.conversion_error(index, &"a time"))
+        self.at(index).as_time().ok_or(self.conversion_error(index, "a time"))
     }
 
     // The column at `index` as an interval.
     pub fn interval_at(&self, index: i64) -> Result<temporal::Interval, errors::Error> {
-        self.at(index).as_interval().ok_or(self.conversion_error(index, &"an interval"))
+        self.at(index).as_interval().ok_or(self.conversion_error(index, "an interval"))
     }
 
     // The column at `index` as a UUID.
     pub fn uuid_at(&self, index: i64) -> Result<temporal::Uuid, errors::Error> {
-        self.at(index).as_uuid().ok_or(self.conversion_error(index, &"a uuid"))
+        self.at(index).as_uuid().ok_or(self.conversion_error(index, "a uuid"))
     }
 
     // The column at `index` as JSON document text.
     pub fn json_at(&self, index: i64) -> Result<String, errors::Error> {
-        self.at(index).as_json_text().ok_or(self.conversion_error(index, &"json"))
+        self.at(index).as_json_text().ok_or(self.conversion_error(index, "json"))
     }
 
     // The column at `index` as `std::time`'s wall-clock reading, for a
@@ -1613,18 +1614,18 @@ impl Row {
 
     // The index of `name`, reporting a name the row does not carry.
     fn require(&self, name: String) -> Result<i64, errors::Error> {
-        let index = self.index_of(name.clone())
+        let index = self.index_of(name)
         if index < 0 {
             return Err(errors::newf("no column named `{}` in this row", name))
         }
         Ok(index)
     }
 
-    fn conversion_error(&self, index: i64, wanted: &String) -> errors::Error {
+    fn conversion_error(&self, index: i64, wanted: String) -> errors::Error {
         let name = if index >= 0 && index < self.columns.len() {
-            self.columns[index].name.clone()
+            self.columns[index].name
         } else {
-            format!("{}", index)
+            format("{}", index)
         }
         errors::newf(
             "column `{}` is {} and does not read as {}"
@@ -1640,26 +1641,26 @@ impl Row {
 // The same columns, labelled with the wire format the results were asked
 // for. A fresh list rather than a mutated copy: the description belongs to
 // the prepared statement, which may be shared with another portal.
-fn relabel_formats(columns: &Vec<Column>, format: i64) -> Vec<Column> {
+fn relabel_formats(columns: Vec<Column>, wire_format: i64) -> Vec<Column> {
     columns.map(|column| Column {
-        name: column.name.clone()
+        name: column.name
         table_oid: column.table_oid
         column_id: column.column_id
         type_oid: column.type_oid
         type_modifier: column.type_modifier
         type_size: column.type_size
-        format: format
+        wire_format: wire_format
     })
 }
 
 // Parses a RowDescription into its columns.
-pub fn parse_row_description(body: &Vec<u8>) -> Vec<Column> {
+pub fn parse_row_description(body: Vec<u8>) -> Vec<Column> {
     let count = buf::i16_at(body, 0)
     let mut columns: Vec<Column> = #[]
     let mut offset = 2
     let mut i = 0
     while i < count {
-        let (name, next) = buf::cstr_at(body, offset)
+        let name, next = buf::cstr_at(body, offset)
         columns.push(Column {
             name: name
             table_oid: buf::u32_at(body, next)
@@ -1667,7 +1668,7 @@ pub fn parse_row_description(body: &Vec<u8>) -> Vec<Column> {
             type_oid: buf::u32_at(body, next + 6)
             type_size: buf::i16_at(body, next + 10)
             type_modifier: buf::i32_at(body, next + 12)
-            format: buf::i16_at(body, next + 16)
+            wire_format: buf::i16_at(body, next + 16)
         })
         offset = next + 18
         i += 1
@@ -1676,7 +1677,7 @@ pub fn parse_row_description(body: &Vec<u8>) -> Vec<Column> {
 }
 
 // Decodes a DataRow under the columns' types and formats.
-pub fn decode_data_row(body: &Vec<u8>, columns: &Vec<Column>) -> Vec<value::Value> {
+pub fn decode_data_row(body: Vec<u8>, columns: Vec<Column>) -> Vec<value::Value> {
     let count = buf::i16_at(body, 0)
     let mut out: Vec<value::Value> = #[]
     let mut offset = 2
@@ -1689,11 +1690,11 @@ pub fn decode_data_row(body: &Vec<u8>, columns: &Vec<Column>) -> Vec<value::Valu
         } else {
             let raw = buf::slice(body, offset, offset + length)
             let type_oid = if i < columns.len() { columns[i].type_oid } else { 0 }
-            let format = if i < columns.len() { columns[i].format } else { value::FORMAT_TEXT }
-            out.push(if format == value::FORMAT_BINARY {
-                value::decode_binary(type_oid, &raw)
+            let wire_format = if i < columns.len() { columns[i].wire_format } else { value::FORMAT_TEXT }
+            out.push(if wire_format == value::FORMAT_BINARY {
+                value::decode_binary(type_oid, raw)
             } else {
-                value::decode_text(type_oid, &raw)
+                value::decode_text(type_oid, raw)
             })
             offset += length
         }
@@ -1703,16 +1704,16 @@ pub fn decode_data_row(body: &Vec<u8>, columns: &Vec<Column>) -> Vec<value::Valu
 }
 
 // The name and setting a ParameterStatus reports.
-fn parse_parameter_status(body: &Vec<u8>) -> (String, String) {
-    let (name, next) = buf::cstr_at(body, 0)
-    let (setting, _) = buf::cstr_at(body, next)
+fn parse_parameter_status(body: Vec<u8>) -> (String, String) {
+    let name, next = buf::cstr_at(body, 0)
+    let setting, _ = buf::cstr_at(body, next)
     (name, setting)
 }
 
-fn parse_notification(body: &Vec<u8>) -> Notification {
+fn parse_notification(body: Vec<u8>) -> Notification {
     let pid = buf::i32_at(body, 0)
-    let (channel, next) = buf::cstr_at(body, 4)
-    let (payload, _) = buf::cstr_at(body, next)
+    let channel, next = buf::cstr_at(body, 4)
+    let payload, _ = buf::cstr_at(body, next)
     Notification { channel: channel, payload: payload, pid: pid }
 }
 
@@ -1720,16 +1721,16 @@ fn parse_notification(body: &Vec<u8>) -> Notification {
 
 // Opens a socket to one host, applying `timeout_ms` as the read and write
 // deadline while the connection is being established.
-fn open_socket(host: &config::HostAddr, timeout_ms: i64) -> Result<Socket, errors::Error> {
+fn open_socket(host: config::HostAddr, timeout_ms: i64) -> Result<Socket, errors::Error> {
     if host.is_unix() {
         let path = host.socket_path()
         return match net::UnixStream::connect(path) {
             Ok(stream) => Ok(Socket::Unix(stream))
-            Err(e) => Err(errors::wrap(e, format!("connecting to {}", host.socket_path())))
+            Err(e) => Err(errors::wrap(e, format("connecting to {}", host.socket_path())))
         }
     }
     let addr = host.tcp_addr()
-    match dial_tcp(&addr, timeout_ms) {
+    match dial_tcp(addr, timeout_ms) {
         Ok(stream) => {
             if timeout_ms > 0 {
                 stream.set_read_timeout_ms(timeout_ms)
@@ -1737,7 +1738,7 @@ fn open_socket(host: &config::HostAddr, timeout_ms: i64) -> Result<Socket, error
             }
             Ok(Socket::Tcp(stream))
         }
-        Err(e) => Err(errors::wrap(e, format!("connecting to {}", addr)))
+        Err(e) => Err(errors::wrap(e, format("connecting to {}", addr)))
     }
 }
 
@@ -1762,23 +1763,23 @@ fn open_socket(host: &config::HostAddr, timeout_ms: i64) -> Result<Socket, error
 // race is run only for a caller that named a deadline: the alternative is
 // paying the same wait at the call itself, where it also blocks the failover
 // to the next host.
-fn dial_tcp(addr: &String, timeout_ms: i64) -> Result<net::TcpStream, errors::Error> {
+fn dial_tcp(addr: String, timeout_ms: i64) -> Result<net::TcpStream, errors::Error> {
     if timeout_ms <= 0 {
-        return net::TcpStream::connect(addr.clone())
+        return net::TcpStream::connect(addr)
     }
-    let (opened, arrivals) = channel_unbounded()
-    let (reported, reports) = channel_unbounded()
-    let target = addr.clone()
+    let opened, arrivals = channel_unbounded()
+    let reported, reports = channel_unbounded()
+    let target = addr
     let dial = || {
         match net::TcpStream::connect(target) {
             Ok(stream) => {
                 opened.send(stream)
                 reported.send("")
             }
-            Err(e) => reported.send(format!("{}", e))
+            Err(e) => reported.send(format("{}", e))
         }
     }
-    go dial()
+    spawn(dial, reason: "pgsql tcp dial")
 
     select {
         settled = reports.recv() => {
@@ -1800,11 +1801,11 @@ fn dial_tcp(addr: &String, timeout_ms: i64) -> Result<net::TcpStream, errors::Er
 //
 // The server never answers it: cancellation is a request, and a query that
 // has already finished is simply unaffected.
-pub fn send_cancel(host: &config::HostAddr, pid: i64, secret: i64) -> Result<(), errors::Error> {
+pub fn send_cancel(host: config::HostAddr, pid: i64, secret: i64) -> Result<(), errors::Error> {
     let sock = open_socket(host, 0)?
     let message = proto::cancel_request(pid, secret)
-    let sent = socket_write(&sock, &message)
-    socket_close(&sock)
+    let sent = socket_write(sock, message)
+    socket_close(sock)
     sent
 }
 
@@ -1814,13 +1815,13 @@ pub fn send_cancel(host: &config::HostAddr, pid: i64, secret: i64) -> Result<(),
 // Every host is tried in order; the last failure is reported when none
 // works, so a multi-host list names the reason it gave up rather than only
 // that it did.
-pub fn connect(cfg: &config::Config) -> Result<PgConn, errors::Error> {
+pub fn connect(cfg: config::Config) -> Result<PgConn, errors::Error> {
     if cfg.hosts.len() == 0 {
         return Err(errors::new("no host to connect to"))
     }
     let mut last: Option<errors::Error> = None
     for host in cfg.hosts {
-        match connect_host(cfg, &host) {
+        match connect_host(cfg, host) {
             Ok(conn) => return Ok(conn)
             Err(e) => { last = Some(e) }
         }
@@ -1833,8 +1834,8 @@ pub fn connect(cfg: &config::Config) -> Result<PgConn, errors::Error> {
 
 // Connects to one specific host.
 pub fn connect_host(
-    cfg: &config::Config
-    host: &config::HostAddr
+    cfg: config::Config
+    host: config::HostAddr
 ) -> Result<PgConn, errors::Error> {
     let sock = open_socket(host, cfg.connect_timeout_ms)?
     let mut conn = PgConn {
@@ -1850,7 +1851,7 @@ pub fn connect_host(
         closed: false
         portal_open: false
         name_counter: 0
-        host: host.clone()
+        host: host
         tls: false
         socket_timeout_ms: cfg.socket_timeout_ms
         opened_at_ms: time::now_ms()
@@ -1880,8 +1881,8 @@ pub fn connect_host(
 // TLS negotiation, startup, and authentication.
 fn negotiate(
     conn: &mut PgConn
-    cfg: &config::Config
-    host: &config::HostAddr
+    cfg: config::Config
+    host: config::HostAddr
 ) -> Result<(), errors::Error> {
     negotiate_tls(conn, cfg, host)?
     send_startup(conn, cfg)?
@@ -1894,8 +1895,8 @@ fn negotiate(
 // which is the same judgement libpq makes.
 fn negotiate_tls(
     conn: &mut PgConn
-    cfg: &config::Config
-    host: &config::HostAddr
+    cfg: config::Config
+    host: config::HostAddr
 ) -> Result<(), errors::Error> {
     if !cfg.wants_tls() || host.is_unix() {
         if cfg.requires_tls() && host.is_unix() {
@@ -1906,8 +1907,8 @@ fn negotiate_tls(
         return Ok(())
     }
     let request = proto::ssl_request()
-    conn.send(&request)?
-    let answer = match socket_read(&conn.sock, 1) {
+    conn.send(request)?
+    let answer = match socket_read(conn.sock, 1) {
         Ok(byte) => byte
         Err(e) => {
             conn.closed = true
@@ -1921,7 +1922,7 @@ fn negotiate_tls(
         if cfg.requires_tls() {
             return Err(errors::newf(
                 "server declined TLS but sslmode is {}"
-                sslmode_name(&cfg.sslmode)
+                sslmode_name(cfg.sslmode)
             ))
         }
         return Ok(())
@@ -1950,18 +1951,18 @@ fn negotiate_tls(
 // Performs the TLS handshake at the strictness `sslmode` asks for.
 fn upgrade_tls(
     stream: net::TcpStream
-    cfg: &config::Config
-    host: &config::HostAddr
+    cfg: config::Config
+    host: config::HostAddr
 ) -> Result<net::TcpStream, errors::Error> {
     let result = if cfg.verifies_certificate() {
         match cfg.sslrootcert {
-            Some(source) => stream.start_tls_ca(host.host.clone(), read_root_cert(source)?)
-            None => stream.start_tls(host.host.clone())
+            Some(source) => stream.start_tls_ca(host.host, read_root_cert(source)?)
+            None => stream.start_tls(host.host)
         }
     } else {
         // `require` encrypts without vouching for the certificate, which is
         // exactly what libpq documents it to mean.
-        stream.start_tls_insecure(host.host.clone())
+        stream.start_tls_insecure(host.host)
     }
     match result {
         Ok(tls) => Ok(tls)
@@ -1978,13 +1979,13 @@ fn read_root_cert(source: String) -> Result<String, errors::Error> {
     if source.starts_with("-----BEGIN") {
         return Ok(source)
     }
-    match fs::read_to_string(source.clone()) {
+    match fs::read_to_string(source) {
         Ok(pem) => Ok(pem)
         Err(e) => Err(errors::newf("sslrootcert `{}`: {}", source, e))
     }
 }
 
-fn sslmode_name(mode: &config::SslMode) -> String {
+fn sslmode_name(mode: config::SslMode) -> String {
     match mode {
         config::SslMode::Disable => "disable"
         config::SslMode::Prefer => "prefer"
@@ -1996,49 +1997,49 @@ fn sslmode_name(mode: &config::SslMode) -> String {
 
 // Sends the startup message: the protocol version, then the session
 // parameters as NUL-terminated name/value pairs, ended by an empty name.
-fn send_startup(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
+fn send_startup(conn: &mut PgConn, cfg: config::Config) -> Result<(), errors::Error> {
     let mut body: Vec<u8> = #[]
     buf::put_i32(&mut body, proto::PROTOCOL_VERSION)
-    buf::put_cstr(&mut body, &"user")
-    buf::put_cstr(&mut body, &cfg.user)
-    buf::put_cstr(&mut body, &"database")
-    buf::put_cstr(&mut body, &cfg.dbname)
+    buf::put_cstr(&mut body, "user")
+    buf::put_cstr(&mut body, cfg.user)
+    buf::put_cstr(&mut body, "database")
+    buf::put_cstr(&mut body, cfg.dbname)
     // UTF-8 throughout, so every text value decodes the same way.
-    buf::put_cstr(&mut body, &"client_encoding")
-    buf::put_cstr(&mut body, &"UTF8")
-    buf::put_cstr(&mut body, &"application_name")
-    buf::put_cstr(&mut body, &cfg.app_name())
+    buf::put_cstr(&mut body, "client_encoding")
+    buf::put_cstr(&mut body, "UTF8")
+    buf::put_cstr(&mut body, "application_name")
+    buf::put_cstr(&mut body, cfg.app_name())
     if let Some(options) = cfg.options {
-        buf::put_cstr(&mut body, &"options")
-        buf::put_cstr(&mut body, &options)
+        buf::put_cstr(&mut body, "options")
+        buf::put_cstr(&mut body, options)
     }
     // Carried here rather than set afterwards so it is the session's own
     // default: `RESET ALL` puts a parameter back to what startup gave it,
     // and a pooled connection is reset between borrowers.
     if cfg.statement_timeout_ms > 0 {
-        buf::put_cstr(&mut body, &"statement_timeout")
-        buf::put_cstr(&mut body, &format!("{}", cfg.statement_timeout_ms))
+        buf::put_cstr(&mut body, "statement_timeout")
+        buf::put_cstr(&mut body, format("{}", cfg.statement_timeout_ms))
     }
     for (name, setting) in cfg.runtime_params.iter() {
-        buf::put_cstr(&mut body, &name)
-        buf::put_cstr(&mut body, &setting)
+        buf::put_cstr(&mut body, name)
+        buf::put_cstr(&mut body, setting)
     }
     buf::put_u8(&mut body, 0)
-    let message = proto::untagged(&body)
-    conn.send(&message)
+    let message = proto::untagged(body)
+    conn.send(message)
 }
 
 // Runs the authentication exchange the server asks for, then reads to the
 // first ReadyForQuery.
-fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
+fn authenticate(conn: &mut PgConn, cfg: config::Config) -> Result<(), errors::Error> {
     let mut scram: Option<sasl::Scram> = None
     // The signature the client-final step derived, checked against the
     // server's final message.
     let mut server_signature: Vec<u8> = #[]
     loop {
-        let (tag, body) = conn.recv()?
+        let tag, body = conn.recv()?
         if tag == proto::B_ERROR_RESPONSE {
-            return Err(dberror::parse(&body).as_error())
+            return Err(dberror::parse(body).as_error())
         }
         if tag == proto::B_NEGOTIATE_PROTOCOL_VERSION {
             // The server speaks an older minor version and lists the
@@ -2052,55 +2053,55 @@ fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
                 tag as char
             ))
         }
-        let kind = buf::i32_at(&body, 0)
+        let kind = buf::i32_at(body, 0)
         match kind {
             proto::AUTH_OK => break
             proto::AUTH_CLEARTEXT_PASSWORD => {
                 let password = require_password(cfg)?
-                send_password_message(conn, &password.as_bytes())?
+                send_password_message(conn, password.as_bytes())?
             }
             proto::AUTH_MD5_PASSWORD => {
                 let password = require_password(cfg)?
-                let salt = buf::slice(&body, 4, 8)
-                let token = sasl::md5_response(&password, &cfg.user, &salt)
-                send_password_message(conn, &token.as_bytes())?
+                let salt = buf::slice(body, 4, 8)
+                let token = sasl::md5_response(password, cfg.user, salt)
+                send_password_message(conn, token.as_bytes())?
             }
             proto::AUTH_SASL => {
                 // The password is only needed at the continue step; asking
                 // for it now reports its absence before the extra round trip.
                 let _ = require_password(cfg)?
-                let mechanisms = parse_sasl_mechanisms(&body)
+                let mechanisms = parse_sasl_mechanisms(body)
                 // The certificate the server presented is what a bound
                 // exchange hashes; a plain connection has none, so the
                 // binding mechanisms are not on the table there.
                 let cert_hash = server_cert_hash(conn)
                 let can_bind = cert_hash.len() > 0
                 let chosen = sasl::choose_mechanism(
-                    &mechanisms
+                    mechanisms
                     cfg.channel_binding == config::CHANNEL_BINDING_REQUIRE
                     can_bind
                 )?
                 let exchange = if chosen == sasl::MECHANISM_SCRAM_SHA_256_PLUS {
-                    sasl::Scram::start_bound(&cert_hash)?
+                    sasl::Scram::start_bound(cert_hash)?
                 } else {
                     sasl::Scram::start()?
                 }
                 let first = exchange.client_first()
                 let mut payload: Vec<u8> = #[]
-                buf::put_cstr(&mut payload, &chosen)
+                buf::put_cstr(&mut payload, chosen)
                 buf::put_i32(&mut payload, first.byte_len())
-                buf::put_str(&mut payload, &first)
-                let message = proto::frame(proto::F_PASSWORD, &payload)
-                conn.send(&message)?
+                buf::put_str(&mut payload, first)
+                let message = proto::frame(proto::F_PASSWORD, payload)
+                conn.send(message)?
                 scram = Some(exchange)
             }
             proto::AUTH_SASL_CONTINUE => {
                 let password = require_password(cfg)?
-                let server_first = buf::utf8_lossy(&buf::slice(&body, 4, body.len()))
+                let server_first = buf::utf8_lossy(buf::slice(body, 4, body.len()))
                 match scram {
                     Some(exchange) => {
-                        let step = exchange.client_final(&password, &server_first)?
-                        send_sasl_response(conn, &step.message)?
+                        let step = exchange.client_final(password, server_first)?
+                        send_sasl_response(conn, step.message)?
                         server_signature = step.server_signature
                         scram = Some(exchange)
                     }
@@ -2108,13 +2109,13 @@ fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
                 }
             }
             proto::AUTH_SASL_FINAL => {
-                let server_final = buf::utf8_lossy(&buf::slice(&body, 4, body.len()))
+                let server_final = buf::utf8_lossy(buf::slice(body, 4, body.len()))
                 // The signature is only set once the client-final step ran, so
                 // its absence means the server skipped the challenge.
                 if server_signature.len() == 0 {
                     return Err(errors::new("server sent a SASL final before the challenge"))
                 }
-                sasl::verify_server(&server_signature, &server_final)?
+                sasl::verify_server(server_signature, server_final)?
             }
             proto::AUTH_KERBEROS_V5 | proto::AUTH_GSS | proto::AUTH_GSS_CONTINUE
             | proto::AUTH_SSPI => {
@@ -2133,17 +2134,17 @@ fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
     }
     // Read to the ready point, keeping the backend key on the way.
     loop {
-        let (tag, body) = conn.recv()?
+        let tag, body = conn.recv()?
         match tag {
             proto::B_BACKEND_KEY_DATA => {
-                conn.backend_pid = buf::i32_at(&body, 0)
-                conn.backend_secret = buf::i32_at(&body, 4)
+                conn.backend_pid = buf::i32_at(body, 0)
+                conn.backend_secret = buf::i32_at(body, 4)
             }
             proto::B_READY_FOR_QUERY => {
-                conn.tx_status = buf::u8_at(&body, 0)
+                conn.tx_status = buf::u8_at(body, 0)
                 return Ok(())
             }
-            proto::B_ERROR_RESPONSE => return Err(dberror::parse(&body).as_error())
+            proto::B_ERROR_RESPONSE => return Err(dberror::parse(body).as_error())
             _ => ()
         }
     }
@@ -2151,8 +2152,8 @@ fn authenticate(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::E
 
 // Applies the settings that need a query, and checks the session is the
 // kind of server the caller asked for.
-fn finish_session(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors::Error> {
-    check_session_attrs(conn, &cfg.target_session_attrs)
+fn finish_session(conn: &mut PgConn, cfg: config::Config) -> Result<(), errors::Error> {
+    check_session_attrs(conn, cfg.target_session_attrs)
 }
 
 // Rejects a server that does not match `target_session_attrs`.
@@ -2161,10 +2162,10 @@ fn finish_session(conn: &mut PgConn, cfg: &config::Config) -> Result<(), errors:
 // primary with `default_transaction_read_only`, both report `on`.
 fn check_session_attrs(
     conn: &mut PgConn
-    want: &config::TargetSessionAttrs
+    want: config::TargetSessionAttrs
 ) -> Result<(), errors::Error> {
     // Any server is acceptable, so neither question needs to be asked.
-    if matches!(want, config::TargetSessionAttrs::Any) {
+    if matches(want, config::TargetSessionAttrs::Any) {
         return Ok(())
     }
     let read_only = read_session_read_only(conn)?
@@ -2190,7 +2191,7 @@ fn check_session_attrs(
     ))
 }
 
-fn session_attrs_name(want: &config::TargetSessionAttrs) -> String {
+fn session_attrs_name(want: config::TargetSessionAttrs) -> String {
     match want {
         config::TargetSessionAttrs::Any => "any"
         config::TargetSessionAttrs::ReadWrite => "read-write"
@@ -2202,18 +2203,18 @@ fn session_attrs_name(want: &config::TargetSessionAttrs) -> String {
 }
 
 fn read_session_read_only(conn: &mut PgConn) -> Result<bool, errors::Error> {
-    let results = conn.simple_query(&"SHOW transaction_read_only")?
-    Ok(first_cell(&results) == "on")
+    let results = conn.simple_query("SHOW transaction_read_only")?
+    Ok(first_cell(results) == "on")
 }
 
 fn read_in_recovery(conn: &mut PgConn) -> Result<bool, errors::Error> {
-    let results = conn.simple_query(&"SELECT pg_catalog.pg_is_in_recovery()")?
-    let cell = first_cell(&results)
+    let results = conn.simple_query("SELECT pg_catalog.pg_is_in_recovery()")?
+    let cell = first_cell(results)
     Ok(cell == "t" || cell == "true" || cell == "on")
 }
 
 // The first column of the first row of the first result set, as text.
-fn first_cell(results: &Vec<SimpleResult>) -> String {
+fn first_cell(results: Vec<SimpleResult>) -> String {
     let Some(result) = results.first() else { return "" }
     let Some(row) = result.rows.first() else { return "" }
     let Some(cell) = row.first() else { return "" }
@@ -2239,11 +2240,11 @@ fn server_cert_hash(conn: &mut PgConn) -> Vec<u8> {
 }
 
 // The mechanism names an AuthenticationSASL message lists.
-fn parse_sasl_mechanisms(body: &Vec<u8>) -> Vec<String> {
+fn parse_sasl_mechanisms(body: Vec<u8>) -> Vec<String> {
     let mut out: Vec<String> = #[]
     let mut offset = 4
     while offset < body.len() {
-        let (name, next) = buf::cstr_at(body, offset)
+        let name, next = buf::cstr_at(body, offset)
         if name == "" {
             break
         }
@@ -2253,7 +2254,7 @@ fn parse_sasl_mechanisms(body: &Vec<u8>) -> Vec<String> {
     out
 }
 
-fn require_password(cfg: &config::Config) -> Result<String, errors::Error> {
+fn require_password(cfg: config::Config) -> Result<String, errors::Error> {
     match cfg.password {
         Some(password) => Ok(password)
         None => Err(errors::newf(
@@ -2265,22 +2266,22 @@ fn require_password(cfg: &config::Config) -> Result<String, errors::Error> {
 
 // A PasswordMessage carrying a cleartext password or an md5 token, which
 // the protocol sends as a NUL-terminated string.
-fn send_password_message(conn: &mut PgConn, payload: &Vec<u8>) -> Result<(), errors::Error> {
+fn send_password_message(conn: &mut PgConn, payload: Vec<u8>) -> Result<(), errors::Error> {
     let mut body: Vec<u8> = #[]
     buf::put_bytes(&mut body, payload)
     buf::put_u8(&mut body, 0)
-    let message = proto::frame(proto::F_PASSWORD, &body)
-    conn.send(&message)
+    let message = proto::frame(proto::F_PASSWORD, body)
+    conn.send(message)
 }
 
 // A SASLResponse: the mechanism's own bytes and nothing else. The message
 // length delimits it, so a NUL terminator would be one byte of payload the
 // mechanism never wrote.
-fn send_sasl_response(conn: &mut PgConn, response: &String) -> Result<(), errors::Error> {
+fn send_sasl_response(conn: &mut PgConn, response: String) -> Result<(), errors::Error> {
     let mut body: Vec<u8> = #[]
     buf::put_str(&mut body, response)
-    let message = proto::frame(proto::F_PASSWORD, &body)
-    conn.send(&message)
+    let message = proto::frame(proto::F_PASSWORD, body)
+    conn.send(message)
 }
 
 #[cfg(test)]
@@ -2295,7 +2296,7 @@ mod conn_tests {
             type_oid: type_oid
             type_modifier: -1
             type_size: -1
-            format: value::FORMAT_TEXT
+            wire_format: value::FORMAT_TEXT
         }
     }
 
@@ -2303,14 +2304,14 @@ mod conn_tests {
     fn row_description_parses_every_field() {
         let mut body: Vec<u8> = #[]
         buf::put_i16(&mut body, 2)
-        buf::put_cstr(&mut body, &"id")
+        buf::put_cstr(&mut body, "id")
         buf::put_i32(&mut body, 16_384)
         buf::put_i16(&mut body, 1)
         buf::put_i32(&mut body, oid::INT4)
         buf::put_i16(&mut body, 4)
         buf::put_i32(&mut body, -1)
         buf::put_i16(&mut body, 0)
-        buf::put_cstr(&mut body, &"label")
+        buf::put_cstr(&mut body, "label")
         buf::put_i32(&mut body, 16_384)
         buf::put_i16(&mut body, 2)
         buf::put_i32(&mut body, oid::TEXT)
@@ -2318,14 +2319,14 @@ mod conn_tests {
         buf::put_i32(&mut body, -1)
         buf::put_i16(&mut body, 0)
 
-        let columns = super::parse_row_description(&body)
-        let _ = testing::check_eq(&columns.len(), &2, "two columns")
-        let _ = testing::check_eq(&columns[0].name, &"id", "first name")
-        let _ = testing::check_eq(&columns[0].type_oid, &oid::INT4, "first type")
-        let _ = testing::check_eq(&columns[0].table_oid, &16_384, "table oid")
-        let _ = testing::check_eq(&columns[0].column_id, &1, "attribute number")
-        let _ = testing::check_eq(&columns[1].name, &"label", "second name")
-        let _ = testing::check_eq(&columns[1].type_size, &-1, "variable length")
+        let columns = super::parse_row_description(body)
+        let _ = testing::check_eq(columns.len(), 2, "two columns")
+        let _ = testing::check_eq(columns[0].name, "id", "first name")
+        let _ = testing::check_eq(columns[0].type_oid, oid::INT4, "first type")
+        let _ = testing::check_eq(columns[0].table_oid, 16_384, "table oid")
+        let _ = testing::check_eq(columns[0].column_id, 1, "attribute number")
+        let _ = testing::check_eq(columns[1].name, "label", "second name")
+        let _ = testing::check_eq(columns[1].type_size, -1, "variable length")
     }
 
     #[test]
@@ -2334,24 +2335,24 @@ mod conn_tests {
         let mut body: Vec<u8> = #[]
         buf::put_i16(&mut body, 2)
         buf::put_i32(&mut body, 2)
-        buf::put_str(&mut body, &"42")
+        buf::put_str(&mut body, "42")
         buf::put_i32(&mut body, -1)
 
-        let values = super::decode_data_row(&body, &columns)
-        let _ = testing::check_eq(&values.len(), &2, "two values")
-        let _ = testing::check_eq(&values[0].as_int().unwrap_or(0), &42, "int column")
+        let values = super::decode_data_row(body, columns)
+        let _ = testing::check_eq(values.len(), 2, "two values")
+        let _ = testing::check_eq(values[0].as_int().unwrap_or(0), 42, "int column")
         let _ = testing::check(values[1].is_null(), "null column")
     }
 
     #[test]
     fn a_row_reads_columns_by_name_and_reports_an_unknown_one() {
         let row = super::Row::new(#[column("id", oid::INT4)], #[value::Value::Int(7)])
-        let _ = testing::check_eq(&row.width(), &1, "one column")
-        let _ = testing::check_eq(&row.index_of("id"), &0, "index of id")
-        let _ = testing::check_eq(&row.index_of("missing"), &-1, "index of a missing column")
+        let _ = testing::check_eq(row.width(), 1, "one column")
+        let _ = testing::check_eq(row.index_of("id"), 0, "index of id")
+        let _ = testing::check_eq(row.index_of("missing"), -1, "index of a missing column")
         match row.get("id") {
-            Ok(v) => { let _ = testing::check_eq(&v.as_int().unwrap_or(0), &7, "value by name") }
-            Err(e) => { let _ = testing::check(false, &format!("get: {}", e)) }
+            Ok(v) => { let _ = testing::check_eq(v.as_int().unwrap_or(0), 7, "value by name") }
+            Err(e) => { let _ = testing::check(false, format("get: {}", e)) }
         }
         let _ = testing::check(row.get("missing").is_err(), "unknown column reported")
         let _ = testing::check(row.at(5).is_null(), "past the end is NULL")
@@ -2361,23 +2362,23 @@ mod conn_tests {
     fn sasl_mechanism_list_parses_to_its_names() {
         let mut body: Vec<u8> = #[]
         buf::put_i32(&mut body, proto::AUTH_SASL)
-        buf::put_cstr(&mut body, &"SCRAM-SHA-256-PLUS")
-        buf::put_cstr(&mut body, &"SCRAM-SHA-256")
+        buf::put_cstr(&mut body, "SCRAM-SHA-256-PLUS")
+        buf::put_cstr(&mut body, "SCRAM-SHA-256")
         buf::put_u8(&mut body, 0)
-        let names = super::parse_sasl_mechanisms(&body)
-        let _ = testing::check_eq(&names.len(), &2, "two mechanisms")
-        let _ = testing::check_eq(&names[1], &"SCRAM-SHA-256", "second mechanism")
+        let names = super::parse_sasl_mechanisms(body)
+        let _ = testing::check_eq(names.len(), 2, "two mechanisms")
+        let _ = testing::check_eq(names[1], "SCRAM-SHA-256", "second mechanism")
     }
 
     #[test]
     fn notification_parses_pid_channel_and_payload() {
         let mut body: Vec<u8> = #[]
         buf::put_i32(&mut body, 4_242)
-        buf::put_cstr(&mut body, &"events")
-        buf::put_cstr(&mut body, &"row 7 changed")
-        let n = super::parse_notification(&body)
-        let _ = testing::check_eq(&n.pid, &4_242, "pid")
-        let _ = testing::check_eq(&n.channel, &"events", "channel")
-        let _ = testing::check_eq(&n.payload, &"row 7 changed", "payload")
+        buf::put_cstr(&mut body, "events")
+        buf::put_cstr(&mut body, "row 7 changed")
+        let n = super::parse_notification(body)
+        let _ = testing::check_eq(n.pid, 4_242, "pid")
+        let _ = testing::check_eq(n.channel, "events", "channel")
+        let _ = testing::check_eq(n.payload, "row 7 changed", "payload")
     }
 }

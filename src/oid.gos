@@ -203,7 +203,7 @@ pub fn is_array(oid: i64) -> bool {
 
 // True when `oid` names a builtin range type.
 pub fn is_range(oid: i64) -> bool {
-    matches!(
+    matches(
         oid
         INT4RANGE | NUMRANGE | TSRANGE | TSTZRANGE | DATERANGE | INT8RANGE
     )
@@ -211,7 +211,7 @@ pub fn is_range(oid: i64) -> bool {
 
 // True when `oid` names a builtin multirange type.
 pub fn is_multirange(oid: i64) -> bool {
-    matches!(
+    matches(
         oid
         INT4MULTIRANGE
         | NUMMULTIRANGE
@@ -238,20 +238,20 @@ pub fn range_element_of(oid: i64) -> i64 {
 // True when the type's text form is a decimal integer the driver reads as
 // an `i64`.
 pub fn is_integer(oid: i64) -> bool {
-    matches!(oid, INT2 | INT4 | INT8 | OID | XID | CID | REGPROC)
+    matches(oid, INT2 | INT4 | INT8 | OID | XID | CID | REGPROC)
 }
 
 // True when the type's text form is a decimal float the driver reads as an
 // `f64`. `numeric` is deliberately absent: it is arbitrary precision, and
 // reading it as a float would lose digits, so it stays exact text.
 pub fn is_float(oid: i64) -> bool {
-    matches!(oid, FLOAT4 | FLOAT8)
+    matches(oid, FLOAT4 | FLOAT8)
 }
 
 // True when the type carries a date or time, so a caller can ask for the
 // value as a timestamp.
 pub fn is_temporal(oid: i64) -> bool {
-    matches!(oid, DATE | TIME | TIMETZ | TIMESTAMP | TIMESTAMPTZ | INTERVAL)
+    matches(oid, DATE | TIME | TIMETZ | TIMESTAMP | TIMESTAMPTZ | INTERVAL)
 }
 
 // The `pg_type` name for a builtin OID, or `"oid <n>"` for one this table
@@ -311,7 +311,7 @@ pub fn name_of(oid: i64) -> String {
         DATERANGE => "daterange"
         _ => {
             let elem = element_of(oid)
-            if elem != 0 { name_of(elem) + "[]" } else { format!("oid {}", oid) }
+            if elem != 0 { name_of(elem) + "[]" } else { format("oid {}", oid) }
         }
     }
 }
@@ -331,8 +331,8 @@ mod oid_tests {
         ]
         for oid in scalars {
             let arr = super::array_of(oid)
-            let _ = testing::check(arr != 0, &format!("{} has an array type", super::name_of(oid)))
-            let _ = testing::check_eq(&super::element_of(arr), &oid, "round trip")
+            let _ = testing::check(arr != 0, format("{} has an array type", super::name_of(oid)))
+            let _ = testing::check_eq(super::element_of(arr), oid, "round trip")
         }
     }
 
@@ -344,24 +344,24 @@ mod oid_tests {
 
     #[test]
     fn name_of_renders_an_array_as_the_element_name_with_brackets() {
-        let _ = testing::check_eq(&super::name_of(super::TEXT_ARRAY), &"text[]", "text array name")
+        let _ = testing::check_eq(super::name_of(super::TEXT_ARRAY), "text[]", "text array name")
     }
 
     #[test]
     fn name_of_falls_back_to_the_numeric_oid() {
-        let _ = testing::check_eq(&super::name_of(999_999), &"oid 999999", "unknown oid")
+        let _ = testing::check_eq(super::name_of(999_999), "oid 999999", "unknown oid")
     }
 
     #[test]
     fn the_type_classes_answer_for_the_types_they_name() {
         for name in #[super::INT2, super::INT4, super::INT8, super::OID] {
-            let _ = testing::check(super::is_integer(name), &format!("{} is an integer", name))
-            let _ = testing::check(!super::is_float(name), &format!("{} is not a float", name))
-            let _ = testing::check(!super::is_temporal(name), &format!("{} is not temporal", name))
+            let _ = testing::check(super::is_integer(name), format("{} is an integer", name))
+            let _ = testing::check(!super::is_float(name), format("{} is not a float", name))
+            let _ = testing::check(!super::is_temporal(name), format("{} is not temporal", name))
         }
         for name in #[super::FLOAT4, super::FLOAT8] {
-            let _ = testing::check(super::is_float(name), &format!("{} is a float", name))
-            let _ = testing::check(!super::is_integer(name), &format!("{} is not an integer", name))
+            let _ = testing::check(super::is_float(name), format("{} is a float", name))
+            let _ = testing::check(!super::is_integer(name), format("{} is not an integer", name))
         }
         // The class follows `pg_type`'s own date/time category, which counts
         // `interval` among them even though it names a span rather than an
@@ -370,7 +370,7 @@ mod oid_tests {
             super::DATE, super::TIME, super::TIMETZ
             super::TIMESTAMP, super::TIMESTAMPTZ, super::INTERVAL
         ] {
-            let _ = testing::check(super::is_temporal(name), &format!("{} is temporal", name))
+            let _ = testing::check(super::is_temporal(name), format("{} is temporal", name))
         }
         // `numeric` is exact rather than binary floating point, so it is not
         // in the float class whatever its values look like.
@@ -386,8 +386,8 @@ mod oid_tests {
         let _ = testing::check(super::is_range(super::INT4RANGE), "int4range")
         let _ = testing::check(!super::is_multirange(super::INT4RANGE), "and is not a multirange")
         let _ = testing::check_eq(
-            &super::range_element_of(super::INT4MULTIRANGE)
-            &super::range_element_of(super::INT4RANGE)
+            super::range_element_of(super::INT4MULTIRANGE)
+            super::range_element_of(super::INT4RANGE)
             "both resolve to the element the bounds carry"
         )
         let _ = testing::check(!super::is_multirange(super::TEXT), "a scalar is neither")
@@ -396,8 +396,8 @@ mod oid_tests {
     #[test]
     fn range_elements_resolve() {
         let _ = testing::check_eq(
-            &super::range_element_of(super::INT8RANGE)
-            &super::INT8
+            super::range_element_of(super::INT8RANGE)
+            super::INT8
             "int8range bounds"
         )
         let _ = testing::check(super::is_range(super::TSRANGE), "tsrange is a range")

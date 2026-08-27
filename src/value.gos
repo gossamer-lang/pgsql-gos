@@ -57,7 +57,7 @@ pub enum Value {
 impl Value {
     // True for SQL NULL.
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches(self, Value::Null)
     }
 
     // The value as an `i64`, converting a float, a numeric, or a decimal
@@ -116,7 +116,7 @@ impl Value {
     pub fn as_bytes(&self) -> Option<Vec<u8>> {
         match self {
             Value::Null => None
-            Value::Bytes(data) => Some(data.clone())
+            Value::Bytes(data) => Some(data)
             _ => Some(self.render().as_bytes())
         }
     }
@@ -128,20 +128,20 @@ impl Value {
     // as the text the server wrote.
     pub fn as_array(&self) -> Option<Vec<Value>> {
         let Some(text) = self.as_text() else { return None }
-        parse_array_literal(&text, oid::TEXT).ok()
+        parse_array_literal(text, oid::TEXT).ok()
     }
 
     // The fields of a composite literal, each read as text.
     pub fn as_record(&self) -> Option<Vec<Value>> {
         let Some(text) = self.as_text() else { return None }
-        parse_record_literal(&text).ok()
+        parse_record_literal(text).ok()
     }
 
     // The value as a timestamp, parsing a text form when the column was
     // read as text; `None` for NULL or a value that carries no date.
     pub fn as_timestamp(&self) -> Option<temporal::Timestamp> {
         match self {
-            Value::Timestamp(ts) => Some(ts.clone())
+            Value::Timestamp(ts) => Some(ts)
             Value::Date(date) => Some(date.at_midnight())
             Value::Text(text) => temporal::parse_timestamp(text).ok()
             _ => None
@@ -151,7 +151,7 @@ impl Value {
     // The value as a date; `None` for NULL or a value that carries none.
     pub fn as_date(&self) -> Option<temporal::Date> {
         match self {
-            Value::Date(date) => Some(date.clone())
+            Value::Date(date) => Some(date)
             Value::Timestamp(ts) => Some(ts.date())
             Value::Text(text) => temporal::parse_date(text).ok()
             _ => None
@@ -162,7 +162,7 @@ impl Value {
     // none.
     pub fn as_time(&self) -> Option<temporal::Time> {
         match self {
-            Value::Time(t) => Some(t.clone())
+            Value::Time(t) => Some(t)
             Value::Timestamp(ts) => Some(ts.time())
             Value::Text(text) => temporal::parse_time(text).ok()
             _ => None
@@ -172,7 +172,7 @@ impl Value {
     // The value as an interval; `None` for NULL or a value that is not one.
     pub fn as_interval(&self) -> Option<temporal::Interval> {
         match self {
-            Value::Interval(interval) => Some(interval.clone())
+            Value::Interval(interval) => Some(interval)
             Value::Text(text) => temporal::parse_interval(text).ok()
             _ => None
         }
@@ -181,7 +181,7 @@ impl Value {
     // The value as a UUID; `None` for NULL or a value that is not one.
     pub fn as_uuid(&self) -> Option<temporal::Uuid> {
         match self {
-            Value::Uuid(id) => Some(id.clone())
+            Value::Uuid(id) => Some(id)
             Value::Text(text) => temporal::parse_uuid(text).ok()
             _ => None
         }
@@ -205,8 +205,8 @@ impl Value {
             Value::Bool(b) => if b { "t" } else { "f" }
             Value::Int(v) => v.to_string()
             Value::Float(f) => render_float(f)
-            Value::Numeric(text) | Value::Text(text) | Value::Json(text) => text.clone()
-            Value::Bytes(data) => "\\x" + &buf::to_hex(data)
+            Value::Numeric(text) | Value::Text(text) | Value::Json(text) => text
+            Value::Bytes(data) => "\\x" + buf::to_hex(data)
             Value::Timestamp(ts) => ts.to_string()
             Value::Date(date) => date.to_string()
             Value::Time(t) => t.to_string()
@@ -234,33 +234,33 @@ pub fn render_float(f: f64) -> String {
 // The array literal for `items`, quoting each element the grammar needs
 // quoted. This is what an array parameter binds as and what an array column
 // reads back as, so building and reading share one spelling.
-pub fn render_array_literal(items: &Vec<Value>) -> String {
+pub fn render_array_literal(items: Vec<Value>) -> String {
     let mut parts: Vec<String> = #[]
     for item in items {
         parts.push(match item {
             Value::Null => "NULL"
-            _ => quote_composite_element(&item.render())
+            _ => quote_composite_element(item.render())
         })
     }
-    "{" + &parts.join(",") + "}"
+    "{" + parts.join(",") + "}"
 }
 
 // The array literal for a list of already-rendered element literals, used to
 // nest one array inside another: a nested literal is not quoted.
-pub fn render_nested_array_literal(elements: &Vec<String>) -> String {
-    "{" + &elements.join(",") + "}"
+pub fn render_nested_array_literal(elements: Vec<String>) -> String {
+    "{" + elements.join(",") + "}"
 }
 
 // A composite literal (`(1,two,)`).
-pub fn render_record_literal(fields: &Vec<Value>) -> String {
+pub fn render_record_literal(fields: Vec<Value>) -> String {
     let mut parts: Vec<String> = #[]
     for field in fields {
         parts.push(match field {
             Value::Null => ""
-            _ => quote_composite_element(&field.render())
+            _ => quote_composite_element(field.render())
         })
     }
-    "(" + &parts.join(",") + ")"
+    "(" + parts.join(",") + ")"
 }
 
 // Quotes an array or composite element when it holds a byte the literal
@@ -269,11 +269,11 @@ pub fn render_record_literal(fields: &Vec<Value>) -> String {
 //
 // Byte offsets throughout: every character the grammar reserves is ASCII, so
 // a multi-byte character copies through untouched.
-fn quote_composite_element(text: &String) -> String {
+fn quote_composite_element(text: String) -> String {
     let needs = text.is_empty() || text.to_uppercase() == "NULL" ||
         text.bytes().any(|byte| is_reserved_byte(byte as i64))
     if !needs {
-        return text.clone()
+        return text
     }
     let mut out: Vec<u8> = #[34]
     for byte in text.bytes() {
@@ -284,13 +284,13 @@ fn quote_composite_element(text: &String) -> String {
         out.push(byte)
     }
     out.push(34)
-    buf::utf8_lossy(&out)
+    buf::utf8_lossy(out)
 }
 
 // The bytes an array or composite literal reads as structure rather than as
 // element text: the delimiters, the quote, the escape, and whitespace.
 fn is_reserved_byte(byte: i64) -> bool {
-    matches!(byte, 44 | 123 | 125 | 40 | 41 | 34 | 92 | 32 | 9 | 10 | 13)
+    matches(byte, 44 | 123 | 125 | 40 | 41 | 34 | 92 | 32 | 9 | 10 | 13)
 }
 
 // --- text decoding -------------------------------------------------
@@ -300,7 +300,7 @@ fn is_reserved_byte(byte: i64) -> bool {
 // A type with no more specific reading answers `Text` carrying exactly what
 // the server sent, so nothing is ever lost: the caller can parse the
 // server's spelling itself.
-pub fn decode_text(type_oid: i64, raw: &Vec<u8>) -> Value {
+pub fn decode_text(type_oid: i64, raw: Vec<u8>) -> Value {
     let text = buf::utf8_lossy(raw)
     // An array or a composite keeps the literal the server wrote. It is the
     // exact value, and the element types belong to the column rather than to
@@ -310,33 +310,33 @@ pub fn decode_text(type_oid: i64, raw: &Vec<u8>) -> Value {
     }
     match type_oid {
         oid::BOOL => Value::Bool(text == "t")
-        oid::BYTEA => match decode_bytea_text(&text) {
+        oid::BYTEA => match decode_bytea_text(text) {
             Ok(data) => Value::Bytes(data)
             Err(_) => Value::Text(text)
         }
-        oid::FLOAT4 | oid::FLOAT8 => match parse_float_text(&text) {
+        oid::FLOAT4 | oid::FLOAT8 => match parse_float_text(text) {
             Some(f) => Value::Float(f)
             None => Value::Text(text)
         }
         oid::NUMERIC | oid::MONEY => Value::Numeric(text)
         oid::JSON | oid::JSONB => Value::Json(text)
-        oid::UUID => match temporal::parse_uuid(&text) {
+        oid::UUID => match temporal::parse_uuid(text) {
             Ok(id) => Value::Uuid(id)
             Err(_) => Value::Text(text)
         }
-        oid::DATE => match temporal::parse_date(&text) {
+        oid::DATE => match temporal::parse_date(text) {
             Ok(date) => Value::Date(date)
             Err(_) => Value::Text(text)
         }
-        oid::TIME | oid::TIMETZ => match temporal::parse_time(&text) {
+        oid::TIME | oid::TIMETZ => match temporal::parse_time(text) {
             Ok(t) => Value::Time(t)
             Err(_) => Value::Text(text)
         }
-        oid::TIMESTAMP | oid::TIMESTAMPTZ => match temporal::parse_timestamp(&text) {
+        oid::TIMESTAMP | oid::TIMESTAMPTZ => match temporal::parse_timestamp(text) {
             Ok(ts) => Value::Timestamp(ts)
             Err(_) => Value::Text(text)
         }
-        oid::INTERVAL => match temporal::parse_interval(&text) {
+        oid::INTERVAL => match temporal::parse_interval(text) {
             Ok(interval) => Value::Interval(interval)
             Err(_) => Value::Text(text)
         }
@@ -354,7 +354,7 @@ pub fn decode_text(type_oid: i64, raw: &Vec<u8>) -> Value {
 }
 
 // A float in PostgreSQL's text form, including the named infinities.
-pub fn parse_float_text(text: &String) -> Option<f64> {
+pub fn parse_float_text(text: String) -> Option<f64> {
     match text {
         "NaN" => Some(nan())
         "Infinity" | "inf" | "+Infinity" => Some(infinity())
@@ -375,9 +375,9 @@ pub fn infinity() -> f64 {
 
 // Decodes `bytea` text output: hex (`\x00ff`, the default since 9.0) or the
 // historical escape format.
-pub fn decode_bytea_text(text: &String) -> Result<Vec<u8>, errors::Error> {
+pub fn decode_bytea_text(text: String) -> Result<Vec<u8>, errors::Error> {
     if text.starts_with("\\x") {
-        return buf::from_hex(&text.substring(2, text.byte_len()))
+        return buf::from_hex(text.substring(2, text.byte_len()))
     }
     let n = text.byte_len()
     let mut out: Vec<u8> = #[]
@@ -415,7 +415,7 @@ pub fn decode_bytea_text(text: &String) -> Result<Vec<u8>, errors::Error> {
 // Handles any dimensionality, the explicit-bounds prefix
 // (`[1:2]={a,b}`), quoted elements with backslash escapes, and the
 // unquoted `NULL` element.
-pub fn parse_array_literal(text: &String, elem_oid: i64) -> Result<Vec<Value>, errors::Error> {
+pub fn parse_array_literal(text: String, elem_oid: i64) -> Result<Vec<Value>, errors::Error> {
     let body = strip_dimension_prefix(text)
     let trimmed = body.trim()
     if trimmed == "" {
@@ -424,17 +424,17 @@ pub fn parse_array_literal(text: &String, elem_oid: i64) -> Result<Vec<Value>, e
     if !trimmed.starts_with("{") {
         return Err(errors::newf("array literal must start with `{{`: {}", trimmed))
     }
-    let close = matching_brace(&trimmed, 0)?
+    let close = matching_brace(trimmed, 0)?
     let rest = trimmed.substring(close + 1, trimmed.byte_len()).trim()
     if rest != "" {
         return Err(errors::newf("trailing text after array literal: {}", rest))
     }
-    parse_array_body(&trimmed.substring(0, close + 1), elem_oid)
+    parse_array_body(trimmed.substring(0, close + 1), elem_oid)
 }
 
 // Drops an explicit-bounds prefix like `[1:3]=` that the server emits when
 // an array's lower bound is not 1.
-fn strip_dimension_prefix(text: &String) -> String {
+fn strip_dimension_prefix(text: String) -> String {
     let t = text.trim()
     if !t.starts_with("[") {
         return t
@@ -450,7 +450,7 @@ fn strip_dimension_prefix(text: &String) -> String {
 // One flat pass: a nested array is carried as its own literal, found by
 // matching its braces, so an array of any dimensionality is read without
 // recursion and every element is the text the server wrote.
-fn parse_array_body(text: &String, elem_oid: i64) -> Result<Vec<Value>, errors::Error> {
+fn parse_array_body(text: String, elem_oid: i64) -> Result<Vec<Value>, errors::Error> {
     let n = text.byte_len()
     let mut items: Vec<Value> = #[]
     let mut i = 1
@@ -474,15 +474,15 @@ fn parse_array_body(text: &String, elem_oid: i64) -> Result<Vec<Value>, errors::
             items.push(Value::Text(text.substring(i, close + 1)))
             i = close + 1
         } else if c == 34 {
-            let (raw, next) = read_quoted(text, i)?
-            items.push(decode_text(elem_oid, &raw.as_bytes()))
+            let raw, next = read_quoted(text, i)?
+            items.push(decode_text(elem_oid, raw.as_bytes()))
             i = next
         } else {
-            let (raw, next) = read_bare(text, i)
+            let raw, next = read_bare(text, i)
             if raw.to_uppercase() == "NULL" {
                 items.push(Value::Null)
             } else {
-                items.push(decode_text(elem_oid, &raw.as_bytes()))
+                items.push(decode_text(elem_oid, raw.as_bytes()))
             }
             i = next
         }
@@ -506,7 +506,7 @@ fn parse_array_body(text: &String, elem_oid: i64) -> Result<Vec<Value>, errors::
 
 // Offset of the `}` closing the `{` at `open`, honoring nesting and quoted
 // elements.
-fn matching_brace(text: &String, open: i64) -> Result<i64, errors::Error> {
+fn matching_brace(text: String, open: i64) -> Result<i64, errors::Error> {
     let n = text.byte_len()
     let mut depth = 0
     let mut i = open
@@ -542,7 +542,7 @@ fn matching_brace(text: &String, open: i64) -> Result<i64, errors::Error> {
 // Parses a composite literal (`(1,"two",)`) into its fields. Every field
 // decodes as text: a record's field types are not on the wire, so the
 // caller converts with the accessors on `Value`.
-pub fn parse_record_literal(text: &String) -> Result<Vec<Value>, errors::Error> {
+pub fn parse_record_literal(text: String) -> Result<Vec<Value>, errors::Error> {
     let t = text.trim()
     if !t.starts_with("(") || !t.ends_with(")") {
         return Err(errors::newf("composite literal must be parenthesized: {}", t))
@@ -560,14 +560,14 @@ pub fn parse_record_literal(text: &String) -> Result<Vec<Value>, errors::Error> 
         }
         let c = t.byte_at(i)
         if c == 34 {
-            let (raw, next) = read_quoted(t, i)?
+            let raw, next = read_quoted(t, i)?
             fields.push(Value::Text(raw))
             i = next
         } else if c == 44 || c == 41 {
             // An empty field is NULL.
             fields.push(Value::Null)
         } else {
-            let (raw, next) = read_bare_record(t, i)
+            let raw, next = read_bare_record(t, i)
             fields.push(Value::Text(raw))
             i = next
         }
@@ -597,7 +597,7 @@ pub struct Range {
 }
 
 // Parses a range literal, decoding each bound under `elem_oid`.
-pub fn parse_range_literal(text: &String, elem_oid: i64) -> Result<Range, errors::Error> {
+pub fn parse_range_literal(text: String, elem_oid: i64) -> Result<Range, errors::Error> {
     let t = text.trim()
     if t.to_lowercase() == "empty" {
         return Ok(Range {
@@ -618,13 +618,13 @@ pub fn parse_range_literal(text: &String, elem_oid: i64) -> Result<Range, errors
         return Err(errors::newf("range literal must be bracketed: {}", t))
     }
     let inner = t.substring(1, n - 1)
-    let (lower_raw, upper_raw) = split_range_bounds(&inner)?
+    let lower_raw, upper_raw = split_range_bounds(inner)?
     Ok(Range {
         is_empty: false
         lower_inclusive: open == 91
         upper_inclusive: close == 93
-        lower: decode_bound(&lower_raw, elem_oid)
-        upper: decode_bound(&upper_raw, elem_oid)
+        lower: decode_bound(lower_raw, elem_oid)
+        upper: decode_bound(upper_raw, elem_oid)
     })
 }
 
@@ -636,7 +636,7 @@ pub fn parse_range_literal(text: &String, elem_oid: i64) -> Result<Range, errors
 // overlap and are already in ascending order, which is what the server
 // normalizes them to.
 pub fn parse_multirange_literal(
-    text: &String
+    text: String
     elem_oid: i64
 ) -> Result<Vec<Range>, errors::Error> {
     let trimmed = text.trim()
@@ -659,8 +659,8 @@ pub fn parse_multirange_literal(
         if c != 91 && c != 40 {
             return Err(errors::newf("multirange element must be bracketed: {}", inner))
         }
-        let end = closing_bracket(&inner, i)?
-        ranges.push(parse_range_literal(&inner.substring(i, end + 1), elem_oid)?)
+        let end = closing_bracket(inner, i)?
+        ranges.push(parse_range_literal(inner.substring(i, end + 1), elem_oid)?)
         i = end + 1
     }
     Ok(ranges)
@@ -668,7 +668,7 @@ pub fn parse_multirange_literal(
 
 // The index of the bracket closing the range that opens at `open`, skipping
 // one inside a quoted bound.
-fn closing_bracket(text: &String, open: i64) -> Result<i64, errors::Error> {
+fn closing_bracket(text: String, open: i64) -> Result<i64, errors::Error> {
     let n = text.byte_len()
     let mut i = open + 1
     let mut quoted = false
@@ -688,22 +688,22 @@ fn closing_bracket(text: &String, open: i64) -> Result<i64, errors::Error> {
     Err(errors::newf("multirange element is unterminated: {}", text.substring(open, n)))
 }
 
-fn decode_bound(raw: &String, elem_oid: i64) -> Value {
+fn decode_bound(raw: String, elem_oid: i64) -> Value {
     if raw == "" {
         return Value::Null
     }
     if raw.starts_with("\"") {
         return match read_quoted(raw, 0) {
-            Ok((text, _)) => decode_text(elem_oid, &text.as_bytes())
-            Err(_) => Value::Text(raw.clone())
+            Ok((text, _)) => decode_text(elem_oid, text.as_bytes())
+            Err(_) => Value::Text(raw)
         }
     }
-    decode_text(elem_oid, &raw.as_bytes())
+    decode_text(elem_oid, raw.as_bytes())
 }
 
 // Splits a range's inner text at the comma that separates the bounds,
 // ignoring a comma inside a quoted bound.
-fn split_range_bounds(inner: &String) -> Result<(String, String), errors::Error> {
+fn split_range_bounds(inner: String) -> Result<(String, String), errors::Error> {
     let n = inner.byte_len()
     let mut i = 0
     let mut quoted = false
@@ -729,7 +729,7 @@ fn is_space_byte(c: i64) -> bool {
 
 // Reads a double-quoted element starting at `start`, returning its
 // unescaped contents and the offset just past the closing quote.
-fn read_quoted(text: &String, start: i64) -> Result<(String, i64), errors::Error> {
+fn read_quoted(text: String, start: i64) -> Result<(String, i64), errors::Error> {
     let n = text.byte_len()
     // Byte offsets, so a multi-byte character inside the element is copied
     // through unchanged rather than re-decoded per byte.
@@ -746,7 +746,7 @@ fn read_quoted(text: &String, start: i64) -> Result<(String, i64), errors::Error
             continue
         }
         if c == 34 {
-            return Ok((buf::utf8_lossy(&out_bytes), i + 1))
+            return Ok((buf::utf8_lossy(out_bytes), i + 1))
         }
         out_bytes.push(c as u8)
         i += 1
@@ -755,7 +755,7 @@ fn read_quoted(text: &String, start: i64) -> Result<(String, i64), errors::Error
 }
 
 // Reads an unquoted array element: everything up to a comma or a brace.
-fn read_bare(text: &String, start: i64) -> (String, i64) {
+fn read_bare(text: String, start: i64) -> (String, i64) {
     let n = text.byte_len()
     let mut end = start
     while end < n {
@@ -775,7 +775,7 @@ fn read_bare(text: &String, start: i64) -> (String, i64) {
 
 // Reads an unquoted composite field: everything up to a comma or the
 // closing parenthesis. Unlike an array element, whitespace is significant.
-fn read_bare_record(text: &String, start: i64) -> (String, i64) {
+fn read_bare_record(text: String, start: i64) -> (String, i64) {
     let n = text.byte_len()
     let mut end = start
     while end < n {
@@ -795,11 +795,11 @@ fn read_bare_record(text: &String, start: i64) -> (String, i64) {
 // Only the types with a binary reading here are decoded; anything else
 // answers its bytes as `Bytes`, since a binary payload has no text form to
 // fall back on. Ask for text format for those (the default).
-pub fn decode_binary(type_oid: i64, raw: &Vec<u8>) -> Value {
+pub fn decode_binary(type_oid: i64, raw: Vec<u8>) -> Value {
     if oid::is_array(type_oid) {
         return match decode_binary_array(raw) {
             Ok(literal) => Value::Text(literal)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
     }
     // A range and a multirange decode to the literal the text format
@@ -808,13 +808,13 @@ pub fn decode_binary(type_oid: i64, raw: &Vec<u8>) -> Value {
     if oid::is_range(type_oid) {
         return match decode_binary_range(raw, oid::range_element_of(type_oid)) {
             Ok(literal) => Value::Text(literal)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
     }
     if oid::is_multirange(type_oid) {
         return match decode_binary_multirange(raw, oid::range_element_of(type_oid)) {
             Ok(literal) => Value::Text(literal)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
     }
     match type_oid {
@@ -833,53 +833,53 @@ pub fn decode_binary(type_oid: i64, raw: &Vec<u8>) -> Value {
             // A jsonb binary payload is a one-byte version prefix then the
             // document as text.
             if buf::u8_at(raw, 0) == 1 {
-                Value::Json(buf::utf8_lossy(&buf::slice(raw, 1, raw.len())))
+                Value::Json(buf::utf8_lossy(buf::slice(raw, 1, raw.len())))
             } else {
                 Value::Json(buf::utf8_lossy(raw))
             }
         }
-        oid::UUID => match temporal::Uuid::from_bytes(raw.clone()) {
+        oid::UUID => match temporal::Uuid::from_bytes(raw) {
             Ok(id) => Value::Uuid(id)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
         oid::DATE => match temporal::date_from_binary(raw) {
             Ok(date) => Value::Date(date)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
         oid::TIME | oid::TIMETZ => match temporal::time_from_binary(raw) {
             Ok(t) => Value::Time(t)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
         oid::TIMESTAMP | oid::TIMESTAMPTZ => {
             match temporal::timestamp_from_binary(raw, type_oid == oid::TIMESTAMPTZ) {
                 Ok(ts) => Value::Timestamp(ts)
-                Err(_) => Value::Bytes(raw.clone())
+                Err(_) => Value::Bytes(raw)
             }
         }
         oid::INTERVAL => match temporal::interval_from_binary(raw) {
             Ok(interval) => Value::Interval(interval)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
         oid::NUMERIC => match decode_binary_numeric(raw) {
             Ok(text) => Value::Numeric(text)
-            Err(_) => Value::Bytes(raw.clone())
+            Err(_) => Value::Bytes(raw)
         }
         // `bytea` is already its bytes, and a type with no binary reading
         // here has no text form to fall back on, so it answers them too.
-        _ => Value::Bytes(raw.clone())
+        _ => Value::Bytes(raw)
     }
 }
 
 // Encodes a value in the binary format for `type_oid`, or `None` when the
 // pair has no binary encoding here - the caller then sends it as text.
-pub fn encode_binary(v: &Value, type_oid: i64) -> Option<Vec<u8>> {
+pub fn encode_binary(v: Value, type_oid: i64) -> Option<Vec<u8>> {
     match v {
         Value::Bool(b) => encode_binary_bool(b, type_oid)
         Value::Int(n) => encode_binary_int(n, type_oid)
         Value::Text(text) => encode_binary_text(text, type_oid)
         Value::Bytes(data) => encode_binary_bytes(data, type_oid)
         Value::Json(text) => encode_binary_json(text, type_oid)
-        Value::Uuid(id) => if type_oid == oid::UUID { Some(id.bytes.clone()) } else { None }
+        Value::Uuid(id) => if type_oid == oid::UUID { Some(id.bytes) } else { None }
         Value::Timestamp(ts) => match type_oid {
             oid::TIMESTAMP | oid::TIMESTAMPTZ => Some(temporal::timestamp_to_binary(ts))
             _ => None
@@ -934,7 +934,7 @@ fn encode_binary_int(n: i64, type_oid: i64) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn encode_binary_text(text: &String, type_oid: i64) -> Option<Vec<u8>> {
+fn encode_binary_text(text: String, type_oid: i64) -> Option<Vec<u8>> {
     match type_oid {
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::JSON | oid::XML
         | oid::CSTRING => Some(text.as_bytes())
@@ -944,7 +944,7 @@ fn encode_binary_text(text: &String, type_oid: i64) -> Option<Vec<u8>> {
 
 // A JSON document in binary: `json` is its bytes, and `jsonb` prefixes them
 // with the one-byte format version the server expects.
-fn encode_binary_json(text: &String, type_oid: i64) -> Option<Vec<u8>> {
+fn encode_binary_json(text: String, type_oid: i64) -> Option<Vec<u8>> {
     match type_oid {
         oid::JSON => Some(text.as_bytes())
         oid::JSONB => {
@@ -956,11 +956,11 @@ fn encode_binary_json(text: &String, type_oid: i64) -> Option<Vec<u8>> {
     }
 }
 
-fn encode_binary_bytes(data: &Vec<u8>, type_oid: i64) -> Option<Vec<u8>> {
+fn encode_binary_bytes(data: Vec<u8>, type_oid: i64) -> Option<Vec<u8>> {
     if type_oid != oid::BYTEA {
         return None
     }
-    Some(data.clone())
+    Some(data)
 }
 
 // Range flag bits, as `rangetypes.h` defines them.
@@ -975,14 +975,14 @@ const RANGE_UB_NULL: i64 = 64
 // Decodes the binary range representation into the literal the text format
 // writes: a flags byte, then each bound the flags say is present as a
 // length and its own binary value.
-fn decode_binary_range(raw: &Vec<u8>, elem_oid: i64) -> Result<String, errors::Error> {
-    let (literal, _) = read_binary_range(raw, 0, raw.len(), elem_oid)?
+fn decode_binary_range(raw: Vec<u8>, elem_oid: i64) -> Result<String, errors::Error> {
+    let literal, _ = read_binary_range(raw, 0, raw.len(), elem_oid)?
     Ok(literal)
 }
 
 // Decodes the binary multirange representation: a count, then each range as
 // a length and its own binary payload.
-fn decode_binary_multirange(raw: &Vec<u8>, elem_oid: i64) -> Result<String, errors::Error> {
+fn decode_binary_multirange(raw: Vec<u8>, elem_oid: i64) -> Result<String, errors::Error> {
     if raw.len() < 4 {
         return Err(errors::new("multirange binary payload too short"))
     }
@@ -1001,17 +1001,17 @@ fn decode_binary_multirange(raw: &Vec<u8>, elem_oid: i64) -> Result<String, erro
         if length < 0 || offset + length > raw.len() {
             return Err(errors::new("multirange binary payload has a bad range length"))
         }
-        let (literal, _) = read_binary_range(raw, offset, offset + length, elem_oid)?
+        let literal, _ = read_binary_range(raw, offset, offset + length, elem_oid)?
         parts.push(literal)
         offset += length
     }
-    Ok("{" + &parts.join(",") + "}")
+    Ok("{" + parts.join(",") + "}")
 }
 
 // One binary range between `start` and `end`, as its literal and the offset
 // just past it.
 fn read_binary_range(
-    raw: &Vec<u8>
+    raw: Vec<u8>
     start: i64
     end: i64
     elem_oid: i64
@@ -1029,22 +1029,22 @@ fn read_binary_range(
     let mut lower = ""
     let mut upper = ""
     if has_lower {
-        let (bound, next) = read_binary_bound(raw, offset, end, elem_oid)?
+        let bound, next = read_binary_bound(raw, offset, end, elem_oid)?
         lower = bound
         offset = next
     }
     if has_upper {
-        let (bound, next) = read_binary_bound(raw, offset, end, elem_oid)?
+        let bound, next = read_binary_bound(raw, offset, end, elem_oid)?
         upper = bound
         offset = next
     }
     let open = if flags & RANGE_LB_INC != 0 { "[" } else { "(" }
     let close = if flags & RANGE_UB_INC != 0 { "]" } else { ")" }
-    Ok((open + &lower + "," + &upper + &close, offset))
+    Ok((open + lower + "," + upper + close, offset))
 }
 
 fn read_binary_bound(
-    raw: &Vec<u8>
+    raw: Vec<u8>
     offset: i64
     end: i64
     elem_oid: i64
@@ -1056,8 +1056,8 @@ fn read_binary_bound(
     if length < 0 || offset + 4 + length > end {
         return Err(errors::new("range binary payload has a bad bound length"))
     }
-    let bound = decode_binary(elem_oid, &buf::slice(raw, offset + 4, offset + 4 + length))
-    Ok((quote_range_bound(&bound.render()), offset + 4 + length))
+    let bound = decode_binary(elem_oid, buf::slice(raw, offset + 4, offset + 4 + length))
+    Ok((quote_range_bound(bound.render()), offset + 4 + length))
 }
 
 // Quotes a range bound when it holds a byte the range grammar would
@@ -1065,11 +1065,11 @@ fn read_binary_bound(
 //
 // Byte offsets: every character the grammar reserves is ASCII, so a
 // multi-byte character copies through untouched.
-fn quote_range_bound(text: &String) -> String {
+fn quote_range_bound(text: String) -> String {
     let needs = text.is_empty()
     || text.bytes().any(|byte| is_reserved_byte(byte as i64) || byte == 91 || byte == 93)
     if !needs {
-        return text.clone()
+        return text
     }
     let mut out: Vec<u8> = #[34]
     for byte in text.bytes() {
@@ -1079,14 +1079,14 @@ fn quote_range_bound(text: &String) -> String {
         out.push(byte)
     }
     out.push(34)
-    buf::utf8_lossy(&out)
+    buf::utf8_lossy(out)
 }
 
 // Decodes the binary `numeric` representation into its exact decimal text.
 //
 // The wire form is a count of base-10000 digit groups, the weight of the
 // first group, a sign, a display scale, then the groups.
-fn decode_binary_numeric(raw: &Vec<u8>) -> Result<String, errors::Error> {
+fn decode_binary_numeric(raw: Vec<u8>) -> Result<String, errors::Error> {
     if raw.len() < 8 {
         return Err(errors::new("numeric binary payload too short"))
     }
@@ -1119,7 +1119,7 @@ fn decode_binary_numeric(raw: &Vec<u8>) -> Result<String, errors::Error> {
         if int_part == "" {
             int_part = group.to_string()
         } else {
-            int_part += format!("{:04}", group)
+            int_part += format("{:04}", group)
         }
     }
     if int_part == "" {
@@ -1138,16 +1138,16 @@ fn decode_binary_numeric(raw: &Vec<u8>) -> Result<String, errors::Error> {
         frac += "0000"
     }
     for fg in max(weight + 1, 0)..groups.len() {
-        frac += format!("{:04}", groups[fg])
+        frac += format("{:04}", groups[fg])
     }
     while frac.byte_len() < dscale {
         frac += "0"
     }
     let frac_shown = frac.substring(0, dscale)
 
-    let mut text = if sign == 16_384 { "-" + &int_part } else { int_part }
+    let mut text = if sign == 16_384 { "-" + int_part } else { int_part }
     if dscale > 0 {
-        text += "." + &frac_shown
+        text += "." + frac_shown
     }
     Ok(text)
 }
@@ -1156,7 +1156,7 @@ fn decode_binary_numeric(raw: &Vec<u8>) -> Result<String, errors::Error> {
 // bitmap flag, the element OID, then each element length-prefixed. The
 // literal is the value an array column carries, so a binary-format array
 // reads back the same way a text-format one does.
-fn decode_binary_array(raw: &Vec<u8>) -> Result<String, errors::Error> {
+fn decode_binary_array(raw: Vec<u8>) -> Result<String, errors::Error> {
     if raw.len() < 12 {
         return Err(errors::new("array binary payload too short"))
     }
@@ -1184,15 +1184,15 @@ fn decode_binary_array(raw: &Vec<u8>) -> Result<String, errors::Error> {
         if length < 0 {
             flat.push(Value::Null)
         } else {
-            flat.push(decode_binary(elem_oid, &buf::slice(raw, off, off + length)))
+            flat.push(decode_binary(elem_oid, buf::slice(raw, off, off + length)))
             off += length
         }
     }
-    Ok(nest_literal(&flat, &dims, 0))
+    Ok(nest_literal(flat, dims, 0))
 }
 
 // Reshapes a flat element list into a `dims`-shaped nested array literal.
-fn nest_literal(flat: &Vec<Value>, dims: &Vec<i64>, depth: i64) -> String {
+fn nest_literal(flat: Vec<Value>, dims: Vec<i64>, depth: i64) -> String {
     if depth >= dims.len() - 1 {
         return render_array_literal(flat)
     }
@@ -1202,9 +1202,9 @@ fn nest_literal(flat: &Vec<Value>, dims: &Vec<i64>, depth: i64) -> String {
     }
     let mut rows: Vec<String> = #[]
     for chunk in flat.chunks(inner_len) {
-        rows.push(nest_literal(&chunk, dims, depth + 1))
+        rows.push(nest_literal(chunk, dims, depth + 1))
     }
-    render_nested_array_literal(&rows)
+    render_nested_array_literal(rows)
 }
 
 fn f64_from_bits(bits: i64) -> f64 {
@@ -1262,176 +1262,176 @@ mod value_tests {
 
     #[test]
     fn render_writes_postgres_text_forms() {
-        let _ = testing::check_eq(&super::Value::Bool(true).render(), &"t", "true")
-        let _ = testing::check_eq(&super::Value::Bool(false).render(), &"f", "false")
-        let _ = testing::check_eq(&super::Value::Int(-7).render(), &"-7", "int")
+        let _ = testing::check_eq(super::Value::Bool(true).render(), "t", "true")
+        let _ = testing::check_eq(super::Value::Bool(false).render(), "f", "false")
+        let _ = testing::check_eq(super::Value::Int(-7).render(), "-7", "int")
         let _ = testing::check_eq(
-            &super::Value::Bytes(#[0, 255]).render()
-            &"\\x00ff"
+            super::Value::Bytes(#[0, 255]).render()
+            "\\x00ff"
             "bytea hex"
         )
     }
 
     #[test]
     fn decode_text_reads_scalars_by_oid() {
-        let v = super::decode_text(oid::INT4, &"42".as_bytes())
-        let _ = testing::check_eq(&v.as_int().unwrap_or(0), &42, "int4")
-        let b = super::decode_text(oid::BOOL, &"t".as_bytes())
+        let v = super::decode_text(oid::INT4, "42".as_bytes())
+        let _ = testing::check_eq(v.as_int().unwrap_or(0), 42, "int4")
+        let b = super::decode_text(oid::BOOL, "t".as_bytes())
         let _ = testing::check(b.as_bool().unwrap_or(false), "bool true")
-        let f = super::decode_text(oid::FLOAT8, &"1.5".as_bytes())
-        let _ = testing::check_eq(&f.as_float().unwrap_or(0.0), &1.5, "float8")
+        let f = super::decode_text(oid::FLOAT8, "1.5".as_bytes())
+        let _ = testing::check_eq(f.as_float().unwrap_or(0.0), 1.5, "float8")
     }
 
     #[test]
     fn numeric_keeps_every_digit_the_server_sent() {
-        let v = super::decode_text(oid::NUMERIC, &"123456789012345678.90".as_bytes())
+        let v = super::decode_text(oid::NUMERIC, "123456789012345678.90".as_bytes())
         let _ = testing::check_eq(
-            &v.as_text().unwrap_or("")
-            &"123456789012345678.90"
+            v.as_text().unwrap_or("")
+            "123456789012345678.90"
             "exact numeric"
         )
     }
 
     #[test]
     fn bytea_hex_and_escape_forms_both_decode() {
-        match super::decode_bytea_text(&"\\x00ff10") {
+        match super::decode_bytea_text("\\x00ff10") {
             Ok(data) => {
-                let _ = testing::check_eq(&data.len(), &3, "hex length")
-                let _ = testing::check_eq(&(data[1] as i64), &255, "hex byte")
+                let _ = testing::check_eq(data.len(), 3, "hex length")
+                let _ = testing::check_eq((data[1] as i64), 255, "hex byte")
             }
-            Err(e) => { let _ = testing::check(false, &format!("hex: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("hex: {}", e)) }
         }
-        match super::decode_bytea_text(&"ab\\000cd\\\\") {
+        match super::decode_bytea_text("ab\\000cd\\\\") {
             Ok(data) => {
-                let _ = testing::check_eq(&data.len(), &6, "escape length")
-                let _ = testing::check_eq(&(data[2] as i64), &0, "octal escape")
-                let _ = testing::check_eq(&(data[5] as i64), &92, "escaped backslash")
+                let _ = testing::check_eq(data.len(), 6, "escape length")
+                let _ = testing::check_eq((data[2] as i64), 0, "octal escape")
+                let _ = testing::check_eq((data[5] as i64), 92, "escaped backslash")
             }
-            Err(e) => { let _ = testing::check(false, &format!("escape: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("escape: {}", e)) }
         }
     }
 
     #[test]
     fn array_literals_parse_with_nulls_quotes_and_nesting() {
-        match super::parse_array_literal(&"{1,2,NULL}", oid::INT4) {
+        match super::parse_array_literal("{1,2,NULL}", oid::INT4) {
             Ok(items) => {
-                let _ = testing::check_eq(&items.len(), &3, "three elements")
-                let _ = testing::check_eq(&items[0].as_int().unwrap_or(0), &1, "first")
+                let _ = testing::check_eq(items.len(), 3, "three elements")
+                let _ = testing::check_eq(items[0].as_int().unwrap_or(0), 1, "first")
                 let _ = testing::check(items[2].is_null(), "third is NULL")
             }
-            Err(e) => { let _ = testing::check(false, &format!("flat: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("flat: {}", e)) }
         }
-        match super::parse_array_literal(&"{{1,2},{3,4}}", oid::INT4) {
+        match super::parse_array_literal("{{1,2},{3,4}}", oid::INT4) {
             Ok(items) => {
-                let _ = testing::check_eq(&items.len(), &2, "two rows")
+                let _ = testing::check_eq(items.len(), 2, "two rows")
                 let row = items[0].as_array().unwrap_or(#[])
-                let _ = testing::check_eq(&row.len(), &2, "two columns")
-                let _ = testing::check_eq(&row[1].as_int().unwrap_or(0), &2, "nested value")
+                let _ = testing::check_eq(row.len(), 2, "two columns")
+                let _ = testing::check_eq(row[1].as_int().unwrap_or(0), 2, "nested value")
             }
-            Err(e) => { let _ = testing::check(false, &format!("nested: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("nested: {}", e)) }
         }
-        match super::parse_array_literal(&"{\"a,b\",\"c\\\"d\",NULL}", oid::TEXT) {
+        match super::parse_array_literal("{\"a,b\",\"c\\\"d\",NULL}", oid::TEXT) {
             Ok(items) => {
-                let _ = testing::check_eq(&items[0].as_text().unwrap_or(""), &"a,b", "quoted comma")
-                let _ = testing::check_eq(&items[1].as_text().unwrap_or(""), &"c\"d", "escaped quote")
+                let _ = testing::check_eq(items[0].as_text().unwrap_or(""), "a,b", "quoted comma")
+                let _ = testing::check_eq(items[1].as_text().unwrap_or(""), "c\"d", "escaped quote")
             }
-            Err(e) => { let _ = testing::check(false, &format!("quoted: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("quoted: {}", e)) }
         }
     }
 
     #[test]
     fn an_empty_array_literal_has_no_elements() {
-        match super::parse_array_literal(&"{}", oid::INT4) {
-            Ok(items) => { let _ = testing::check_eq(&items.len(), &0, "empty") }
-            Err(e) => { let _ = testing::check(false, &format!("empty: {}", e)) }
+        match super::parse_array_literal("{}", oid::INT4) {
+            Ok(items) => { let _ = testing::check_eq(items.len(), 0, "empty") }
+            Err(e) => { let _ = testing::check(false, format("empty: {}", e)) }
         }
     }
 
     #[test]
     fn an_explicit_bounds_prefix_is_dropped() {
-        match super::parse_array_literal(&"[2:3]={7,8}", oid::INT4) {
+        match super::parse_array_literal("[2:3]={7,8}", oid::INT4) {
             Ok(items) => {
-                let _ = testing::check_eq(&items.len(), &2, "two elements")
-                let _ = testing::check_eq(&items[0].as_int().unwrap_or(0), &7, "first")
+                let _ = testing::check_eq(items.len(), 2, "two elements")
+                let _ = testing::check_eq(items[0].as_int().unwrap_or(0), 7, "first")
             }
-            Err(e) => { let _ = testing::check(false, &format!("bounds: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("bounds: {}", e)) }
         }
     }
 
     #[test]
     fn arrays_round_trip_through_render_and_parse() {
-        let text = super::render_array_literal(&#[
+        let text = super::render_array_literal(#[
             super::Value::Text("plain")
             super::Value::Text("has,comma")
             super::Value::Null
             super::Value::Text("")
         ])
-        match super::parse_array_literal(&text, oid::TEXT) {
+        match super::parse_array_literal(text, oid::TEXT) {
             Ok(items) => {
-                let _ = testing::check_eq(&items.len(), &4, "element count")
-                let _ = testing::check_eq(&items[1].as_text().unwrap_or(""), &"has,comma", "comma")
+                let _ = testing::check_eq(items.len(), 4, "element count")
+                let _ = testing::check_eq(items[1].as_text().unwrap_or(""), "has,comma", "comma")
                 let _ = testing::check(items[2].is_null(), "null preserved")
-                let _ = testing::check_eq(&items[3].as_text().unwrap_or("x"), &"", "empty string")
+                let _ = testing::check_eq(items[3].as_text().unwrap_or("x"), "", "empty string")
             }
-            Err(e) => { let _ = testing::check(false, &format!("round trip of {}: {}", text, e)) }
+            Err(e) => { let _ = testing::check(false, format("round trip of {}: {}", text, e)) }
         }
     }
 
     #[test]
     fn composite_literals_parse_fields_and_nulls() {
-        match super::parse_record_literal(&"(1,\"two, three\",)") {
+        match super::parse_record_literal("(1,\"two, three\",)") {
             Ok(fields) => {
-                let _ = testing::check_eq(&fields.len(), &3, "three fields")
-                let _ = testing::check_eq(&fields[0].as_int().unwrap_or(0), &1, "first")
+                let _ = testing::check_eq(fields.len(), 3, "three fields")
+                let _ = testing::check_eq(fields[0].as_int().unwrap_or(0), 1, "first")
                 let _ = testing::check_eq(
-                    &fields[1].as_text().unwrap_or("")
-                    &"two, three"
+                    fields[1].as_text().unwrap_or("")
+                    "two, three"
                     "quoted field"
                 )
                 let _ = testing::check(fields[2].is_null(), "empty field is NULL")
             }
-            Err(e) => { let _ = testing::check(false, &format!("composite: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("composite: {}", e)) }
         }
     }
 
     #[test]
     fn range_literals_parse_bounds_and_inclusivity() {
-        match super::parse_range_literal(&"[1,5)", oid::INT4) {
+        match super::parse_range_literal("[1,5)", oid::INT4) {
             Ok(r) => {
                 let _ = testing::check(r.lower_inclusive, "lower inclusive")
                 let _ = testing::check(!r.upper_inclusive, "upper exclusive")
-                let _ = testing::check_eq(&r.lower.as_int().unwrap_or(0), &1, "lower bound")
-                let _ = testing::check_eq(&r.upper.as_int().unwrap_or(0), &5, "upper bound")
+                let _ = testing::check_eq(r.lower.as_int().unwrap_or(0), 1, "lower bound")
+                let _ = testing::check_eq(r.upper.as_int().unwrap_or(0), 5, "upper bound")
             }
-            Err(e) => { let _ = testing::check(false, &format!("range: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("range: {}", e)) }
         }
-        match super::parse_range_literal(&"empty", oid::INT4) {
+        match super::parse_range_literal("empty", oid::INT4) {
             Ok(r) => { let _ = testing::check(r.is_empty, "empty range") }
-            Err(e) => { let _ = testing::check(false, &format!("empty range: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("empty range: {}", e)) }
         }
-        match super::parse_range_literal(&"(,10]", oid::INT4) {
+        match super::parse_range_literal("(,10]", oid::INT4) {
             Ok(r) => {
                 let _ = testing::check(r.lower.is_null(), "unbounded lower")
-                let _ = testing::check_eq(&r.upper.as_int().unwrap_or(0), &10, "upper bound")
+                let _ = testing::check_eq(r.upper.as_int().unwrap_or(0), 10, "upper bound")
             }
-            Err(e) => { let _ = testing::check(false, &format!("unbounded: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("unbounded: {}", e)) }
         }
     }
 
     #[test]
     fn binary_scalars_decode() {
         let _ = testing::check_eq(
-            &super::decode_binary(oid::INT4, &#[0, 0, 1, 0]).as_int().unwrap_or(0)
-            &256
+            super::decode_binary(oid::INT4, #[0, 0, 1, 0]).as_int().unwrap_or(0)
+            256
             "int4 binary"
         )
         let _ = testing::check_eq(
-            &super::decode_binary(oid::INT2, &#[255, 254]).as_int().unwrap_or(0)
-            &-2
+            super::decode_binary(oid::INT2, #[255, 254]).as_int().unwrap_or(0)
+            -2
             "int2 binary negative"
         )
         let _ = testing::check(
-            super::decode_binary(oid::BOOL, &#[1]).as_bool().unwrap_or(false)
+            super::decode_binary(oid::BOOL, #[1]).as_bool().unwrap_or(false)
             "bool binary"
         )
     }
@@ -1472,9 +1472,9 @@ mod value_tests {
         for (weight, negative, dscale, groups, expected) in cases {
             let raw = numeric_wire(weight, negative, dscale, groups)
             let _ = testing::check_eq(
-                &super::decode_binary(oid::NUMERIC, &raw).render()
-                &expected
-                &format!("weight {} dscale {}", weight, dscale)
+                super::decode_binary(oid::NUMERIC, raw).render()
+                expected
+                format("weight {} dscale {}", weight, dscale)
             )
         }
     }
@@ -1482,13 +1482,13 @@ mod value_tests {
     #[test]
     fn a_binary_char_reads_as_the_character_its_text_form_writes() {
         let _ = testing::check_eq(
-            &super::decode_binary(oid::CHAR, &#[120]).render()
-            &"x"
+            super::decode_binary(oid::CHAR, #[120]).render()
+            "x"
             "the byte is the character"
         )
         let _ = testing::check_eq(
-            &super::decode_text(oid::CHAR, &"x".as_bytes()).render()
-            &super::decode_binary(oid::CHAR, &#[120]).render()
+            super::decode_text(oid::CHAR, "x".as_bytes()).render()
+            super::decode_binary(oid::CHAR, #[120]).render()
             "both wire formats agree"
         )
     }
@@ -1500,7 +1500,7 @@ mod value_tests {
         // design: it is what the server wrote, so a typed reading of it is a
         // parse that either succeeds or does not.
         let word = super::Value::Text("hello")
-        let _ = testing::check_eq(&word.as_text().unwrap_or(""), &"hello", "text reads as text")
+        let _ = testing::check_eq(word.as_text().unwrap_or(""), "hello", "text reads as text")
         let _ = testing::check(word.as_int().is_none(), "a word is no integer")
         let _ = testing::check(word.as_float().is_none(), "nor a float")
         let _ = testing::check(word.as_bool().is_none(), "nor a bool")
@@ -1511,8 +1511,8 @@ mod value_tests {
         let _ = testing::check(word.as_interval().is_none(), "nor an interval")
 
         let number = super::Value::Int(7)
-        let _ = testing::check_eq(&number.as_int().unwrap_or(0), &7, "an integer reads")
-        let _ = testing::check_eq(&number.as_text().unwrap_or(""), &"7", "and has a text form")
+        let _ = testing::check_eq(number.as_int().unwrap_or(0), 7, "an integer reads")
+        let _ = testing::check_eq(number.as_text().unwrap_or(""), "7", "and has a text form")
         let _ = testing::check(number.as_bool().unwrap_or(false), "a non-zero integer is true")
         let _ = testing::check(!super::Value::Int(0).as_bool().unwrap_or(true), "and zero is false")
         let _ = testing::check(number.as_uuid().is_none(), "but names no uuid")
@@ -1532,7 +1532,7 @@ mod value_tests {
         let _ = testing::check(null.as_json_text().is_none(), "no document")
         let _ = testing::check(null.as_uuid().is_none(), "no uuid")
         let _ = testing::check(null.as_timestamp().is_none(), "no timestamp")
-        let _ = testing::check_eq(&null.render(), &"", "and renders as nothing")
+        let _ = testing::check_eq(null.render(), "", "and renders as nothing")
     }
 
     #[test]
@@ -1540,13 +1540,13 @@ mod value_tests {
         for spelling in #["t", "true", "TRUE", "y", "yes", "on", "1"] {
             let _ = testing::check(
                 super::Value::Text(spelling).as_bool().unwrap_or(false)
-                &format!("{} is true", spelling)
+                format("{} is true", spelling)
             )
         }
         for spelling in #["f", "false", "FALSE", "n", "no", "off", "0"] {
             let _ = testing::check(
                 !super::Value::Text(spelling).as_bool().unwrap_or(true)
-                &format!("{} is false", spelling)
+                format("{} is false", spelling)
             )
         }
         let _ = testing::check(super::Value::Text("maybe").as_bool().is_none(), "and nothing else does")
@@ -1554,42 +1554,42 @@ mod value_tests {
 
     #[test]
     fn the_typed_temporal_arms_read_back_through_their_own_accessors() {
-        match super::temporal::parse_timestamp(&"2026-08-23 12:34:56.789012+00") {
+        match super::temporal::parse_timestamp("2026-08-23 12:34:56.789012+00") {
             Ok(at) => {
                 let v = super::Value::Timestamp(at)
                 let _ = testing::check(v.as_timestamp().is_some(), "a timestamp arm reads")
                 let _ = testing::check(
                     v.render().starts_with("2026-08-23 12:34:56.789012")
-                    &format!("rendering keeps the microseconds: {}", v.render())
+                    format("rendering keeps the microseconds: {}", v.render())
                 )
                 // A timestamp carries a date and a time, so both project.
                 let _ = testing::check(v.as_date().is_some(), "and projects to its date")
                 let _ = testing::check(v.as_time().is_some(), "and to its time of day")
                 let _ = testing::check(v.as_interval().is_none(), "but names no span")
             }
-            Err(e) => { let _ = testing::check(false, &format!("timestamp: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("timestamp: {}", e)) }
         }
-        match super::temporal::parse_interval(&"1 mon 2 days 03:04:05") {
+        match super::temporal::parse_interval("1 mon 2 days 03:04:05") {
             Ok(span) => {
                 let v = super::Value::Interval(span)
                 let _ = testing::check(v.as_interval().is_some(), "an interval arm reads")
                 let _ = testing::check(v.as_timestamp().is_none(), "and names no instant")
                 let _ = testing::check(v.as_date().is_none(), "nor a date")
             }
-            Err(e) => { let _ = testing::check(false, &format!("interval: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("interval: {}", e)) }
         }
     }
 
     #[test]
     fn a_json_document_keeps_its_own_arm_and_its_text() {
         let doc = super::Value::Json("{\"a\":1}")
-        let _ = testing::check_eq(&doc.as_json_text().unwrap_or(""), &"{\"a\":1}", "the document")
-        let _ = testing::check_eq(&doc.render(), &"{\"a\":1}", "rendered as written")
+        let _ = testing::check_eq(doc.as_json_text().unwrap_or(""), "{\"a\":1}", "the document")
+        let _ = testing::check_eq(doc.render(), "{\"a\":1}", "rendered as written")
         // A column of any other type answers its own text here, which is what
         // a caller assembling a document out of one wants.
         let _ = testing::check_eq(
-            &super::Value::Int(7).as_json_text().unwrap_or("")
-            &"7"
+            super::Value::Int(7).as_json_text().unwrap_or("")
+            "7"
             "a scalar answers its own text"
         )
     }
@@ -1600,16 +1600,16 @@ mod value_tests {
         let arr = super::Value::Text("{1,2,3}")
         match arr.as_array() {
             Some(items) => {
-                let _ = testing::check_eq(&items.len(), &3, "three elements")
-                let _ = testing::check_eq(&items[2].render(), &"3", "the last one")
+                let _ = testing::check_eq(items.len(), 3, "three elements")
+                let _ = testing::check_eq(items[2].render(), "3", "the last one")
             }
             None => { let _ = testing::check(false, "an array literal reads as an array") }
         }
         let record = super::Value::Text("(1,ada,)")
         match record.as_record() {
             Some(fields) => {
-                let _ = testing::check_eq(&fields.len(), &3, "three fields")
-                let _ = testing::check_eq(&fields[1].render(), &"ada", "the second")
+                let _ = testing::check_eq(fields.len(), 3, "three fields")
+                let _ = testing::check_eq(fields[1].render(), "ada", "the second")
                 let _ = testing::check(fields[2].is_null(), "an empty field is NULL")
             }
             None => { let _ = testing::check(false, "a composite literal reads as a record") }
@@ -1619,46 +1619,46 @@ mod value_tests {
 
     #[test]
     fn a_float_renders_in_the_spelling_postgres_reads_back() {
-        let _ = testing::check_eq(&super::render_float(1.5), &"1.5", "a plain decimal")
-        let _ = testing::check_eq(&super::render_float(-0.25), &"-0.25", "a negative one")
-        let _ = testing::check_eq(&super::render_float(super::nan()), &"NaN", "not a number")
-        let _ = testing::check_eq(&super::render_float(super::infinity()), &"Infinity", "infinity")
+        let _ = testing::check_eq(super::render_float(1.5), "1.5", "a plain decimal")
+        let _ = testing::check_eq(super::render_float(-0.25), "-0.25", "a negative one")
+        let _ = testing::check_eq(super::render_float(super::nan()), "NaN", "not a number")
+        let _ = testing::check_eq(super::render_float(super::infinity()), "Infinity", "infinity")
         // Whatever the spelling, it has to parse back to the same value, or a
         // float bound as a parameter is not the float that was read.
         for text in #["1.5", "-0.25", "NaN", "Infinity", "-Infinity"] {
-            match super::parse_float_text(&text) {
+            match super::parse_float_text(text) {
                 Some(f) => {
                     let _ = testing::check_eq(
-                        &super::render_float(f)
-                        &text
-                        &format!("round trip {}", text)
+                        super::render_float(f)
+                        text
+                        format("round trip {}", text)
                     )
                 }
-                None => { let _ = testing::check(false, &format!("{} must parse", text)) }
+                None => { let _ = testing::check(false, format("{} must parse", text)) }
             }
         }
-        let _ = testing::check(super::parse_float_text(&"not a number").is_none(), "a word is rejected")
+        let _ = testing::check(super::parse_float_text("not a number").is_none(), "a word is rejected")
     }
 
     #[test]
     fn a_multirange_literal_parses_to_the_ranges_it_holds() {
-        match super::parse_multirange_literal(&"{[1,3),[5,7)}", oid::INT4) {
+        match super::parse_multirange_literal("{[1,3),[5,7)}", oid::INT4) {
             Ok(ranges) => {
-                let _ = testing::check_eq(&ranges.len(), &2, "two ranges")
-                let _ = testing::check_eq(&ranges[0].lower.render(), &"1", "the first lower bound")
-                let _ = testing::check_eq(&ranges[1].upper.render(), &"7", "the second upper bound")
+                let _ = testing::check_eq(ranges.len(), 2, "two ranges")
+                let _ = testing::check_eq(ranges[0].lower.render(), "1", "the first lower bound")
+                let _ = testing::check_eq(ranges[1].upper.render(), "7", "the second upper bound")
                 let _ = testing::check(ranges[0].lower_inclusive, "a square bracket includes")
                 let _ = testing::check(!ranges[0].upper_inclusive, "a round one does not")
             }
-            Err(e) => { let _ = testing::check(false, &format!("parse failed: {}", e)) }
+            Err(e) => { let _ = testing::check(false, format("parse failed: {}", e)) }
         }
         let _ = testing::check_eq(
-            &super::parse_multirange_literal(&"{}", oid::INT4).unwrap_or(#[]).len()
-            &0
+            super::parse_multirange_literal("{}", oid::INT4).unwrap_or(#[]).len()
+            0
             "an empty multirange holds nothing"
         )
         let _ = testing::check(
-            super::parse_multirange_literal(&"[1,3)", oid::INT4).is_err()
+            super::parse_multirange_literal("[1,3)", oid::INT4).is_err()
             "an unbraced literal is not a multirange"
         )
     }
@@ -1668,26 +1668,26 @@ mod value_tests {
         // A field carrying a comma or a quote has to come back the same, or a
         // composite parameter changes shape on the way to the server.
         for literal in #["(1,ada,)", "(\"a,b\",c)", "(,)"] {
-            match super::parse_record_literal(&literal) {
+            match super::parse_record_literal(literal) {
                 Ok(fields) => {
-                    let again = super::render_record_literal(&fields)
-                    match super::parse_record_literal(&again) {
+                    let again = super::render_record_literal(fields)
+                    match super::parse_record_literal(again) {
                         Ok(reparsed) => {
                             let _ = testing::check_eq(
-                                &reparsed.len()
-                                &fields.len()
-                                &format!("{} keeps its field count through {}", literal, again)
+                                reparsed.len()
+                                fields.len()
+                                format("{} keeps its field count through {}", literal, again)
                             )
                             let _ = testing::check_eq(
-                                &reparsed.map(|f| f.render())
-                                &fields.map(|f| f.render())
-                                &format!("{} keeps its fields through {}", literal, again)
+                                reparsed.map(|f| f.render())
+                                fields.map(|f| f.render())
+                                format("{} keeps its fields through {}", literal, again)
                             )
                         }
-                        Err(e) => { let _ = testing::check(false, &format!("reparse {}: {}", again, e)) }
+                        Err(e) => { let _ = testing::check(false, format("reparse {}: {}", again, e)) }
                     }
                 }
-                Err(e) => { let _ = testing::check(false, &format!("{}: {}", literal, e)) }
+                Err(e) => { let _ = testing::check(false, format("{}: {}", literal, e)) }
             }
         }
     }
@@ -1696,12 +1696,12 @@ mod value_tests {
     fn a_nested_array_literal_renders_with_its_shape_intact() {
         let rows: Vec<String> = #["{1,2}", "{3,4}"]
         let _ = testing::check_eq(
-            &super::render_nested_array_literal(&rows)
-            &"{{1,2},{3,4}}"
+            super::render_nested_array_literal(rows)
+            "{{1,2},{3,4}}"
             "two rows of two"
         )
         let empty: Vec<String> = #[]
-        let _ = testing::check_eq(&super::render_nested_array_literal(&empty), &"{}", "no rows")
+        let _ = testing::check_eq(super::render_nested_array_literal(empty), "{}", "no rows")
     }
 
     #[test]
@@ -1710,24 +1710,24 @@ mod value_tests {
             0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255
         ]
         let _ = testing::check_eq(
-            &super::decode_binary(oid::UUID, &raw).as_text().unwrap_or("")
-            &"00112233-4455-6677-8899-aabbccddeeff"
+            super::decode_binary(oid::UUID, raw).as_text().unwrap_or("")
+            "00112233-4455-6677-8899-aabbccddeeff"
             "uuid text"
         )
     }
 
     #[test]
     fn binary_int_parameters_encode_at_their_width() {
-        match super::encode_binary(&super::Value::Int(258), oid::INT2) {
+        match super::encode_binary(super::Value::Int(258), oid::INT2) {
             Some(bytes) => {
-                let _ = testing::check_eq(&bytes.len(), &2, "int2 width")
-                let _ = testing::check_eq(&(bytes[0] as i64), &1, "high byte")
-                let _ = testing::check_eq(&(bytes[1] as i64), &2, "low byte")
+                let _ = testing::check_eq(bytes.len(), 2, "int2 width")
+                let _ = testing::check_eq((bytes[0] as i64), 1, "high byte")
+                let _ = testing::check_eq((bytes[1] as i64), 2, "low byte")
             }
             None => { let _ = testing::check(false, "int2 has a binary encoding") }
         }
         let _ = testing::check(
-            super::encode_binary(&super::Value::Int(1), oid::NUMERIC).is_none()
+            super::encode_binary(super::Value::Int(1), oid::NUMERIC).is_none()
             "numeric has no binary encoding here"
         )
     }

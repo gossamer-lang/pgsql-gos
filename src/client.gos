@@ -37,13 +37,13 @@ pub struct Client {
 }
 
 // Connects using a libpq keyword string or a `postgres://` URI.
-pub fn connect(url: &String) -> Result<Client, errors::Error> {
+pub fn connect(url: String) -> Result<Client, errors::Error> {
     let cfg = config::parse(url)?
-    connect_with(&cfg)
+    connect_with(cfg)
 }
 
 // Connects using already-parsed parameters.
-pub fn connect_with(cfg: &config::Config) -> Result<Client, errors::Error> {
+pub fn connect_with(cfg: config::Config) -> Result<Client, errors::Error> {
     let pg = conn::connect(cfg)?
     Ok(Client {
         pg: pg
@@ -60,7 +60,7 @@ impl Client {
 
     // The session parameter `name`, as the server reported it.
     pub fn parameter(&self, name: String) -> Option<String> {
-        self.pg.parameter(&name)
+        self.pg.parameter(name)
     }
 
     // The server's version string.
@@ -113,7 +113,7 @@ impl Client {
 
     // Round-trips a trivial query to confirm the connection still works.
     pub fn ping(&mut self) -> Result<(), errors::Error> {
-        let _ = self.pg.simple_query(&"SELECT 1")?
+        let _ = self.pg.simple_query("SELECT 1")?
         Ok(())
     }
 
@@ -127,7 +127,7 @@ impl Client {
     // cache is, so dropping them on the server would leave the cache naming
     // statements that no longer exist.
     pub fn reset_session(&mut self) -> Result<(), errors::Error> {
-        self.pg.batch_execute(&"RESET ALL; CLOSE ALL; UNLISTEN *; DISCARD TEMP; DISCARD SEQUENCES")
+        self.pg.batch_execute("RESET ALL; CLOSE ALL; UNLISTEN *; DISCARD TEMP; DISCARD SEQUENCES")
     }
 
     // Turns the prepared-statement cache on or off. With it off, every
@@ -164,9 +164,9 @@ impl Client {
 
     // Drops every cached statement, deallocating each on the server.
     pub fn clear_statement_cache(&mut self) {
-        for sql in self.recency.clone() {
-            if let Some(statement) = self.cache.get(&sql) {
-                let _ = self.pg.close_statement(&statement)
+        for sql in self.recency {
+            if let Some(statement) = self.cache.get(sql) {
+                let _ = self.pg.close_statement(statement)
             }
         }
         self.cache = Map::new()
@@ -175,8 +175,8 @@ impl Client {
 
     // Sets the wire format results arrive in: `value::FORMAT_TEXT` (the
     // default) or `value::FORMAT_BINARY`.
-    pub fn set_result_format(&mut self, format: i64) {
-        self.result_format = format
+    pub fn set_result_format(&mut self, wire_format: i64) {
+        self.result_format = wire_format
     }
 
     // Sends Terminate and closes the socket.
@@ -189,8 +189,8 @@ impl Client {
     // --- statements -------------------------------------------------
 
     // Prepares `sql`, letting the server infer the parameter types.
-    pub fn prepare(&mut self, sql: &String) -> Result<conn::Statement, errors::Error> {
-        self.pg.prepare(sql, &#[])
+    pub fn prepare(&mut self, sql: String) -> Result<conn::Statement, errors::Error> {
+        self.pg.prepare(sql, #[])
     }
 
     // Prepares `sql` with the parameter types pinned, for a query whose
@@ -198,14 +198,14 @@ impl Client {
     // value that would otherwise resolve to `text`).
     pub fn prepare_typed(
         &mut self
-        sql: &String
-        param_oids: &Vec<i64>
+        sql: String
+        param_oids: Vec<i64>
     ) -> Result<conn::Statement, errors::Error> {
         self.pg.prepare(sql, param_oids)
     }
 
     // Drops a prepared statement, and forgets it if it was cached.
-    pub fn close_statement(&mut self, statement: &conn::Statement) -> Result<(), errors::Error> {
+    pub fn close_statement(&mut self, statement: conn::Statement) -> Result<(), errors::Error> {
         let mut stale: Vec<String> = #[]
         for (sql, cached) in self.cache.iter() {
             if cached.name == statement.name {
@@ -213,15 +213,15 @@ impl Client {
             }
         }
         for sql in stale {
-            self.forget(&sql)
+            self.forget(sql)
         }
         self.pg.close_statement(statement)
     }
 
     // The cached statement for `sql`, preparing it on first use.
-    fn statement_for(&mut self, sql: &String) -> Result<conn::Statement, errors::Error> {
+    fn statement_for(&mut self, sql: String) -> Result<conn::Statement, errors::Error> {
         if !self.caching || self.capacity <= 0 {
-            return self.pg.prepare(sql, &#[])
+            return self.pg.prepare(sql, #[])
         }
         match self.cache.get(sql) {
             Some(cached) => {
@@ -229,9 +229,9 @@ impl Client {
                 Ok(cached)
             }
             None => {
-                let prepared = self.pg.prepare(sql, &#[])?
-                let _ = self.cache.insert(sql.clone(), prepared.clone())
-                self.recency.push(sql.clone())
+                let prepared = self.pg.prepare(sql, #[])?
+                let _ = self.cache.insert(sql, prepared)
+                self.recency.push(sql)
                 self.evict_to_capacity()
                 Ok(prepared)
             }
@@ -240,11 +240,10 @@ impl Client {
 
     // Moves `sql` to the most-recently-used end, so eviction reaches the
     // statements a caller has stopped running.
-    fn touch(&mut self, sql: &String) {
-        let wanted = sql.clone()
-        if let Some(position) = self.recency.position(|held| held == wanted) {
+    fn touch(&mut self, sql: String) {
+        if let Some(position) = self.recency.position(|held| held == sql) {
             let _ = self.recency.remove(position)
-            self.recency.push(wanted)
+            self.recency.push(sql)
         }
     }
 
@@ -254,17 +253,16 @@ impl Client {
         while self.cache.len() > max(self.capacity, 0) && !self.recency.is_empty() {
             let Ok(sql) = self.recency.remove(0) else { break }
             if let Some(statement) = Map::pop(&mut self.cache, sql) {
-                let _ = self.pg.close_statement(&statement)
+                let _ = self.pg.close_statement(statement)
             }
         }
     }
 
     // Forgets a cached statement without closing it on the server, for one
     // the server has already dropped or the caller is closing itself.
-    fn forget(&mut self, sql: &String) {
-        let wanted = sql.clone()
-        let _ = Map::pop(&mut self.cache, wanted.clone())
-        if let Some(position) = self.recency.position(|held| held == wanted) {
+    fn forget(&mut self, sql: String) {
+        let _ = Map::pop(&mut self.cache, sql)
+        if let Some(position) = self.recency.position(|held| held == sql) {
             let _ = self.recency.remove(position)
         }
     }
@@ -274,19 +272,19 @@ impl Client {
     // Runs `sql` with `params` for its effect, answering the rows affected.
     pub fn execute(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<i64, errors::Error> {
         let statement = self.statement_for(sql)?
-        match self.pg.execute(&statement, params) {
+        match self.pg.execute(statement, params) {
             Ok(affected) => Ok(affected)
             Err(e) => {
-                if !self.can_reprepare(&e) {
+                if !self.can_reprepare(e) {
                     return Err(e)
                 }
                 self.forget(sql)
                 let fresh = self.statement_for(sql)?
-                self.pg.execute(&fresh, params)
+                self.pg.execute(fresh, params)
             }
         }
     }
@@ -294,21 +292,21 @@ impl Client {
     // Runs a prepared statement for its effect.
     pub fn execute_prepared(
         &mut self
-        statement: &conn::Statement
-        params: &Vec<value::Value>
+        statement: conn::Statement
+        params: Vec<value::Value>
     ) -> Result<i64, errors::Error> {
         self.pg.execute(statement, params)
     }
 
     // Runs one or more statements with no parameters, through the simple
     // query protocol. This is the call for DDL and for a script.
-    pub fn batch_execute(&mut self, sql: &String) -> Result<(), errors::Error> {
+    pub fn batch_execute(&mut self, sql: String) -> Result<(), errors::Error> {
         self.pg.batch_execute(sql)
     }
 
     // Runs `sql` through the simple query protocol, answering every result
     // set it produced.
-    pub fn simple_query(&mut self, sql: &String) -> Result<Vec<conn::SimpleResult>, errors::Error> {
+    pub fn simple_query(&mut self, sql: String) -> Result<Vec<conn::SimpleResult>, errors::Error> {
         self.pg.simple_query(sql)
     }
 
@@ -317,8 +315,8 @@ impl Client {
     // Runs `sql` and collects every row.
     pub fn query(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<Vec<conn::Row>, errors::Error> {
         let mut stream = self.query_raw(sql, params)?
         let mut rows: Vec<conn::Row> = #[]
@@ -332,20 +330,20 @@ impl Client {
     // held in memory at once. Rows are pulled with `next_row`.
     pub fn query_raw(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<conn::RowStream, errors::Error> {
         let statement = self.statement_for(sql)?
-        let format = self.result_format
-        match self.pg.query(&statement, params, format) {
+        let wire_format = self.result_format
+        match self.pg.query(statement, params, wire_format) {
             Ok(stream) => Ok(stream)
             Err(e) => {
-                if !self.can_reprepare(&e) {
+                if !self.can_reprepare(e) {
                     return Err(e)
                 }
                 self.forget(sql)
                 let fresh = self.statement_for(sql)?
-                self.pg.query(&fresh, params, format)
+                self.pg.query(fresh, params, wire_format)
             }
         }
     }
@@ -366,8 +364,8 @@ impl Client {
     // Runs `sql` expecting exactly one row, and reports any other count.
     pub fn query_one(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<conn::Row, errors::Error> {
         let rows = self.query(sql, params)?
         if rows.len() != 1 {
@@ -379,8 +377,8 @@ impl Client {
     // Runs `sql` expecting at most one row.
     pub fn query_opt(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<Option<conn::Row>, errors::Error> {
         let rows = self.query(sql, params)?
         if rows.len() > 1 {
@@ -393,8 +391,8 @@ impl Client {
     // `SELECT count(*)` or a `RETURNING id` takes.
     pub fn query_value(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<value::Value, errors::Error> {
         let row = self.query_one(sql, params)?
         if row.width() < 1 {
@@ -407,20 +405,20 @@ impl Client {
     // lives until its transaction ends, so open one inside a transaction.
     pub fn open_portal(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<conn::Portal, errors::Error> {
         let statement = self.statement_for(sql)?
-        let format = self.result_format
-        match self.pg.open_portal(&statement, params, format) {
+        let wire_format = self.result_format
+        match self.pg.open_portal(statement, params, wire_format) {
             Ok(portal) => Ok(portal)
             Err(e) => {
-                if !self.can_reprepare(&e) {
+                if !self.can_reprepare(e) {
                     return Err(e)
                 }
                 self.forget(sql)
                 let fresh = self.statement_for(sql)?
-                self.pg.open_portal(&fresh, params, format)
+                self.pg.open_portal(fresh, params, wire_format)
             }
         }
     }
@@ -443,17 +441,17 @@ impl Client {
     // affected-row count. Pair the statements with their parameter sets.
     pub fn pipeline(
         &mut self
-        sql: &Vec<String>
-        params: &Vec<Vec<value::Value>>
+        sql: Vec<String>
+        params: Vec<Vec<value::Value>>
     ) -> Result<Vec<i64>, errors::Error> {
         let mut statements: Vec<conn::Statement> = #[]
         for text in sql {
-            statements.push(self.statement_for(&text)?)
+            statements.push(self.statement_for(text)?)
         }
-        match self.pg.pipeline(&statements, params) {
+        match self.pg.pipeline(statements, params) {
             Ok(counts) => Ok(counts)
             Err(e) => {
-                if !self.can_reprepare(&e) {
+                if !self.can_reprepare(e) {
                     return Err(e)
                 }
                 // The batch carries one Sync, so its failure rolled back
@@ -461,10 +459,10 @@ impl Client {
                 // reported, so all of them are prepared again.
                 let mut fresh: Vec<conn::Statement> = #[]
                 for text in sql {
-                    self.forget(&text)
-                    fresh.push(self.statement_for(&text)?)
+                    self.forget(text)
+                    fresh.push(self.statement_for(text)?)
                 }
-                self.pg.pipeline(&fresh, params)
+                self.pg.pipeline(fresh, params)
             }
         }
     }
@@ -475,32 +473,32 @@ impl Client {
     // column name and typed by each column's own OID.
     pub fn query_json(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<String, errors::Error> {
-        Ok(rowmap::rows_json(&self.query(sql, params)?))
+        Ok(rowmap::rows_json(self.query(sql, params)?))
     }
 
     // Runs `sql` and answers its one row as a JSON object, reporting a
     // result that does not hold exactly one.
     pub fn query_one_json(
         &mut self
-        sql: &String
-        params: &Vec<value::Value>
+        sql: String
+        params: Vec<value::Value>
     ) -> Result<String, errors::Error> {
-        Ok(rowmap::row_json(&self.query_one(sql, params)?))
+        Ok(rowmap::row_json(self.query_one(sql, params)?))
     }
 
     // --- transactions -----------------------------------------------
 
     // Opens a transaction with the server's default characteristics.
     pub fn transaction(&mut self) -> Result<Transaction, errors::Error> {
-        self.begin_with(&TxOptions::defaults())
+        self.begin_with(TxOptions::defaults())
     }
 
     // Opens a transaction with explicit characteristics.
-    pub fn begin_with(&mut self, options: &TxOptions) -> Result<Transaction, errors::Error> {
-        self.pg.batch_execute(&options.render())?
+    pub fn begin_with(&mut self, options: TxOptions) -> Result<Transaction, errors::Error> {
+        self.pg.batch_execute(options.render())?
         Ok(Transaction { open: true, depth: 0 })
     }
 
@@ -510,7 +508,7 @@ impl Client {
             return Err(errors::new("transaction is already finished"))
         }
         tx.open = false
-        self.pg.batch_execute(&"COMMIT")
+        self.pg.batch_execute("COMMIT")
     }
 
     // Rolls an open transaction back. Safe to call on a failed transaction,
@@ -520,7 +518,7 @@ impl Client {
             return Ok(())
         }
         tx.open = false
-        self.pg.batch_execute(&"ROLLBACK")
+        self.pg.batch_execute("ROLLBACK")
     }
 
     // Establishes a savepoint inside a transaction, answering its name so
@@ -530,20 +528,20 @@ impl Client {
             return Err(errors::new("savepoint needs an open transaction"))
         }
         tx.depth += 1
-        let name = format!("gos_pgsql_sp{}", tx.depth)
-        self.pg.batch_execute(&format!("SAVEPOINT {}", quote_ident(&name)))?
+        let name = format("gos_pgsql_sp{}", tx.depth)
+        self.pg.batch_execute(format("SAVEPOINT {}", quote_ident(name)))?
         Ok(name)
     }
 
     // Rolls back to a savepoint, keeping the transaction open. This is what
     // recovers a transaction whose last statement failed.
     pub fn rollback_to(&mut self, name: String) -> Result<(), errors::Error> {
-        self.pg.batch_execute(&format!("ROLLBACK TO SAVEPOINT {}", quote_ident(&name)))
+        self.pg.batch_execute(format("ROLLBACK TO SAVEPOINT {}", quote_ident(name)))
     }
 
     // Releases a savepoint, keeping its effects.
     pub fn release_savepoint(&mut self, name: String) -> Result<(), errors::Error> {
-        self.pg.batch_execute(&format!("RELEASE SAVEPOINT {}", quote_ident(&name)))
+        self.pg.batch_execute(format("RELEASE SAVEPOINT {}", quote_ident(name)))
     }
 
     // --- COPY -------------------------------------------------------
@@ -556,7 +554,7 @@ impl Client {
     //         db.copy_in_write(&mut copy, &batch)?
     //     }
     //     let rows = db.copy_in_end(&mut copy)?
-    pub fn copy_in_begin(&mut self, sql: &String) -> Result<conn::CopyIn, errors::Error> {
+    pub fn copy_in_begin(&mut self, sql: String) -> Result<conn::CopyIn, errors::Error> {
         self.pg.copy_in_begin(sql)
     }
 
@@ -564,7 +562,7 @@ impl Client {
     pub fn copy_in_write(
         &mut self
         copy: &mut conn::CopyIn
-        data: &Vec<u8>
+        data: Vec<u8>
     ) -> Result<(), errors::Error> {
         self.pg.copy_in_write(copy, data)
     }
@@ -574,14 +572,14 @@ impl Client {
     pub fn copy_in_write_rows(
         &mut self
         copy: &mut conn::CopyIn
-        rows: &Vec<Vec<value::Value>>
+        rows: Vec<Vec<value::Value>>
     ) -> Result<(), errors::Error> {
         let mut data: Vec<u8> = #[]
         for row in rows {
-            data.extend(copy_text_row(&row).as_bytes())
+            data.extend(copy_text_row(row).as_bytes())
             data.push(10)
         }
-        self.pg.copy_in_write(copy, &data)
+        self.pg.copy_in_write(copy, data)
     }
 
     // Ends an open COPY FROM STDIN, answering the rows the server accepted.
@@ -593,14 +591,14 @@ impl Client {
     pub fn copy_in_abort(
         &mut self
         copy: &mut conn::CopyIn
-        reason: &String
+        reason: String
     ) -> Result<(), errors::Error> {
         self.pg.copy_in_abort(copy, reason)
     }
 
     // Streams `data` into the server with `COPY ... FROM STDIN` in one
     // call.
-    pub fn copy_in(&mut self, sql: &String, data: &Vec<u8>) -> Result<i64, errors::Error> {
+    pub fn copy_in(&mut self, sql: String, data: Vec<u8>) -> Result<i64, errors::Error> {
         self.pg.copy_in(sql, data)
     }
 
@@ -612,25 +610,25 @@ impl Client {
     // list too large to hold as a single buffer still copies.
     pub fn copy_in_rows(
         &mut self
-        sql: &String
-        rows: &Vec<Vec<value::Value>>
+        sql: String
+        rows: Vec<Vec<value::Value>>
     ) -> Result<i64, errors::Error> {
         let mut copy = self.pg.copy_in_begin(sql)?
         let mut batch: Vec<u8> = #[]
         for row in rows {
-            batch.extend(copy_text_row(&row).as_bytes())
+            batch.extend(copy_text_row(row).as_bytes())
             batch.push(10)
             if batch.len() >= COPY_BATCH_BYTES {
-                match self.pg.copy_in_write(&mut copy, &batch) {
+                match self.pg.copy_in_write(&mut copy, batch) {
                     Ok(_) => { batch = #[] }
                     Err(e) => {
-                        let _ = self.pg.copy_in_abort(&mut copy, &format!("{}", e))
+                        let _ = self.pg.copy_in_abort(&mut copy, format("{}", e))
                         return Err(e)
                     }
                 }
             }
         }
-        self.pg.copy_in_write(&mut copy, &batch)?
+        self.pg.copy_in_write(&mut copy, batch)?
         self.pg.copy_in_end(&mut copy)
     }
 
@@ -641,7 +639,7 @@ impl Client {
     //     while let Some(chunk) = db.copy_out_next(&mut copy)? {
     //         sink(chunk)
     //     }
-    pub fn copy_out_begin(&mut self, sql: &String) -> Result<conn::CopyOut, errors::Error> {
+    pub fn copy_out_begin(&mut self, sql: String) -> Result<conn::CopyOut, errors::Error> {
         self.pg.copy_out_begin(sql)
     }
 
@@ -672,13 +670,13 @@ impl Client {
     }
 
     // Reads a `COPY ... TO STDOUT` in full.
-    pub fn copy_out(&mut self, sql: &String) -> Result<Vec<u8>, errors::Error> {
+    pub fn copy_out(&mut self, sql: String) -> Result<Vec<u8>, errors::Error> {
         self.pg.copy_out(sql)
     }
 
     // Reads a `COPY ... TO STDOUT` and splits it into lines, dropping the
     // trailing empty line the final newline leaves.
-    pub fn copy_out_lines(&mut self, sql: &String) -> Result<Vec<String>, errors::Error> {
+    pub fn copy_out_lines(&mut self, sql: String) -> Result<Vec<String>, errors::Error> {
         let mut copy = self.pg.copy_out_begin(sql)?
         let mut lines: Vec<String> = #[]
         while let Some(line) = self.copy_out_line(&mut copy)? {
@@ -691,24 +689,24 @@ impl Client {
 
     // Subscribes to a notification channel.
     pub fn listen(&mut self, channel: String) -> Result<(), errors::Error> {
-        self.pg.batch_execute(&format!("LISTEN {}", quote_ident(&channel)))
+        self.pg.batch_execute(format("LISTEN {}", quote_ident(channel)))
     }
 
     // Unsubscribes from a channel, or from all of them when `channel` is
     // empty.
     pub fn unlisten(&mut self, channel: String) -> Result<(), errors::Error> {
         if channel == "" {
-            return self.pg.batch_execute(&"UNLISTEN *")
+            return self.pg.batch_execute("UNLISTEN *")
         }
-        self.pg.batch_execute(&format!("UNLISTEN {}", quote_ident(&channel)))
+        self.pg.batch_execute(format("UNLISTEN {}", quote_ident(channel)))
     }
 
     // Sends a notification with a payload.
     pub fn notify(&mut self, channel: String, payload: String) -> Result<(), errors::Error> {
-        let _ = self.pg.simple_query(&format!(
+        let _ = self.pg.simple_query(format(
             "SELECT pg_notify({}, {})"
-            quote_literal(&channel)
-            quote_literal(&payload)
+            quote_literal(channel)
+            quote_literal(payload)
         ))?
         Ok(())
     }
@@ -755,8 +753,8 @@ impl Client {
     // Inside a transaction the failure has already put the block in its
     // aborted state, where the server accepts only a rollback, so the retry
     // belongs to the caller's own recovery there rather than here.
-    fn can_reprepare(&self, e: &errors::Error) -> bool {
-        matches!(dberror::sqlstate_of(e), "26000" | "0A000")
+    fn can_reprepare(&self, e: errors::Error) -> bool {
+        matches(dberror::sqlstate_of(e), "26000" | "0A000")
         && !self.pg.is_closed()
         && !self.pg.in_transaction()
     }
@@ -836,7 +834,7 @@ impl CancelToken {
         if self.pid == 0 {
             return Err(errors::new("no backend key: the server sent no BackendKeyData"))
         }
-        conn::send_cancel(&self.host, self.pid, self.secret)
+        conn::send_cancel(self.host, self.pid, self.secret)
     }
 }
 
@@ -844,22 +842,22 @@ impl CancelToken {
 
 // Quotes an identifier by doubling embedded quotes, so a channel or
 // savepoint name cannot end a statement and start another.
-pub fn quote_ident(name: &String) -> String {
-    "\"" + &name.replace("\"", "\"\"") + "\""
+pub fn quote_ident(name: String) -> String {
+    "\"" + name.replace("\"", "\"\"") + "\""
 }
 
 // Quotes a string literal by doubling embedded quotes. Used only for the
 // `pg_notify` arguments, which cannot be parameters in a simple query.
-pub fn quote_literal(text: &String) -> String {
-    "'" + &text.replace("'", "''") + "'"
+pub fn quote_literal(text: String) -> String {
+    "'" + text.replace("'", "''") + "'"
 }
 
 // One row in COPY's default text format: tab-separated fields, `\N` for
 // NULL, and backslash escapes for the characters the format reserves.
-pub fn copy_text_row(row: &Vec<value::Value>) -> String {
+pub fn copy_text_row(row: Vec<value::Value>) -> String {
     let fields = row.map(|cell| match cell {
         value::Value::Null => "\\N"
-        _ => escape_copy_field(&cell.render())
+        _ => escape_copy_field(cell.render())
     })
     fields.join("\t")
 }
@@ -867,18 +865,18 @@ pub fn copy_text_row(row: &Vec<value::Value>) -> String {
 // One COPY text field with the format's reserved characters escaped. Byte
 // offsets: every escape the format defines is ASCII, so a multi-byte
 // character copies through untouched.
-fn escape_copy_field(text: &String) -> String {
+fn escape_copy_field(text: String) -> String {
     let mut out: Vec<u8> = #[]
     for byte in text.bytes() {
         match byte {
-            92 => out.extend(&#[92, 92])
-            9 => out.extend(&#[92, 116])
-            10 => out.extend(&#[92, 110])
-            13 => out.extend(&#[92, 114])
+            92 => out.extend(#[92, 92])
+            9 => out.extend(#[92, 116])
+            10 => out.extend(#[92, 110])
+            13 => out.extend(#[92, 114])
             _ => out.push(byte)
         }
     }
-    buf::utf8_lossy(&out)
+    buf::utf8_lossy(out)
 }
 
 #[cfg(test)]
@@ -888,8 +886,8 @@ mod client_tests {
     #[test]
     fn tx_options_render_the_begin_statement() {
         let _ = testing::check_eq(
-            &super::TxOptions::defaults().render()
-            &"BEGIN"
+            super::TxOptions::defaults().render()
+            "BEGIN"
             "default begin"
         )
         let serializable = super::TxOptions {
@@ -898,8 +896,8 @@ mod client_tests {
             deferrable: true
         }
         let _ = testing::check_eq(
-            &serializable.render()
-            &"BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE"
+            serializable.render()
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE"
             "serializable read-only deferrable"
         )
         let repeatable = super::TxOptions {
@@ -908,8 +906,8 @@ mod client_tests {
             deferrable: false
         }
         let _ = testing::check_eq(
-            &repeatable.render()
-            &"BEGIN ISOLATION LEVEL REPEATABLE READ"
+            repeatable.render()
+            "BEGIN ISOLATION LEVEL REPEATABLE READ"
             "repeatable read"
         )
     }
@@ -917,13 +915,13 @@ mod client_tests {
     #[test]
     fn identifiers_and_literals_are_quoted_against_injection() {
         let _ = testing::check_eq(
-            &super::quote_ident(&"events\"; DROP TABLE t; --")
-            &"\"events\"\"; DROP TABLE t; --\""
+            super::quote_ident("events\"; DROP TABLE t; --")
+            "\"events\"\"; DROP TABLE t; --\""
             "identifier quoting doubles the quote"
         )
         let _ = testing::check_eq(
-            &super::quote_literal(&"it's")
-            &"'it''s'"
+            super::quote_literal("it's")
+            "'it''s'"
             "literal quoting doubles the apostrophe"
         )
     }
@@ -937,8 +935,8 @@ mod client_tests {
             value::Value::Text("line\nbreak")
         ]
         let _ = testing::check_eq(
-            &super::copy_text_row(&row)
-            &"1\thas\\ttab\t\\N\tline\\nbreak"
+            super::copy_text_row(row)
+            "1\thas\\ttab\t\\N\tline\\nbreak"
             "copy text row"
         )
     }

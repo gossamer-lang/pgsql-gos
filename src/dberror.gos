@@ -70,7 +70,7 @@ impl DbError {
     // True when the error's SQLSTATE class (its first two characters)
     // matches `class`. Class "23" is an integrity-constraint violation,
     // "40" a transaction rollback, "42" a syntax or access-rule error.
-    pub fn in_class(&self, class: &String) -> bool {
+    pub fn in_class(&self, class: String) -> bool {
         self.code.starts_with(class)
     }
 
@@ -104,15 +104,15 @@ impl DbError {
     // `[SQLSTATE] message`, with detail and hint appended when present.
     pub fn render(&self) -> String {
         let mut out = if self.code == "" {
-            self.message.clone()
+            self.message
         } else {
-            format!("[{}] {}", self.code, self.message)
+            format("[{}] {}", self.code, self.message)
         }
         if self.detail != "" {
-            out += format!(": {}", self.detail)
+            out += format(": {}", self.detail)
         }
         if self.hint != "" {
-            out += format!(" (hint: {})", self.hint)
+            out += format(" (hint: {})", self.hint)
         }
         out
     }
@@ -128,7 +128,7 @@ impl DbError {
         if self.code == "" {
             return reported
         }
-        reported.with_field(SQLSTATE_FIELD, self.code.clone())
+        reported.with_field(SQLSTATE_FIELD, self.code)
     }
 }
 
@@ -142,7 +142,7 @@ pub const SQLSTATE_FIELD: String = "sqlstate"
 // link in the chain, so a failure classified several layers above the call
 // still reads the code the server sent. An error built from the rendered
 // `[SQLSTATE] message` text alone is read back from that text.
-pub fn sqlstate_of(e: &errors::Error) -> String {
+pub fn sqlstate_of(e: errors::Error) -> String {
     for link in e.chain() {
         if let Some(code) = link.field(SQLSTATE_FIELD) {
             return code
@@ -162,7 +162,7 @@ pub fn sqlstate_of(e: &errors::Error) -> String {
 
 // Parses an ErrorResponse / NoticeResponse body: a sequence of
 // field-type-byte + NUL-terminated value, ended by a zero byte.
-pub fn parse(body: &Vec<u8>) -> DbError {
+pub fn parse(body: Vec<u8>) -> DbError {
     let mut out = DbError::blank()
     let n = body.len()
     let mut i = 0
@@ -171,8 +171,8 @@ pub fn parse(body: &Vec<u8>) -> DbError {
         if kind == 0 {
             break
         }
-        let (value, next) = buf::cstr_at(body, i + 1)
-        assign(&mut out, kind, &value)
+        let value, next = buf::cstr_at(body, i + 1)
+        assign(&mut out, kind, value)
         i = next
     }
     out
@@ -198,31 +198,31 @@ const FIELD_FILE: i64 = 70
 const FIELD_LINE: i64 = 76
 const FIELD_ROUTINE: i64 = 82
 
-fn assign(out: &mut DbError, kind: i64, value: &String) {
+fn assign(out: &mut DbError, kind: i64, value: String) {
     match kind {
-        FIELD_SEVERITY => { out.severity = value.clone() }
-        FIELD_SEVERITY_UNLOCALIZED => { out.severity_unlocalized = value.clone() }
-        FIELD_CODE => { out.code = value.clone() }
-        FIELD_MESSAGE => { out.message = value.clone() }
-        FIELD_DETAIL => { out.detail = value.clone() }
-        FIELD_HINT => { out.hint = value.clone() }
+        FIELD_SEVERITY => { out.severity = value }
+        FIELD_SEVERITY_UNLOCALIZED => { out.severity_unlocalized = value }
+        FIELD_CODE => { out.code = value }
+        FIELD_MESSAGE => { out.message = value }
+        FIELD_DETAIL => { out.detail = value }
+        FIELD_HINT => { out.hint = value }
         FIELD_POSITION => { out.position = to_int(value) }
         FIELD_INTERNAL_POSITION => { out.internal_position = to_int(value) }
-        FIELD_INTERNAL_QUERY => { out.internal_query = value.clone() }
-        FIELD_WHERE => { out.context_trace = value.clone() }
-        FIELD_SCHEMA => { out.schema = value.clone() }
-        FIELD_TABLE => { out.table = value.clone() }
-        FIELD_COLUMN => { out.column = value.clone() }
-        FIELD_DATATYPE => { out.datatype = value.clone() }
-        FIELD_CONSTRAINT => { out.constraint = value.clone() }
-        FIELD_FILE => { out.file = value.clone() }
+        FIELD_INTERNAL_QUERY => { out.internal_query = value }
+        FIELD_WHERE => { out.context_trace = value }
+        FIELD_SCHEMA => { out.schema = value }
+        FIELD_TABLE => { out.table = value }
+        FIELD_COLUMN => { out.column = value }
+        FIELD_DATATYPE => { out.datatype = value }
+        FIELD_CONSTRAINT => { out.constraint = value }
+        FIELD_FILE => { out.file = value }
         FIELD_LINE => { out.line = to_int(value) }
-        FIELD_ROUTINE => { out.routine = value.clone() }
+        FIELD_ROUTINE => { out.routine = value }
         _ => ()
     }
 }
 
-fn to_int(text: &String) -> i64 {
+fn to_int(text: String) -> i64 {
     text.to_i64().unwrap_or(0)
 }
 
@@ -233,51 +233,51 @@ mod dberror_tests {
     fn sample() -> Vec<u8> {
         let mut b: Vec<u8> = #[]
         buf::put_u8(&mut b, 83)
-        buf::put_cstr(&mut b, &"ERROR")
+        buf::put_cstr(&mut b, "ERROR")
         buf::put_u8(&mut b, 86)
-        buf::put_cstr(&mut b, &"ERROR")
+        buf::put_cstr(&mut b, "ERROR")
         buf::put_u8(&mut b, 67)
-        buf::put_cstr(&mut b, &"23505")
+        buf::put_cstr(&mut b, "23505")
         buf::put_u8(&mut b, 77)
-        buf::put_cstr(&mut b, &"duplicate key value violates unique constraint \"t_pkey\"")
+        buf::put_cstr(&mut b, "duplicate key value violates unique constraint \"t_pkey\"")
         buf::put_u8(&mut b, 68)
-        buf::put_cstr(&mut b, &"Key (id)=(1) already exists.")
+        buf::put_cstr(&mut b, "Key (id)=(1) already exists.")
         buf::put_u8(&mut b, 110)
-        buf::put_cstr(&mut b, &"t_pkey")
+        buf::put_cstr(&mut b, "t_pkey")
         buf::put_u8(&mut b, 116)
-        buf::put_cstr(&mut b, &"t")
+        buf::put_cstr(&mut b, "t")
         buf::put_u8(&mut b, 80)
-        buf::put_cstr(&mut b, &"17")
+        buf::put_cstr(&mut b, "17")
         buf::put_u8(&mut b, 76)
-        buf::put_cstr(&mut b, &"239")
+        buf::put_cstr(&mut b, "239")
         buf::put_u8(&mut b, 0)
         b
     }
 
     #[test]
     fn parse_reads_every_field_it_is_sent() {
-        let e = super::parse(&sample())
-        let _ = testing::check_eq(&e.code, &"23505", "sqlstate")
-        let _ = testing::check_eq(&e.constraint, &"t_pkey", "constraint")
-        let _ = testing::check_eq(&e.table, &"t", "table")
-        let _ = testing::check_eq(&e.position, &17, "position")
-        let _ = testing::check_eq(&e.line, &239, "server line")
-        let _ = testing::check_eq(&e.detail, &"Key (id)=(1) already exists.", "detail")
+        let e = super::parse(sample())
+        let _ = testing::check_eq(e.code, "23505", "sqlstate")
+        let _ = testing::check_eq(e.constraint, "t_pkey", "constraint")
+        let _ = testing::check_eq(e.table, "t", "table")
+        let _ = testing::check_eq(e.position, 17, "position")
+        let _ = testing::check_eq(e.line, 239, "server line")
+        let _ = testing::check_eq(e.detail, "Key (id)=(1) already exists.", "detail")
     }
 
     #[test]
     fn classification_reads_the_sqlstate() {
-        let e = super::parse(&sample())
+        let e = super::parse(sample())
         let _ = testing::check(e.is_unique_violation(), "unique violation")
-        let _ = testing::check(e.in_class(&"23"), "integrity constraint class")
+        let _ = testing::check(e.in_class("23"), "integrity constraint class")
         let _ = testing::check(!e.is_retryable(), "not retryable")
         let _ = testing::check(!e.is_fatal(), "not fatal")
     }
 
     #[test]
     fn render_includes_the_sqlstate_and_detail() {
-        let text = super::parse(&sample()).render()
-        let _ = testing::check(text.starts_with("[23505]"), &format!("rendered: {}", text))
+        let text = super::parse(sample()).render()
+        let _ = testing::check(text.starts_with("[23505]"), format("rendered: {}", text))
         let _ = testing::check(text.contains("already exists"), "detail included")
     }
 
@@ -295,11 +295,11 @@ mod dberror_tests {
         ]
         for (code, unique, foreign, not_null, retryable) in cases {
             let mut e = super::DbError::blank()
-            e.code = code.clone()
-            let _ = testing::check_eq(&e.is_unique_violation(), &unique, &format!("{} unique", code))
-            let _ = testing::check_eq(&e.is_foreign_key_violation(), &foreign, &format!("{} fk", code))
-            let _ = testing::check_eq(&e.is_not_null_violation(), &not_null, &format!("{} not null", code))
-            let _ = testing::check_eq(&e.is_retryable(), &retryable, &format!("{} retryable", code))
+            e.code = code
+            let _ = testing::check_eq(e.is_unique_violation(), unique, format("{} unique", code))
+            let _ = testing::check_eq(e.is_foreign_key_violation(), foreign, format("{} fk", code))
+            let _ = testing::check_eq(e.is_not_null_violation(), not_null, format("{} not null", code))
+            let _ = testing::check_eq(e.is_retryable(), retryable, format("{} retryable", code))
         }
     }
 
@@ -311,13 +311,13 @@ mod dberror_tests {
             let mut e = super::DbError::blank()
             e.severity_unlocalized = severity
             e.code = "42601"
-            let _ = testing::check(e.is_fatal(), &format!("{} ends the session", severity))
+            let _ = testing::check(e.is_fatal(), format("{} ends the session", severity))
         }
         for severity in #["ERROR", "WARNING", "NOTICE", ""] {
             let mut e = super::DbError::blank()
             e.severity_unlocalized = severity
             e.code = "57P01"
-            let _ = testing::check(!e.is_fatal(), &format!("{} does not", severity))
+            let _ = testing::check(!e.is_fatal(), format("{} does not", severity))
         }
     }
 
@@ -325,39 +325,39 @@ mod dberror_tests {
     fn a_class_is_the_first_two_characters_and_nothing_looser() {
         let mut e = super::DbError::blank()
         e.code = "23505"
-        let _ = testing::check(e.in_class(&"23"), "its own class")
-        let _ = testing::check(e.in_class(&"235"), "a longer prefix still matches")
-        let _ = testing::check(!e.in_class(&"22"), "a neighbouring class does not")
-        let _ = testing::check(!e.in_class(&"505"), "the class is a prefix, not a substring")
+        let _ = testing::check(e.in_class("23"), "its own class")
+        let _ = testing::check(e.in_class("235"), "a longer prefix still matches")
+        let _ = testing::check(!e.in_class("22"), "a neighbouring class does not")
+        let _ = testing::check(!e.in_class("505"), "the class is a prefix, not a substring")
     }
 
     #[test]
     fn as_error_carries_the_sqlstate_where_a_wrap_cannot_lose_it() {
-        let reported = super::parse(&sample()).as_error()
-        let _ = testing::check_eq(&super::sqlstate_of(&reported), &"23505", "read straight back")
+        let reported = super::parse(sample()).as_error()
+        let _ = testing::check_eq(super::sqlstate_of(reported), "23505", "read straight back")
         let wrapped = errors::wrap(errors::wrap(reported, "inner"), "outer")
-        let _ = testing::check_eq(&super::sqlstate_of(&wrapped), &"23505", "through two wraps")
+        let _ = testing::check_eq(super::sqlstate_of(wrapped), "23505", "through two wraps")
         let _ = testing::check(
-            format!("{}", wrapped).starts_with("outer: inner: [23505]")
-            &format!("the text still reads as a chain: {}", wrapped)
+            format("{}", wrapped).starts_with("outer: inner: [23505]")
+            format("the text still reads as a chain: {}", wrapped)
         )
     }
 
     #[test]
     fn a_report_with_no_sqlstate_carries_no_field_to_classify_by() {
         let blank = super::DbError::blank().as_error()
-        let _ = testing::check_eq(&super::sqlstate_of(&blank), &"", "nothing to read")
+        let _ = testing::check_eq(super::sqlstate_of(blank), "", "nothing to read")
         let plain = errors::new("connecting to 127.0.0.1:5432: refused")
-        let _ = testing::check_eq(&super::sqlstate_of(&plain), &"", "a local failure has none")
+        let _ = testing::check_eq(super::sqlstate_of(plain), "", "a local failure has none")
         // A bracketed run that is not five characters is not a SQLSTATE.
-        let _ = testing::check_eq(&super::sqlstate_of(&errors::new("[23] short")), &"", "too short")
-        let _ = testing::check_eq(&super::sqlstate_of(&errors::new("[234567] long")), &"", "too long")
+        let _ = testing::check_eq(super::sqlstate_of(errors::new("[23] short")), "", "too short")
+        let _ = testing::check_eq(super::sqlstate_of(errors::new("[234567] long")), "", "too long")
     }
 
     #[test]
     fn parse_of_an_empty_body_is_blank() {
-        let e = super::parse(&#[])
-        let _ = testing::check_eq(&e.code, &"", "no sqlstate")
-        let _ = testing::check_eq(&e.render(), &"", "empty render")
+        let e = super::parse(#[])
+        let _ = testing::check_eq(e.code, "", "no sqlstate")
+        let _ = testing::check_eq(e.render(), "", "empty render")
     }
 }

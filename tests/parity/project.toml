@@ -1,7 +1,7 @@
 [project]
 id = "example.com/pgsql-gos-parity"
 version = "0.1.0"
-gossamer-version = "^v0.55.3"
+gossamer-version = "^v0.56.0"
 
 [dependencies]
 "github.com/gossamer-lang/pgsql-gos" = { path = "../.." }
