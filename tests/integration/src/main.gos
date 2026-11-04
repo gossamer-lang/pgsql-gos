@@ -2171,17 +2171,19 @@ fn a_cancel_token_stops_a_running_query_steps() -> Result<(), errors::Error> {
         time::sleep(300)
         let _ = token.cancel()
     }
-    spawn(cancel, reason: "cancel token")
-    let outcome = db.query("SELECT pg_sleep(10)", #[])
-    match outcome {
-        Ok(_) => { let _ = testing::check(false, "the sleep should have been cancelled") }
-        Err(e) => {
-            let _ = testing::check(
-                pgsql::sqlstate_of(e) == "57014"
-                format("query_canceled sqlstate: {}", e)
-            )
+    cohort {
+        spawn(cancel, reason: "cancel token")
+        let outcome = db.query("SELECT pg_sleep(10)", #[])
+        match outcome {
+            Ok(_) => { let _ = testing::check(false, "the sleep should have been cancelled") }
+            Err(e) => {
+                let _ = testing::check(
+                    pgsql::sqlstate_of(e) == "57014"
+                    format("query_canceled sqlstate: {}", e)
+                )
+            }
         }
-    }
+    }?
     // The session survives a cancellation.
     let after = db.query_value("SELECT 5", #[])?
     let _ = testing::check_eq(after.as_int().unwrap_or(0), 5, "the next query works")

@@ -43,7 +43,7 @@ pub fn row_json(row: conn::Row) -> String {
 
 // A result set as a JSON array of objects.
 pub fn rows_json(rows: Vec<conn::Row>) -> String {
-    "[" + rows.map(|row| row_json(row)).join(",") + "]"
+    "[" + rows.map(row_json).join(",") + "]"
 }
 
 // One value as the JSON its column's type calls for.
@@ -116,7 +116,7 @@ pub fn insert_sql(table: String, columns: Vec<String>) -> String {
     format(
         "INSERT INTO {} ({}) VALUES ({})"
         quote_ident(table)
-        columns.map(|name| quote_ident(name)).join(", ")
+        columns.map(quote_ident).join(", ")
         placeholders(columns.len())
     )
 }
@@ -125,7 +125,7 @@ pub fn insert_sql(table: String, columns: Vec<String>) -> String {
 pub fn select_sql(table: String, columns: Vec<String>) -> String {
     format(
         "SELECT {} FROM {}"
-        columns.map(|name| quote_ident(name)).join(", ")
+        columns.map(quote_ident).join(", ")
         quote_ident(table)
     )
 }

@@ -178,8 +178,8 @@ impl Display for Date {
         match self.bound {
             Bound::Infinity => "infinity"
             Bound::NegInfinity => "-infinity"
-            Bound::Finite => render_civil_date(self.year, self.month, self.day)
-            + render_era(self.year)
+            Bound::Finite => render_civil_date(self.year, self.month, self.day) +
+                render_era(self.year)
         }
     }
 }
@@ -220,8 +220,8 @@ impl Time {
 
     // Microseconds from midnight to this time, before any offset.
     pub fn to_day_micros(&self) -> i64 {
-        self.hour * MICROS_PER_HOUR + self.minute * MICROS_PER_MINUTE
-        + self.second * MICROS_PER_SECOND + self.micros
+        self.hour * MICROS_PER_HOUR + self.minute * MICROS_PER_MINUTE +
+            self.second * MICROS_PER_SECOND + self.micros
     }
 
     // Microseconds from midnight in UTC, so two `timetz` values in
@@ -251,8 +251,8 @@ impl Display for Time {
     // The time in the form PostgreSQL writes: fractional seconds only when
     // there are any, and the offset only for a `timetz`.
     fn fmt(&self) -> String {
-        render_clock(self.hour, self.minute, self.second, self.micros)
-        + render_offset(self.offset_minutes)
+        render_clock(self.hour, self.minute, self.second, self.micros) +
+            render_offset(self.offset_minutes)
     }
 }
 
@@ -303,10 +303,10 @@ impl Timestamp {
             Bound::NegInfinity => MICROS_NEG_INFINITY
             Bound::Finite => {
                 let days = days_from_civil(self.year, self.month, self.day)
-                let day_micros = self.hour * MICROS_PER_HOUR
-                + self.minute * MICROS_PER_MINUTE
-                + self.second * MICROS_PER_SECOND
-                + self.micros
+                let day_micros = self.hour * MICROS_PER_HOUR +
+                    self.minute * MICROS_PER_MINUTE +
+                    self.second * MICROS_PER_SECOND +
+                    self.micros
                 let offset = self.offset_minutes.unwrap_or(0) * MICROS_PER_MINUTE
                 days * MICROS_PER_DAY + day_micros - offset
             }
@@ -366,9 +366,9 @@ impl Timestamp {
                     Some(0) | None => "Z"
                     Some(minutes) => render_rfc3339_offset(minutes)
                 }
-                render_civil_date(self.year, self.month, self.day) + "T"
-                + render_clock(self.hour, self.minute, self.second, self.micros)
-                + zone
+                render_civil_date(self.year, self.month, self.day) + "T" +
+                    render_clock(self.hour, self.minute, self.second, self.micros) +
+                    zone
             }
         }
     }
@@ -390,10 +390,10 @@ impl Display for Timestamp {
             Bound::Infinity => "infinity"
             Bound::NegInfinity => "-infinity"
             Bound::Finite => {
-                render_civil_date(self.year, self.month, self.day) + " "
-                + render_clock(self.hour, self.minute, self.second, self.micros)
-                + render_offset(self.offset_minutes)
-                + render_era(self.year)
+                render_civil_date(self.year, self.month, self.day) + " " +
+                    render_clock(self.hour, self.minute, self.second, self.micros) +
+                    render_offset(self.offset_minutes) +
+                    render_era(self.year)
             }
         }
     }
@@ -654,8 +654,8 @@ impl Display for Uuid {
         if hex.byte_len() != 32 {
             return hex
         }
-        hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) + "-"
-        + hex.substring(16, 20) + "-" + hex.substring(20, 32)
+        hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) + "-" +
+            hex.substring(16, 20) + "-" + hex.substring(20, 32)
     }
 }
 
@@ -1088,8 +1088,8 @@ fn parse_interval_clock(text: String) -> Result<i64, errors::Error> {
     if rest.trim() != "" {
         return Err(errors::newf("trailing text in interval time `{}`: {}", text, rest))
     }
-    let total = hour * MICROS_PER_HOUR + minute * MICROS_PER_MINUTE
-    + second * MICROS_PER_SECOND + micros
+    let total = hour * MICROS_PER_HOUR + minute * MICROS_PER_MINUTE +
+        second * MICROS_PER_SECOND + micros
     Ok(if negative { -total } else { total })
 }
 

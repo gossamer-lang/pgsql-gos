@@ -214,11 +214,11 @@ pub fn is_multirange(oid: i64) -> bool {
     matches(
         oid
         INT4MULTIRANGE
-        | NUMMULTIRANGE
-        | TSMULTIRANGE
-        | TSTZMULTIRANGE
-        | DATEMULTIRANGE
-        | INT8MULTIRANGE
+        |NUMMULTIRANGE
+        |TSMULTIRANGE
+        |TSTZMULTIRANGE
+        |DATEMULTIRANGE
+        |INT8MULTIRANGE
     )
 }
 

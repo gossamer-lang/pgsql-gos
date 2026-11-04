@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3
+
+- Require Gossamer v0.75.18.
+- Start every `spawn` inside a `cohort { }`, which v0.75 requires: the dial
+  raced against the connect timeout, the cancel-token test, and the service
+  example's self-test HTTP server each ran unaccounted before.
+- Hash the MD5 challenge from bytes: `crypto::insecure::md5` and `md5_hex`
+  now take `Vec<u8>` rather than `String`, so text reaches them through
+  `as_bytes()`.
+- Match the line-continuation rule v0.75 enforces: an operator ends a
+  continued line instead of starting the next one.
+
 ## 0.1.2
 
 - Require Gossamer v0.56.0, which removed the shared reference from the

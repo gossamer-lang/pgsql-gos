@@ -827,7 +827,7 @@ pub fn decode_binary(type_oid: i64, raw: Vec<u8>) -> Value {
         // `"char"` is one byte, and what the server writes for it in text
         // format is the character itself, so it reads as its text alike.
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::XML
-        | oid::CSTRING | oid::CHAR => Value::Text(buf::utf8_lossy(raw))
+        |oid::CSTRING| oid::CHAR => Value::Text(buf::utf8_lossy(raw))
         oid::JSON => Value::Json(buf::utf8_lossy(raw))
         oid::JSONB => {
             // A jsonb binary payload is a one-byte version prefix then the
@@ -937,7 +937,7 @@ fn encode_binary_int(n: i64, type_oid: i64) -> Option<Vec<u8>> {
 fn encode_binary_text(text: String, type_oid: i64) -> Option<Vec<u8>> {
     match type_oid {
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::JSON | oid::XML
-        | oid::CSTRING => Some(text.as_bytes())
+        |oid::CSTRING => Some(text.as_bytes())
         _ => None
     }
 }
@@ -1066,8 +1066,8 @@ fn read_binary_bound(
 // Byte offsets: every character the grammar reserves is ASCII, so a
 // multi-byte character copies through untouched.
 fn quote_range_bound(text: String) -> String {
-    let needs = text.is_empty()
-    || text.bytes().any(|byte| is_reserved_byte(byte as i64) || byte == 91 || byte == 93)
+    let needs = text.is_empty() ||
+        text.bytes().any(|byte| is_reserved_byte(byte as i64) || byte == 91 || byte == 93)
     if !needs {
         return text
     }

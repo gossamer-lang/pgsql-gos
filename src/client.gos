@@ -754,9 +754,9 @@ impl Client {
     // aborted state, where the server accepts only a rollback, so the retry
     // belongs to the caller's own recovery there rather than here.
     fn can_reprepare(&self, e: errors::Error) -> bool {
-        matches(dberror::sqlstate_of(e), "26000" | "0A000")
-        && !self.pg.is_closed()
-        && !self.pg.in_transaction()
+        matches(dberror::sqlstate_of(e), "26000" | "0A000") &&
+            !self.pg.is_closed() &&
+            !self.pg.in_transaction()
     }
 }
 

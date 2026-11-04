@@ -16,7 +16,7 @@ use crate::buf
 // The second digest covers bytes rather than text: the salt is four random
 // bytes, which are not UTF-8 in general, so it is hashed as it arrived.
 pub fn md5_response(password: String, user: String, salt: Vec<u8>) -> String {
-    let mut challenge: Vec<u8> = insecure::md5_hex(password + user).as_bytes()
+    let mut challenge: Vec<u8> = insecure::md5_hex((password + user).as_bytes()).as_bytes()
     challenge.extend(salt)
     "md5" + buf::to_hex(insecure::md5(challenge))
 }

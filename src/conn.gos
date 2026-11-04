@@ -1770,27 +1770,29 @@ fn dial_tcp(addr: String, timeout_ms: i64) -> Result<net::TcpStream, errors::Err
     let opened, arrivals = channel_unbounded()
     let reported, reports = channel_unbounded()
     let target = addr
-    let dial = || {
-        match net::TcpStream::connect(target) {
-            Ok(stream) => {
-                opened.send(stream)
-                reported.send("")
+    cohort {
+        let dial = || {
+            match net::TcpStream::connect(target) {
+                Ok(stream) => {
+                    opened.send(stream)
+                    reported.send("")
+                }
+                Err(e) => reported.send(format("{}", e))
             }
-            Err(e) => reported.send(format("{}", e))
         }
-    }
-    spawn(dial, reason: "pgsql tcp dial")
+        spawn(dial, reason: "pgsql tcp dial")
 
-    select {
-        settled = reports.recv() => {
-            if settled != "" {
-                return Err(errors::new(settled))
+        select {
+            settled = reports.recv() => {
+                if settled != Some("") {
+                    return Err(errors::new(settled.unwrap_or("")))
+                }
+            }
+            _ = time::after(time::Duration::from_millis(timeout_ms)).recv() => {
+                return Err(errors::newf("no answer within {} ms", timeout_ms))
             }
         }
-        _ = time::after(time::Duration::from_millis(timeout_ms)).recv() => {
-            return Err(errors::newf("no answer within {} ms", timeout_ms))
-        }
-    }
+    }?
     let Some(stream) = arrivals.recv() else {
         return Err(errors::new("the dial reported success without a socket"))
     }
@@ -2118,7 +2120,7 @@ fn authenticate(conn: &mut PgConn, cfg: config::Config) -> Result<(), errors::Er
                 sasl::verify_server(server_signature, server_final)?
             }
             proto::AUTH_KERBEROS_V5 | proto::AUTH_GSS | proto::AUTH_GSS_CONTINUE
-            | proto::AUTH_SSPI => {
+            |proto::AUTH_SSPI => {
                 return Err(errors::newf(
                     "the server asked for GSSAPI/SSPI authentication ({}), which this driver does not implement; configure md5, scram-sha-256, trust, or peer"
                     kind
