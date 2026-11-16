@@ -22,18 +22,18 @@ pub const DEFAULT_STATEMENT_CACHE_CAPACITY: i64 = 256
 
 // A client and its connection.
 pub struct Client {
-    pub (package) pg: conn::PgConn
+    pub(package) pg: conn::PgConn
     // Prepared statements already parsed on the server, keyed by SQL text.
-    pub (package) cache: Map<String, conn::Statement>
+    pub(package) cache: Map<String, conn::Statement>
     // Cached SQL text in least-recently-used order, so a full cache knows
     // which statement to drop.
-    pub (package) recency: Vec<String>
+    pub(package) recency: Vec<String>
     // How many statements the cache holds before evicting.
-    pub (package) capacity: i64
+    pub(package) capacity: i64
     // Whether `query` and friends consult the cache.
-    pub (package) caching: bool
+    pub(package) caching: bool
     // Result format for queries that do not name one.
-    pub (package) result_format: i64
+    pub(package) result_format: i64
 }
 
 // Connects using a libpq keyword string or a `postgres://` URI.
@@ -763,8 +763,8 @@ impl Client {
 // An open transaction. The client runs the statements; this tracks whether
 // the block is still open and how deep its savepoints go.
 pub struct Transaction {
-    pub (package) open: bool
-    pub (package) depth: i64
+    pub(package) open: bool
+    pub(package) depth: i64
 }
 
 impl Transaction {
@@ -823,9 +823,9 @@ impl TxOptions {
 // The identity a cancel request needs. Copyable, so it can be handed to
 // another goroutine while the session it names is busy.
 pub struct CancelToken {
-    pub (package) host: config::HostAddr
-    pub (package) pid: i64
-    pub (package) secret: i64
+    pub(package) host: config::HostAddr
+    pub(package) pid: i64
+    pub(package) secret: i64
 }
 
 impl CancelToken {

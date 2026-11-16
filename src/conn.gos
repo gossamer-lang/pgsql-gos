@@ -61,38 +61,38 @@ impl Statement {
 
 // A live connection.
 pub struct PgConn {
-    pub (package) sock: Socket
+    pub(package) sock: Socket
     // Bytes read from the socket and not yet framed, and how far into them
     // the framer has consumed. Compacted rather than re-sliced per message.
-    pub (package) inbox: Vec<u8>
-    pub (package) inbox_pos: i64
+    pub(package) inbox: Vec<u8>
+    pub(package) inbox_pos: i64
     // Session parameters the server reports, keyed by name.
-    pub (package) params: Map<String, String>
+    pub(package) params: Map<String, String>
     // Backend identity, for a CancelRequest on a second connection.
-    pub (package) backend_pid: i64
-    pub (package) backend_secret: i64
+    pub(package) backend_pid: i64
+    pub(package) backend_secret: i64
     // Transaction status from the last ReadyForQuery.
-    pub (package) tx_status: i64
+    pub(package) tx_status: i64
     // Notices and notifications the message loop absorbed.
-    pub (package) notices: Vec<dberror::DbError>
-    pub (package) pending: Vec<Notification>
+    pub(package) notices: Vec<dberror::DbError>
+    pub(package) pending: Vec<Notification>
     // True once the socket is unusable.
-    pub (package) closed: bool
+    pub(package) closed: bool
     // True while a portal is mid-stream, so the next exchange drains first.
-    pub (package) portal_open: bool
+    pub(package) portal_open: bool
     // Names handed out to prepared statements and portals.
-    pub (package) name_counter: i64
+    pub(package) name_counter: i64
     // Which host of the config this connection reached.
-    pub (package) host: config::HostAddr
+    pub(package) host: config::HostAddr
     // Whether the session is running over TLS.
-    pub (package) tls: bool
+    pub(package) tls: bool
     // Deadline on a single socket read once the session is up, in
     // milliseconds; 0 for none. Held here so a call that narrows the
     // deadline for its own wait puts this one back afterwards.
-    pub (package) socket_timeout_ms: i64
+    pub(package) socket_timeout_ms: i64
     // When the socket was opened, as `time::now_ms` reads it, so a pool can
     // retire a connection that has been alive long enough.
-    pub (package) opened_at_ms: i64
+    pub(package) opened_at_ms: i64
 }
 
 // --- socket plumbing ----------------------------------------------
@@ -129,7 +129,7 @@ const READ_CHUNK: i64 = 65_536
 
 impl PgConn {
     // Sends raw bytes, marking the connection dead if the socket fails.
-    pub (package) fn send(&mut self, data: Vec<u8>) -> Result<(), errors::Error> {
+    pub(package) fn send(&mut self, data: Vec<u8>) -> Result<(), errors::Error> {
         if self.closed {
             return Err(errors::new("connection is closed"))
         }
@@ -208,7 +208,7 @@ impl PgConn {
     }
 
     // One message, with the asynchronous ones absorbed.
-    pub (package) fn recv(&mut self) -> Result<(i64, Vec<u8>), errors::Error> {
+    pub(package) fn recv(&mut self) -> Result<(i64, Vec<u8>), errors::Error> {
         loop {
             let tag, body = self.recv_raw()?
             match tag {
@@ -225,7 +225,7 @@ impl PgConn {
 
     // Puts the session's own read and write deadline on the socket, or
     // takes any deadline off when the session has none.
-    pub (package) fn apply_socket_timeout(&mut self) {
+    pub(package) fn apply_socket_timeout(&mut self) {
         match self.sock {
             Socket::Tcp(stream) => {
                 if self.socket_timeout_ms > 0 {
@@ -314,7 +314,7 @@ impl PgConn {
     }
 
     // A fresh name for a statement or portal, unique within the session.
-    pub (package) fn next_name(&mut self, prefix: String) -> String {
+    pub(package) fn next_name(&mut self, prefix: String) -> String {
         self.name_counter += 1
         format("gos_pgsql_{}{}", prefix, self.name_counter)
     }
@@ -331,7 +331,7 @@ impl PgConn {
     // Reads to the next ReadyForQuery, collecting one row count per
     // CommandComplete and reporting the first error the server sent along
     // the way. This is the shape every exchange that ends in a Sync takes.
-    pub (package) fn collect_counts(&mut self) -> Result<Vec<i64>, errors::Error> {
+    pub(package) fn collect_counts(&mut self) -> Result<Vec<i64>, errors::Error> {
         let mut counts: Vec<i64> = #[]
         let mut failure: Option<dberror::DbError> = None
         loop {
@@ -360,14 +360,14 @@ impl PgConn {
     }
 
     // Reads to the next ReadyForQuery for its effect alone.
-    pub (package) fn drain_to_ready(&mut self) -> Result<(), errors::Error> {
+    pub(package) fn drain_to_ready(&mut self) -> Result<(), errors::Error> {
         let _ = self.collect_counts()?
         Ok(())
     }
 
     // Brings the connection back to a ready point before a new exchange,
     // draining a portal left mid-stream by an abandoned row walk.
-    pub (package) fn ensure_ready(&mut self) -> Result<(), errors::Error> {
+    pub(package) fn ensure_ready(&mut self) -> Result<(), errors::Error> {
         if self.portal_open {
             self.portal_open = false
             self.drain_to_ready()?
@@ -539,7 +539,7 @@ impl PgConn {
     // Binds parameters to a statement, producing a named portal ready to be
     // executed. `result_format` is one of the `value::FORMAT_*` codes and
     // applies to every column.
-    pub (package) fn bind(
+    pub(package) fn bind(
         &mut self
         statement: Statement
         portal: String
@@ -612,7 +612,7 @@ impl PgConn {
 
     // An Execute message for `portal`, fetching at most `max_rows` rows (0
     // for all of them).
-    pub (package) fn execute_message(portal: String, max_rows: i64) -> Vec<u8> {
+    pub(package) fn execute_message(portal: String, max_rows: i64) -> Vec<u8> {
         let mut body: Vec<u8> = #[]
         buf::put_cstr(&mut body, portal)
         buf::put_i32(&mut body, max(max_rows, 0))
@@ -1188,9 +1188,9 @@ impl PgConn {
 
 // An open `COPY ... FROM STDIN`, written a chunk at a time.
 pub struct CopyIn {
-    pub (package) done: bool
+    pub(package) done: bool
     // Payload bytes handed to the server so far.
-    pub (package) sent: i64
+    pub(package) sent: i64
 }
 
 impl CopyIn {
@@ -1207,15 +1207,15 @@ impl CopyIn {
 
 // An open `COPY ... TO STDOUT`, pulled a chunk at a time.
 pub struct CopyOut {
-    pub (package) done: bool
-    pub (package) failure: Option<dberror::DbError>
+    pub(package) done: bool
+    pub(package) failure: Option<dberror::DbError>
     // Payload bytes read from the server so far.
-    pub (package) received: i64
+    pub(package) received: i64
     // Payload read from the server and not yet handed out as a line, and
     // how far into it the line walk has consumed. Compacted rather than
     // re-sliced per line.
-    pub (package) residue: Vec<u8>
-    pub (package) residue_pos: i64
+    pub(package) residue: Vec<u8>
+    pub(package) residue_pos: i64
 }
 
 impl CopyOut {
@@ -1254,11 +1254,11 @@ pub struct SimpleResult {
 
 // An open row stream from the extended query protocol.
 pub struct RowStream {
-    pub (package) portal: String
+    pub(package) portal: String
     pub columns: Vec<Column>
     // Name index for `columns`, shared by every row the stream answers.
-    pub (package) index: Map<String, i64>
-    pub (package) done: bool
+    pub(package) index: Map<String, i64>
+    pub(package) done: bool
     // Filled once the stream reaches its CommandComplete.
     pub rows_affected: i64
     pub tag: String
@@ -1273,11 +1273,11 @@ impl RowStream {
 
 // A server-side portal fetched in batches.
 pub struct Portal {
-    pub (package) name: String
+    pub(package) name: String
     pub columns: Vec<Column>
     // Name index for `columns`, shared by every row the portal answers.
-    pub (package) index: Map<String, i64>
-    pub (package) exhausted: bool
+    pub(package) index: Map<String, i64>
+    pub(package) exhausted: bool
 }
 
 impl Portal {
@@ -1293,7 +1293,7 @@ pub struct Row {
     pub values: Vec<value::Value>
     // Column name to position, built once for the result set the row came
     // from, so reading by name costs one lookup rather than a scan.
-    pub (package) index: Map<String, i64>
+    pub(package) index: Map<String, i64>
 }
 
 // Column name to position for a result set. A duplicated name keeps its

@@ -26,21 +26,21 @@ use crate::{client, config}
 
 // A set of connections to one database, reused across units of work.
 pub struct Pool {
-    pub (package) cfg: config::Config
+    pub(package) cfg: config::Config
     // Connections opened and not currently lent out.
-    pub (package) idle: Vec<client::Client>
+    pub(package) idle: Vec<client::Client>
     // How many connections exist, lent out or idle.
-    pub (package) live: i64
-    pub (package) max_size: i64
+    pub(package) live: i64
+    pub(package) max_size: i64
     // Whether a connection is checked with a round trip before being lent,
     // so a server restart surfaces as a reconnect rather than a failed query.
-    pub (package) test_on_acquire: bool
+    pub(package) test_on_acquire: bool
     // Whether a returning connection has its session put back to what a
     // freshly opened one is, so nothing a borrower set reaches the next one.
-    pub (package) reset_on_release: bool
+    pub(package) reset_on_release: bool
     // How long a connection may stay in the pool, in milliseconds; 0 for no
     // bound. One older than this is closed rather than lent or kept.
-    pub (package) max_lifetime_ms: i64
+    pub(package) max_lifetime_ms: i64
 }
 
 // Opens a pool of at most `max_size` connections, with none opened yet.
@@ -243,12 +243,12 @@ pub struct Limiter {
     // connection, and a string crosses that boundary where an aggregate
     // with nested storage does not. Parsing costs nothing beside a
     // handshake.
-    pub (package) url: String
+    pub(package) url: String
     // One value per connection the limiter allows; taking one is the
     // permission to open a connection, sending it back is giving it up.
-    pub (package) permits: Sender<i64>
-    pub (package) leases: Receiver<i64>
-    pub (package) max_size: i64
+    pub(package) permits: Sender<i64>
+    pub(package) leases: Receiver<i64>
+    pub(package) max_size: i64
 }
 
 // Opens a limiter allowing at most `max_size` connections at once. The URL

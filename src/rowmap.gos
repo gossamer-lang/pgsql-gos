@@ -71,7 +71,7 @@ pub fn value_json(cell: value::Value, type_oid: i64) -> String {
         oid::BOOL => if cell.as_bool().unwrap_or(false) { "true" } else { "false" }
         oid::JSON | oid::JSONB => {
             let document = cell.render()
-            if json::valid(document) { document } else { quote_json(document) }
+            if json::is_valid(document) { document } else { quote_json(document) }
         }
         oid::BYTEA => match cell.as_bytes() {
             Some(data) => "[" + data.map(|byte| (byte as i64).to_string()).join(",") + "]"

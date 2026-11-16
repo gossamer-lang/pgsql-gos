@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- Require Gossamer v0.80.0, which renamed `json::valid` to `json::is_valid`;
+  a `json` / `jsonb` column's text is checked with `json::is_valid`.
+- Format the driver sources the way `gos fmt` writes them (`pub(package)`).
+
 ## 0.1.3
 
 - Require Gossamer v0.75.18.

@@ -735,10 +735,10 @@ a driver one - see [the toolchain section](#known-defect-preparing-statements-on
 
 ## Toolchain
 
-The driver needs Gossamer v0.75.18 or newer: v0.56 removed the shared reference
-from the language, and v0.75 requires a `cohort { }` around every `spawn` and
-an operator at the end of a continued line, and the driver is written in the
-spelling both replaced.
+The driver needs Gossamer v0.80.0 or newer: v0.56 removed the shared reference
+from the language, v0.75 requires a `cohort { }` around every `spawn` and an
+operator at the end of a continued line, and v0.80 renamed `json::valid` to
+`json::is_valid`; the driver is written in the spelling each replaced.
 
 `tests/parity/run.sh` runs one program on the bytecode VM (`gos run`,
 `gos test`), the Cranelift JIT (`gos build`), and LLVM AOT (`gos build

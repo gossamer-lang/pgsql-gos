@@ -26,15 +26,15 @@ pub fn md5_response(password: String, user: String, salt: Vec<u8>) -> String {
 // the signature that step derived and the server's final message.
 pub struct Scram {
     // The client nonce, as sent.
-    pub (package) client_nonce: String
+    pub(package) client_nonce: String
     // The client-first-message-bare, which the auth message replays.
-    pub (package) client_first_bare: String
+    pub(package) client_first_bare: String
     // The GS2 header, which the client-final message echoes base64-encoded.
-    pub (package) gs2_header: String
+    pub(package) gs2_header: String
     // The channel-binding data the header commits to: for
     // `tls-server-end-point`, the hash of the server's certificate. Empty
     // when the exchange is plain SCRAM.
-    pub (package) binding_data: Vec<u8>
+    pub(package) binding_data: Vec<u8>
 }
 
 // The client-final message and the server signature one exchange derives.
